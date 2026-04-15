@@ -1,0 +1,8 @@
+/target/
+
+# Editor files
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

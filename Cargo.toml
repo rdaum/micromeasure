@@ -1,0 +1,27 @@
+[package]
+name = "micromeasure"
+version = "0.1.0"
+authors = ["Ryan Daum <ryan.daum@gmail.com>"]
+categories = ["development-tools::profiling", "development-tools::testing"]
+edition = "2024"
+keywords = ["benchmark", "microbenchmark", "perf", "pmu", "linux"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/rdaum/micromeasure"
+homepage = "https://github.com/rdaum/micromeasure"
+documentation = "https://docs.rs/micromeasure"
+rust-version = "1.85.0"
+description = "Microbenchmark harness for tiny operations and PMU-aware measurement"
+
+# This is a dev-only crate - only used in benchmarks and tests
+[lib]
+doctest = false
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-width = "0.2"
+
+[target.'cfg(all(target_os = "linux"))'.dependencies]
+perf-event2 = "0.7"

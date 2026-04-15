@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io::IsTerminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Generic table formatter with proper Unicode-aware column alignment
@@ -21,6 +22,7 @@ pub struct TableFormatter {
     rows: Vec<Vec<String>>,
     column_alignments: Vec<Alignment>,
     group_split_after: Option<usize>,
+    border_color: Option<BorderColor>,
 }
 
 #[derive(Clone, Copy)]
@@ -30,10 +32,21 @@ pub enum Alignment {
     Center,
 }
 
+#[derive(Clone, Copy)]
+pub enum BorderColor {
+    Cyan,
+}
+
 impl TableFormatter {
     pub fn new(headers: Vec<&str>, column_widths: Vec<usize>) -> Self {
         let alignments = (0..column_widths.len())
-            .map(|i| if i == 0 { Alignment::Left } else { Alignment::Right })
+            .map(|i| {
+                if i == 0 {
+                    Alignment::Left
+                } else {
+                    Alignment::Right
+                }
+            })
             .collect();
         Self {
             headers: headers.iter().map(|s| s.to_string()).collect(),
@@ -41,6 +54,7 @@ impl TableFormatter {
             rows: Vec::new(),
             column_alignments: alignments,
             group_split_after: None,
+            border_color: None,
         }
     }
 
@@ -51,6 +65,11 @@ impl TableFormatter {
 
     pub fn with_group_split_after(mut self, column: usize) -> Self {
         self.group_split_after = Some(column);
+        self
+    }
+
+    pub fn with_border_color(mut self, color: BorderColor) -> Self {
+        self.border_color = Some(color);
         self
     }
 
@@ -81,39 +100,44 @@ impl TableFormatter {
         let has_headers = !self.headers.is_empty();
 
         // Top border
-        print!("┌");
+        print!("{}", self.borderize("┌"));
         for (i, &width) in self.column_widths.iter().enumerate() {
-            print!("{}", "─".repeat(width));
+            print!("{}", self.borderize(&"─".repeat(width)));
             if i < self.column_widths.len() - 1 {
-                print!("{}", self.vertical_top(i));
+                print!("{}", self.borderize(self.vertical_top(i)));
             }
         }
-        println!("┐");
+        println!("{}", self.borderize("┐"));
 
         // Header row (only if headers exist)
         if has_headers {
-            print!("│");
-            for (i, (header, &width)) in self.headers.iter().zip(self.column_widths.iter()).enumerate() {
+            print!("{}", self.borderize("│"));
+            for (i, (header, &width)) in self
+                .headers
+                .iter()
+                .zip(self.column_widths.iter())
+                .enumerate()
+            {
                 let formatted = self.format_cell(header, width, Alignment::Center);
                 print!("{formatted}");
-                print!("{}", self.vertical_body(i));
+                print!("{}", self.borderize(self.vertical_body(i)));
             }
             println!();
 
             // Header separator
-            print!("╞");
+            print!("{}", self.borderize("╞"));
             for (i, &width) in self.column_widths.iter().enumerate() {
-                print!("{}", "═".repeat(width));
+                print!("{}", self.borderize(&"═".repeat(width)));
                 if i < self.column_widths.len() - 1 {
-                    print!("{}", self.vertical_header(i));
+                    print!("{}", self.borderize(self.vertical_header(i)));
                 }
             }
-            println!("╡");
+            println!("{}", self.borderize("╡"));
         }
 
         // Data rows with separators between them
         for row in &self.rows {
-            print!("│");
+            print!("{}", self.borderize("│"));
             for (i, (cell, &width)) in row.iter().zip(self.column_widths.iter()).enumerate() {
                 let align = self
                     .column_alignments
@@ -122,20 +146,20 @@ impl TableFormatter {
                     .unwrap_or(Alignment::Right);
                 let formatted = self.format_cell(cell, width, align);
                 print!("{formatted}");
-                print!("{}", self.vertical_body(i));
+                print!("{}", self.borderize(self.vertical_body(i)));
             }
             println!();
         }
 
         // Bottom border
-        print!("└");
+        print!("{}", self.borderize("└"));
         for (i, &width) in self.column_widths.iter().enumerate() {
-            print!("{}", "─".repeat(width));
+            print!("{}", self.borderize(&"─".repeat(width)));
             if i < self.column_widths.len() - 1 {
-                print!("{}", self.vertical_bottom(i));
+                print!("{}", self.borderize(self.vertical_bottom(i)));
             }
         }
-        println!("┘");
+        println!("{}", self.borderize("┘"));
     }
 
     fn vertical_top(&self, column: usize) -> &'static str {
@@ -171,6 +195,19 @@ impl TableFormatter {
             "┴"
         }
     }
+
+    fn borderize(&self, text: &str) -> String {
+        if !std::io::stdout().is_terminal() {
+            return text.to_string();
+        }
+        let Some(color) = self.border_color else {
+            return text.to_string();
+        };
+        let code = match color {
+            BorderColor::Cyan => "36",
+        };
+        format!("\x1b[{code}m{text}\x1b[0m")
+    }
 }
 
 fn display_text_width(text: &str) -> usize {
@@ -185,7 +222,7 @@ fn truncate_display_text(text: &str, target_width: usize) -> String {
     while let Some(ch) = chars.next() {
         if ch == '\u{1b}' {
             output.push(ch);
-            while let Some(next) = chars.next() {
+            for next in chars.by_ref() {
                 output.push(next);
                 if next == 'm' {
                     break;
@@ -210,16 +247,14 @@ fn strip_ansi(text: &str) -> String {
     let mut chars = text.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for next in chars.by_ref() {
-                    if next == 'm' {
-                        break;
-                    }
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
                 }
-                continue;
             }
+            continue;
         }
         output.push(ch);
     }

@@ -23,22 +23,26 @@
 //! - Generic table formatting
 
 pub mod bench;
-pub mod table;
 mod session;
+pub mod table;
 mod threading;
 
 pub use bench::{
-    BenchContext, BenchmarkRunner, NoContext,
+    BenchContext, BenchmarkRunner, ConcurrentBenchContext, ConcurrentBenchControl,
+    ConcurrentBenchmarkGroup, ConcurrentWorker, NoContext,
 };
-pub use table::{Alignment, TableFormatter};
+pub use table::{Alignment, BorderColor, TableFormatter};
 
 #[cfg(target_os = "linux")]
 pub use bench::PerfCounters;
-pub use session::{BenchmarkKind, BenchmarkReport, BenchmarkResult, ComparisonPolicy};
+pub use session::{
+    BenchmarkKind, BenchmarkReport, BenchmarkResult, BenchmarkStats, ComparisonPolicy,
+    WorkerSummary,
+};
 
 // Re-export key types for convenience
-pub use std::time::Instant;
 pub use std::hint::black_box;
+pub use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 pub use perf_event;

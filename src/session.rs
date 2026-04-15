@@ -29,6 +29,14 @@ pub struct BenchmarkResult {
     pub name: String,
     pub group: String,
     pub kind: BenchmarkKind,
+    #[serde(flatten)]
+    pub stats: BenchmarkStats,
+    #[serde(default)]
+    pub worker_summaries: Vec<WorkerSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BenchmarkStats {
     pub mops_per_sec: f64,
     pub median_mops_per_sec: f64,
     pub ns_per_op: f64,
@@ -37,8 +45,8 @@ pub struct BenchmarkResult {
     pub mad_ns_per_op: f64,
     pub instructions_per_op: f64,
     pub branches_per_op: f64,
-    pub branch_miss_rate: f64,     // percentage of branches mispredicted
-    pub branch_misses_per_op: f64, // branch misses per operation
+    pub branch_miss_rate: f64,
+    pub branch_misses_per_op: f64,
     pub cache_miss_rate: f64,
     pub cv_percent: f64,
     pub outlier_count: usize,
@@ -49,12 +57,33 @@ pub struct BenchmarkResult {
     pub sample_throughput_mops_per_sec: Vec<f64>,
     #[serde(default)]
     pub sample_latency_ns_per_op: Vec<f64>,
+    #[serde(default)]
+    pub has_instructions: bool,
+    #[serde(default)]
+    pub has_branches: bool,
+    #[serde(default)]
+    pub has_branch_misses: bool,
+    #[serde(default)]
+    pub has_cache_misses: bool,
+    #[serde(default)]
+    pub pmu_time_enabled_ns: u64,
+    #[serde(default)]
+    pub pmu_time_running_ns: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerSummary {
+    pub name: String,
+    pub threads: usize,
+    #[serde(flatten)]
+    pub stats: BenchmarkStats,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkKind {
     Standard,
+    Concurrent,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -218,8 +247,10 @@ impl BenchmarkReport {
                 let change_info = if let Some(ref prev) = previous_session {
                     matching_previous_result(prev, result)
                         .map(|prev_result| {
-                            let change =
-                                safe_percent_change(result.mops_per_sec, prev_result.mops_per_sec);
+                            let change = safe_percent_change(
+                                result.stats.mops_per_sec,
+                                prev_result.stats.mops_per_sec,
+                            );
                             format_percent_change(change)
                         })
                         .unwrap_or_else(|| "NEW".to_string())
@@ -229,9 +260,9 @@ impl BenchmarkReport {
 
                 table.add_row(vec![
                     &colorize_label(&result.name),
-                    &colorize_value(&format!("{:.1}", result.mops_per_sec)),
-                    &colorize_value(&format!("{:.2}", result.median_ns_per_op)),
-                    &colorize_value(&format!("{:.2}", result.p95_ns_per_op)),
+                    &colorize_value(&format!("{:.1}", result.stats.mops_per_sec)),
+                    &colorize_value(&format!("{:.2}", result.stats.median_ns_per_op)),
+                    &colorize_value(&format!("{:.2}", result.stats.p95_ns_per_op)),
                     &change_info,
                 ]);
             }
@@ -242,7 +273,9 @@ impl BenchmarkReport {
             if let Some(ref prev) = previous_session {
                 let comparable_results: Vec<_> = group_results
                     .iter()
-                    .filter_map(|result| matching_previous_result(prev, result).map(|previous| (*result, previous)))
+                    .filter_map(|result| {
+                        matching_previous_result(prev, result).map(|previous| (*result, previous))
+                    })
                     .collect();
 
                 if !comparable_results.is_empty() {
@@ -283,8 +316,8 @@ impl BenchmarkReport {
                                 true,
                             )),
                             &format_improvement(safe_improvement_percent(
-                                result.cv_percent,
-                                previous.cv_percent,
+                                result.stats.cv_percent,
+                                previous.stats.cv_percent,
                                 true,
                             )),
                         ]);
@@ -329,8 +362,10 @@ impl BenchmarkReport {
 
             for result in &self.results {
                 if let Some(prev_result) = matching_previous_result(prev, result)
-                    && let Some(change) =
-                        safe_percent_change(result.mops_per_sec, prev_result.mops_per_sec)
+                    && let Some(change) = safe_percent_change(
+                        result.stats.mops_per_sec,
+                        prev_result.stats.mops_per_sec,
+                    )
                 {
                     comparable_count += 1;
                     total_change += change;
@@ -455,45 +490,49 @@ fn matching_previous_result<'a>(
     previous_report
         .results
         .iter()
-        .find(|previous| previous.name == result.name)
+        .find(|previous| previous.name == result.name && previous.kind == result.kind)
 }
 
 fn result_mean_throughput(result: &BenchmarkResult) -> f64 {
-    if result.sample_throughput_mops_per_sec.is_empty() {
-        return result.mops_per_sec;
+    if result.stats.sample_throughput_mops_per_sec.is_empty() {
+        return result.stats.mops_per_sec;
     }
 
-    result.sample_throughput_mops_per_sec.iter().sum::<f64>()
-        / result.sample_throughput_mops_per_sec.len() as f64
+    result
+        .stats
+        .sample_throughput_mops_per_sec
+        .iter()
+        .sum::<f64>()
+        / result.stats.sample_throughput_mops_per_sec.len() as f64
 }
 
 fn result_median_latency(result: &BenchmarkResult) -> f64 {
-    if result.sample_latency_ns_per_op.is_empty() {
-        return result.median_ns_per_op;
+    if result.stats.sample_latency_ns_per_op.is_empty() {
+        return result.stats.median_ns_per_op;
     }
 
-    let mut samples = result.sample_latency_ns_per_op.clone();
+    let mut samples = result.stats.sample_latency_ns_per_op.clone();
     samples.sort_by(|a, b| a.total_cmp(b));
     percentile_latency(&samples, 0.5)
 }
 
 fn result_p95_latency(result: &BenchmarkResult) -> f64 {
-    if result.sample_latency_ns_per_op.is_empty() {
-        return result.p95_ns_per_op;
+    if result.stats.sample_latency_ns_per_op.is_empty() {
+        return result.stats.p95_ns_per_op;
     }
 
-    let mut samples = result.sample_latency_ns_per_op.clone();
+    let mut samples = result.stats.sample_latency_ns_per_op.clone();
     samples.sort_by(|a, b| a.total_cmp(b));
     percentile_latency(&samples, 0.95)
 }
 
 fn result_mad_latency(result: &BenchmarkResult) -> f64 {
-    if result.sample_latency_ns_per_op.is_empty() {
-        return result.mad_ns_per_op;
+    if result.stats.sample_latency_ns_per_op.is_empty() {
+        return result.stats.mad_ns_per_op;
     }
 
     let median = result_median_latency(result);
-    median_absolute_deviation_latency(&result.sample_latency_ns_per_op, median)
+    median_absolute_deviation_latency(&result.stats.sample_latency_ns_per_op, median)
 }
 
 fn percentile_latency(sorted_values: &[f64], percentile: f64) -> f64 {
@@ -519,13 +558,16 @@ fn median_absolute_deviation_latency(values: &[f64], median_value: f64) -> f64 {
         return 0.0;
     }
 
-    let mut deviations: Vec<f64> = values.iter().map(|value| (value - median_value).abs()).collect();
+    let mut deviations: Vec<f64> = values
+        .iter()
+        .map(|value| (value - median_value).abs())
+        .collect();
     deviations.sort_by(|a, b| a.total_cmp(b));
     percentile_latency(&deviations, 0.5)
 }
 
 fn finite_mops(result: &BenchmarkResult) -> Option<f64> {
-    let mops = result.mops_per_sec;
+    let mops = result.stats.mops_per_sec;
     if mops.is_finite() && mops >= 0.0 {
         Some(mops)
     } else {
@@ -536,7 +578,10 @@ fn finite_mops(result: &BenchmarkResult) -> Option<f64> {
 fn default_suite_name() -> String {
     std::env::current_exe()
         .ok()
-        .and_then(|path| path.file_stem().map(|name| name.to_string_lossy().into_owned()))
+        .and_then(|path| {
+            path.file_stem()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "benchmark".to_string())
 }
@@ -580,8 +625,15 @@ fn session_is_compatible(
         return false;
     }
 
-    let current_names: BTreeSet<&str> = current_results.iter().map(|result| result.name.as_str()).collect();
-    let previous_names: BTreeSet<&str> = session.results.iter().map(|result| result.name.as_str()).collect();
+    let current_names: BTreeSet<(&str, BenchmarkKind)> = current_results
+        .iter()
+        .map(|result| (result.name.as_str(), result.kind))
+        .collect();
+    let previous_names: BTreeSet<(&str, BenchmarkKind)> = session
+        .results
+        .iter()
+        .map(|result| (result.name.as_str(), result.kind))
+        .collect();
     current_names == previous_names
 }
 
@@ -647,32 +699,37 @@ mod tests {
             name: name.to_string(),
             group: "test".to_string(),
             kind: BenchmarkKind::Standard,
-            mops_per_sec,
-            median_mops_per_sec: mops_per_sec,
-            ns_per_op: 1.0,
-            median_ns_per_op: 1.0,
-            p95_ns_per_op: 1.0,
-            mad_ns_per_op: 0.0,
-            instructions_per_op: 1.0,
-            branches_per_op: 1.0,
-            branch_miss_rate: 0.0,
-            branch_misses_per_op: 0.0,
-            cache_miss_rate: 0.0,
-            cv_percent: 0.0,
-            outlier_count: 0,
-            samples: 1,
-            operations: 1,
-            total_duration_sec: 1.0,
-            sample_throughput_mops_per_sec: vec![mops_per_sec],
-            sample_latency_ns_per_op: vec![1.0],
+            stats: BenchmarkStats {
+                mops_per_sec,
+                median_mops_per_sec: mops_per_sec,
+                ns_per_op: 1.0,
+                median_ns_per_op: 1.0,
+                p95_ns_per_op: 1.0,
+                mad_ns_per_op: 0.0,
+                instructions_per_op: 1.0,
+                branches_per_op: 1.0,
+                branch_miss_rate: 0.0,
+                branch_misses_per_op: 0.0,
+                cache_miss_rate: 0.0,
+                cv_percent: 0.0,
+                outlier_count: 0,
+                samples: 1,
+                operations: 1,
+                total_duration_sec: 1.0,
+                sample_throughput_mops_per_sec: vec![mops_per_sec],
+                sample_latency_ns_per_op: vec![1.0],
+                has_instructions: false,
+                has_branches: false,
+                has_branch_misses: false,
+                has_cache_misses: false,
+                pmu_time_enabled_ns: 0,
+                pmu_time_running_ns: 0,
+            },
+            worker_summaries: Vec::new(),
         }
     }
 
-    fn make_session(
-        hostname: &str,
-        suite: Option<&str>,
-        result_names: &[&str],
-    ) -> BenchmarkReport {
+    fn make_session(hostname: &str, suite: Option<&str>, result_names: &[&str]) -> BenchmarkReport {
         BenchmarkReport {
             timestamp: "123".to_string(),
             hostname: hostname.to_string(),

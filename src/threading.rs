@@ -112,7 +112,11 @@ fn read_physical_core_metrics() -> io::Result<Vec<PhysicalCoreMetrics>> {
         entry.logical_processor_ids.push(logical_processor_id);
 
         if let Ok(capacity) = read_u32(cpu_path(logical_processor_id).join("cpu_capacity")) {
-            entry.capacity = Some(entry.capacity.map_or(capacity, |current| current.max(capacity)));
+            entry.capacity = Some(
+                entry
+                    .capacity
+                    .map_or(capacity, |current| current.max(capacity)),
+            );
         }
 
         if let Ok(max_freq_khz) = read_u32(
@@ -120,8 +124,11 @@ fn read_physical_core_metrics() -> io::Result<Vec<PhysicalCoreMetrics>> {
                 .join("cpufreq")
                 .join("cpuinfo_max_freq"),
         ) {
-            entry.max_freq_khz =
-                Some(entry.max_freq_khz.map_or(max_freq_khz, |current| current.max(max_freq_khz)));
+            entry.max_freq_khz = Some(
+                entry
+                    .max_freq_khz
+                    .map_or(max_freq_khz, |current| current.max(max_freq_khz)),
+            );
         }
     }
 
@@ -216,7 +223,9 @@ fn select_performance_cores_by_metric(
     logical_processor_ids.sort_unstable();
     logical_processor_ids.dedup();
 
-    Some(PerformanceCoreSelection { logical_processor_ids })
+    Some(PerformanceCoreSelection {
+        logical_processor_ids,
+    })
 }
 
 #[cfg(target_os = "linux")]

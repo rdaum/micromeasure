@@ -65,6 +65,7 @@ am sharing it.
 
 - timing and throughput
 - median, p95, MAD, coefficient of variation, and outlier counts
+- coordinated concurrent microbenchmarks with the same sample/report pipeline
 - Linux perf counters when available
 - graceful fallback to timing-only runs when PMU access is unavailable
 - persisted benchmark reports with per-sample throughput and latency series
@@ -95,6 +96,12 @@ For a standalone example in this repository, run:
 
 ```sh
 cargo run --example basic --release
+```
+
+For a concurrent workload example, run:
+
+```sh
+cargo run --example concurrent_scenario --release
 ```
 
 In a consuming crate, you would usually run your benchmark with:
@@ -131,6 +138,46 @@ fn main() {
     let _ = report.save_to_default_location();
 }
 ```
+
+## Concurrent Benchmarks
+
+`micromeasure` can also benchmark coordinated concurrent workloads while still using the same
+sample-driven measurement pipeline as the single-threaded path.
+
+That means concurrent benchmarks still get:
+
+- the usual sample count and calibration flow
+- the usual timing statistics
+- Linux PMU counters when available
+- persisted `BenchmarkResult` data and normal session summaries
+
+The difference is the shape of one sample: instead of one function running on one thread, a sample
+runs multiple worker roles against shared state for a fixed sample window.
+
+Use this when the thing you care about only shows up under contention, for example:
+
+- cache misses caused by reader/writer interference
+- branch miss behaviour in optimistic retry loops
+- lock or latch implementations under mixed access patterns
+
+The concurrent API is centered on:
+
+- `ConcurrentBenchContext`
+- `ConcurrentWorker`
+- `ConcurrentBenchControl`
+- `BenchmarkRunner::concurrent_group(...)`
+
+See [examples/concurrent_scenario.rs](./examples/concurrent_scenario.rs) for a complete
+reader/writer contention benchmark using `ConcurrentBenchContext` and
+`BenchmarkRunner::concurrent_group(...)`.
+
+In concurrent output, worker-role tables are the primary view. Each worker role gets the same
+stats table shape as the normal benchmark path, including throughput, latency, and PMU-derived
+metrics like instructions/op, branch misses, and cache misses.
+
+The `workers combined` section at the bottom is a whole-scenario aggregate. It is mainly useful as
+the PMU view of the entire interacting workload; the worker-role tables are usually the more
+meaningful place to interpret throughput and latency.
 
 ## Linux-first, and why
 

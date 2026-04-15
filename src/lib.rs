@@ -30,16 +30,18 @@ mod threading;
 
 pub use bench::{
     BenchContext, BenchmarkRunner, ConcurrentBenchContext, ConcurrentBenchControl,
-    ConcurrentBenchmarkGroup, ConcurrentWorker, NoContext,
+    ConcurrentBenchmarkGroup, ConcurrentWorker, ConcurrentWorkerResult, CounterValue, NoContext,
 };
-pub use launcher::{BenchmarkMainOptions, benchmark_filter_from_args, benchmark_filter_from_env, run_benchmark_main};
+pub use launcher::{
+    BenchmarkMainOptions, benchmark_filter_from_args, benchmark_filter_from_env, run_benchmark_main,
+};
 pub use table::{Alignment, BorderColor, TableFormatter};
 
 #[cfg(target_os = "linux")]
 pub use bench::PerfCounters;
 pub use session::{
     BenchmarkKind, BenchmarkReport, BenchmarkResult, BenchmarkStats, ComparisonPolicy,
-    WorkerSummary,
+    WorkerCounterSummary, WorkerSummary,
 };
 
 // Re-export key types for convenience
@@ -53,7 +55,10 @@ pub use perf_event;
 macro_rules! benchmark_main {
     (|$runner:ident| $body:block) => {
         fn main() {
-            let _ = $crate::run_benchmark_main($crate::BenchmarkMainOptions::default(), |$runner| $body);
+            let _ =
+                $crate::run_benchmark_main($crate::BenchmarkMainOptions::default(), |$runner| {
+                    $body
+                });
         }
     };
     ($options:expr, |$runner:ident| $body:block) => {

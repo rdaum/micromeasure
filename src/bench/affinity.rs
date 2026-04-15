@@ -227,10 +227,10 @@ impl BenchAffinityGuard {
             };
 
             let did_pin = pin_current_thread(core_id, "benchmark thread");
-            return Self {
+            Self {
                 restore_mask: did_pin.then_some(restore_mask).flatten(),
                 did_pin,
-            };
+            }
         }
 
         #[cfg(not(target_os = "linux"))]

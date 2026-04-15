@@ -107,6 +107,12 @@ For a concurrent workload example, run:
 cargo run --example concurrent_scenario --release
 ```
 
+For a concurrent workload example with bench-defined event counters, run:
+
+```sh
+cargo run --example concurrent_counters --release
+```
+
 In a consuming crate, you would usually run your benchmark with:
 
 ```sh
@@ -172,11 +178,27 @@ The concurrent API is centered on:
 - `ConcurrentBenchContext`
 - `ConcurrentWorker`
 - `ConcurrentBenchControl`
+- `ConcurrentWorkerResult`
 - `BenchmarkRunner::concurrent_group(...)`
 
 See [examples/concurrent_scenario.rs](./examples/concurrent_scenario.rs) for a complete
 reader/writer contention benchmark using `ConcurrentBenchContext` and
 `BenchmarkRunner::concurrent_group(...)`.
+
+If a concurrent benchmark needs to report scenario-specific events such as retries, failed
+try-locks, dropped work, or backoffs, workers can return `ConcurrentWorkerResult` instead of
+just an operation count. These event counters are intended to be:
+
+- worker-local plain integers in the hot loop
+- packaged once at the end of the sample
+- aggregated by worker role after join
+
+That keeps event reporting out of the measured hot path. The framework reports them under each
+worker role as `bench event counters`, including total count, per-operation rate, and per-second
+rate.
+
+See [examples/concurrent_counters.rs](./examples/concurrent_counters.rs) for a complete
+concurrent benchmark that reports bench-defined event counters.
 
 In concurrent output, worker-role tables are the primary view. Each worker role gets the same
 stats table shape as the normal benchmark path, including throughput, latency, and PMU-derived

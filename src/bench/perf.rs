@@ -1,4 +1,7 @@
-use super::{ConcurrentBenchContext, ConcurrentBenchControl, Results, safe_ratio_f64};
+use super::{
+    ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorkerMeasurement,
+    ConcurrentWorkerResult, Results, safe_ratio_f64,
+};
 use std::{
     io,
     sync::atomic::{AtomicBool, Ordering},
@@ -295,22 +298,7 @@ fn disable_counter(counter: &mut Option<perf_event::Counter>, name: &str) {
 }
 
 #[cfg(target_os = "linux")]
-fn timing_window(
-    instructions_enabled: u64,
-    instructions_running: u64,
-    branches_enabled: u64,
-    branches_running: u64,
-    branch_misses_enabled: u64,
-    branch_misses_running: u64,
-    cache_misses_enabled: u64,
-    cache_misses_running: u64,
-) -> (u64, u64) {
-    let timing_candidates = [
-        (instructions_enabled, instructions_running),
-        (branches_enabled, branches_running),
-        (branch_misses_enabled, branch_misses_running),
-        (cache_misses_enabled, cache_misses_running),
-    ];
+fn timing_window(timing_candidates: [(u64, u64); 4]) -> (u64, u64) {
 
     timing_candidates
         .iter()
@@ -376,16 +364,12 @@ fn run_with_individual_counters(run: &mut impl FnMut() -> u64) -> Results {
     let (cache_misses, cache_misses_enabled, cache_misses_running) =
         read_scaled_counter(&mut cache_misses_counter, "cache-misses");
 
-    let (pmu_time_enabled_ns, pmu_time_running_ns) = timing_window(
-        instructions_enabled,
-        instructions_running,
-        branches_enabled,
-        branches_running,
-        branch_misses_enabled,
-        branch_misses_running,
-        cache_misses_enabled,
-        cache_misses_running,
-    );
+    let (pmu_time_enabled_ns, pmu_time_running_ns) = timing_window([
+        (instructions_enabled, instructions_running),
+        (branches_enabled, branches_running),
+        (branch_misses_enabled, branch_misses_running),
+        (cache_misses_enabled, cache_misses_running),
+    ]);
 
     Results {
         instructions,
@@ -501,9 +485,18 @@ pub(super) fn execute_standard(mut run: impl FnMut() -> u64) -> Results {
 pub(super) fn execute_concurrent_worker<T: ConcurrentBenchContext>(
     prepared: &T,
     control: &ConcurrentBenchControl,
-    run: fn(&T, &ConcurrentBenchControl) -> u64,
-) -> Results {
-    execute_standard(|| run(prepared, control))
+    run: fn(&T, &ConcurrentBenchControl) -> ConcurrentWorkerResult,
+) -> ConcurrentWorkerMeasurement {
+    let mut maybe_counters = None;
+    let results = execute_standard(|| {
+        let worker_result = run(prepared, control);
+        maybe_counters = Some(worker_result.counters);
+        worker_result.operations
+    });
+    ConcurrentWorkerMeasurement {
+        results,
+        counters: maybe_counters.unwrap_or_default(),
+    }
 }
 
 /// Performance counter controls for fine-grained measurement

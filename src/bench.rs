@@ -17,7 +17,10 @@ mod perf;
 mod stats;
 
 use crate::session::BenchmarkSession;
-use crate::{BenchmarkKind, BenchmarkReport, BenchmarkResult, WorkerSummary};
+use crate::{
+    Alignment, BenchmarkKind, BenchmarkReport, BenchmarkResult, TableFormatter,
+    WorkerCounterSummary, WorkerSummary,
+};
 #[cfg(target_os = "linux")]
 use affinity::concurrent_worker_pin_cores;
 use affinity::{BenchAffinityGuard, warn_affinity_once};
@@ -49,7 +52,7 @@ const MIN_SAMPLES: usize = 20;
 const MAX_SAMPLES: usize = 100;
 
 type BenchFunction<T> = fn(&mut T, usize, usize);
-type ConcurrentBenchFunction<T> = fn(&T, &ConcurrentBenchControl) -> u64;
+type ConcurrentBenchFunction<T> = fn(&T, &ConcurrentBenchControl) -> ConcurrentWorkerResult;
 
 #[derive(Clone, Copy)]
 pub struct ConcurrentBenchControl {
@@ -82,14 +85,58 @@ pub struct ConcurrentWorker<T> {
     pub run: ConcurrentBenchFunction<T>,
 }
 
+#[derive(Clone, Debug)]
+pub struct CounterValue {
+    pub name: &'static str,
+    pub value: u64,
+}
+
+impl CounterValue {
+    pub fn new(name: &'static str, value: u64) -> Self {
+        Self { name, value }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ConcurrentWorkerResult {
+    pub operations: u64,
+    pub counters: Vec<CounterValue>,
+}
+
+impl ConcurrentWorkerResult {
+    pub fn operations(operations: u64) -> Self {
+        Self {
+            operations,
+            counters: Vec::new(),
+        }
+    }
+
+    pub fn with_counter(mut self, name: &'static str, value: u64) -> Self {
+        self.counters.push(CounterValue::new(name, value));
+        self
+    }
+}
+
+impl From<u64> for ConcurrentWorkerResult {
+    fn from(operations: u64) -> Self {
+        Self::operations(operations)
+    }
+}
+
 #[derive(Clone)]
 struct WorkerSampleSummary {
     results: Results,
+    counters: Vec<CounterValue>,
 }
 
 struct ConcurrentSampleResult {
     results: Results,
     worker_summaries: Vec<WorkerSampleSummary>,
+}
+
+pub(super) struct ConcurrentWorkerMeasurement {
+    pub results: Results,
+    pub counters: Vec<CounterValue>,
 }
 
 #[derive(Clone, Default)]
@@ -255,6 +302,87 @@ fn update_running_throughput(running_throughput: &mut f64, result: &Results) {
     }
 }
 
+fn merge_counter_values(acc: &mut Vec<CounterValue>, new_values: &[CounterValue]) {
+    for new_value in new_values {
+        if let Some(existing) = acc.iter_mut().find(|value| value.name == new_value.name) {
+            existing.value = existing.value.saturating_add(new_value.value);
+        } else {
+            acc.push(new_value.clone());
+        }
+    }
+    acc.sort_by(|left, right| left.name.cmp(right.name));
+}
+
+fn summarize_worker_counters(
+    counters: &[CounterValue],
+    operations: u64,
+    total_duration_sec: f64,
+) -> Vec<WorkerCounterSummary> {
+    counters
+        .iter()
+        .map(|counter| WorkerCounterSummary {
+            name: counter.name.to_string(),
+            total: counter.value,
+            per_op: if operations > 0 {
+                counter.value as f64 / operations as f64
+            } else {
+                0.0
+            },
+            per_sec: if total_duration_sec > 0.0 {
+                counter.value as f64 / total_duration_sec
+            } else {
+                0.0
+            },
+        })
+        .collect()
+}
+
+fn render_worker_counters(counters: &[WorkerCounterSummary]) {
+    if counters.is_empty() {
+        return;
+    }
+
+    println!("  bench event counters:");
+    let mut table = TableFormatter::new(
+        vec!["Event", "Total", "Per Op", "Per Sec"],
+        vec![28, 16, 14, 16],
+    )
+    .with_alignments(vec![
+        Alignment::Left,
+        Alignment::Right,
+        Alignment::Right,
+        Alignment::Right,
+    ]);
+
+    for counter in counters {
+        table.add_row(vec![
+            &counter.name,
+            &counter.total.to_string(),
+            &format_small_rate(counter.per_op),
+            &format!("{:.2}", counter.per_sec),
+        ]);
+    }
+
+    table.print();
+}
+
+fn format_small_rate(value: f64) -> String {
+    if !value.is_finite() {
+        return "n/a".to_string();
+    }
+
+    if value == 0.0 {
+        return "0".to_string();
+    }
+
+    let abs = value.abs();
+    if abs >= 0.001 {
+        format!("{value:.4}")
+    } else {
+        format!("{value:.3e}")
+    }
+}
+
 fn render_result_section(
     title: &str,
     stats: &crate::BenchmarkStats,
@@ -310,6 +438,7 @@ fn render_concurrent_results(
             false,
             Some(crate::BorderColor::Cyan),
         );
+        render_worker_counters(&worker_summary.counters);
         println!();
     }
     render_result_section("workers combined", combined_stats, true, None);
@@ -418,14 +547,11 @@ fn total_worker_threads<T>(workers: &[ConcurrentWorker<T>]) -> usize {
     workers.iter().map(|worker| worker.threads).sum()
 }
 
-fn warm_up_concurrent_engine<T: ConcurrentBenchContext, F: Fn(usize) -> T + ?Sized>(
+fn warm_up_concurrent_engine<T: ConcurrentBenchContext + Sync, F: Fn(usize) -> T + ?Sized>(
     sample_duration: Duration,
     workers: &[ConcurrentWorker<T>],
     factory: &F,
-) -> ConcurrentBenchmarkConfig
-where
-    T: Sync,
-{
+) -> ConcurrentBenchmarkConfig {
     rewrite_line("🔥 calibrating benchmark");
 
     let total_threads = total_worker_threads(workers);
@@ -468,6 +594,7 @@ where
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn execute_timing_only(run: impl FnOnce() -> u64) -> Results {
     let start_time = Instant::now();
     let iterations = run();
@@ -476,6 +603,22 @@ fn execute_timing_only(run: impl FnOnce() -> u64) -> Results {
         iterations,
         chunks_executed: 1,
         ..Results::default()
+    }
+}
+
+fn execute_concurrent_timing_only_measurement(
+    run: impl FnOnce() -> ConcurrentWorkerResult,
+) -> ConcurrentWorkerMeasurement {
+    let start_time = Instant::now();
+    let worker_result = run();
+    ConcurrentWorkerMeasurement {
+        results: Results {
+            duration: start_time.elapsed(),
+            iterations: worker_result.operations,
+            chunks_executed: 1,
+            ..Results::default()
+        },
+        counters: worker_result.counters,
     }
 }
 
@@ -503,14 +646,11 @@ fn execute_standard_sample<T: BenchContext>(
     }
 }
 
-fn execute_concurrent_timing_only<T: ConcurrentBenchContext>(
+fn execute_concurrent_timing_only<T: ConcurrentBenchContext + Sync>(
     prepared: &T,
     sample_duration: Duration,
     workers: &[ConcurrentWorker<T>],
-) -> ConcurrentSampleResult
-where
-    T: Sync,
-{
+) -> ConcurrentSampleResult {
     execute_concurrent_sample_inner(
         prepared,
         sample_duration,
@@ -521,15 +661,12 @@ where
     )
 }
 
-fn execute_concurrent_sample<T: ConcurrentBenchContext>(
+fn execute_concurrent_sample<T: ConcurrentBenchContext + Sync>(
     prepared: &T,
     sample_duration: Duration,
     workers: &[ConcurrentWorker<T>],
     #[cfg(target_os = "linux")] pin_cores: &[usize],
-) -> ConcurrentSampleResult
-where
-    T: Sync,
-{
+) -> ConcurrentSampleResult {
     execute_concurrent_sample_inner(
         prepared,
         sample_duration,
@@ -540,16 +677,13 @@ where
     )
 }
 
-fn execute_concurrent_sample_inner<T: ConcurrentBenchContext>(
+fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
     prepared: &T,
     sample_duration: Duration,
     workers: &[ConcurrentWorker<T>],
     #[cfg(target_os = "linux")] pin_cores: &[usize],
     use_perf_counters: bool,
-) -> ConcurrentSampleResult
-where
-    T: Sync,
-{
+) -> ConcurrentSampleResult {
     let total_threads = total_worker_threads(workers);
     let ready_barrier = Barrier::new(total_threads + 1);
     let start_barrier = Barrier::new(total_threads + 1);
@@ -597,10 +731,14 @@ where
                         }
                         #[cfg(not(target_os = "linux"))]
                         {
-                            execute_timing_only(|| black_box(|| run(prepared, &control))())
+                            execute_concurrent_timing_only_measurement(|| {
+                                black_box(|| run(prepared, &control))()
+                            })
                         }
                     } else {
-                        execute_timing_only(|| black_box(|| run(prepared, &control))())
+                        execute_concurrent_timing_only_measurement(|| {
+                            black_box(|| run(prepared, &control))()
+                        })
                     };
 
                     (worker_index, worker_result)
@@ -615,11 +753,13 @@ where
 
         let mut aggregate = Results::default();
         let mut worker_results = vec![Results::default(); workers.len()];
+        let mut worker_counters = vec![Vec::<CounterValue>::new(); workers.len()];
         for handle in handles {
             let (worker_index, worker_result) =
                 handle.join().expect("concurrent benchmark worker panicked");
-            worker_results[worker_index].add(&worker_result);
-            aggregate.add(&worker_result);
+            worker_results[worker_index].add(&worker_result.results);
+            merge_counter_values(&mut worker_counters[worker_index], &worker_result.counters);
+            aggregate.add(&worker_result.results);
         }
 
         let wall_duration = benchmark_start.elapsed();
@@ -634,7 +774,8 @@ where
             results: aggregate,
             worker_summaries: worker_results
                 .into_iter()
-                .map(|results| WorkerSampleSummary { results })
+                .zip(worker_counters)
+                .map(|(results, counters)| WorkerSampleSummary { results, counters })
                 .collect(),
         }
     })
@@ -710,13 +851,11 @@ impl BenchmarkRunner {
         f(&group);
     }
 
-    pub fn concurrent_group<T: ConcurrentBenchContext>(
+    pub fn concurrent_group<T: ConcurrentBenchContext + Send + Sync>(
         &self,
         name: &'static str,
         f: impl FnOnce(&ConcurrentBenchmarkGroup<T>),
-    ) where
-        T: Send + Sync,
-    {
+    ) {
         let group = ConcurrentBenchmarkGroup {
             runner: self,
             name,
@@ -805,30 +944,29 @@ impl BenchmarkRunner {
         });
     }
 
-    pub fn run_concurrent<T: ConcurrentBenchContext>(
+    pub fn run_concurrent<T: ConcurrentBenchContext + Send + Sync>(
         &self,
         name: &str,
         group: &str,
         sample_duration: Duration,
         workers: &[ConcurrentWorker<T>],
-    ) where
-        T: Send + Sync,
-    {
+    ) {
         self.run_concurrent_with_factory(name, group, sample_duration, workers, &|num_threads| {
             T::prepare(num_threads)
         });
     }
 
-    pub fn run_concurrent_with_factory<T: ConcurrentBenchContext, F: Fn(usize) -> T + ?Sized>(
+    pub fn run_concurrent_with_factory<
+        T: ConcurrentBenchContext + Send + Sync,
+        F: Fn(usize) -> T + ?Sized,
+    >(
         &self,
         name: &str,
         group: &str,
         sample_duration: Duration,
         workers: &[ConcurrentWorker<T>],
         factory: &F,
-    ) where
-        T: Send + Sync,
-    {
+    ) {
         if !self.should_run(name, group) {
             return;
         }
@@ -870,6 +1008,7 @@ impl BenchmarkRunner {
         let mut all_results = Vec::with_capacity(config.target_samples);
         let mut summed_results = Results::default();
         let mut summed_worker_results = vec![Results::default(); workers.len()];
+        let mut summed_worker_counters = vec![Vec::<CounterValue>::new(); workers.len()];
         let mut all_worker_results = vec![Vec::with_capacity(config.target_samples); workers.len()];
         let mut running_throughput = config.estimated_ops_per_sec / 1_000_000.0;
 
@@ -886,6 +1025,7 @@ impl BenchmarkRunner {
             update_running_throughput(&mut running_throughput, &sample_result.results);
             for (index, worker_summary) in sample_result.worker_summaries.iter().enumerate() {
                 summed_worker_results[index].add(&worker_summary.results);
+                merge_counter_values(&mut summed_worker_counters[index], &worker_summary.counters);
                 all_worker_results[index].push(worker_summary.results.clone());
             }
 
@@ -906,15 +1046,26 @@ impl BenchmarkRunner {
             .iter()
             .zip(summed_worker_results.iter())
             .zip(all_worker_results.iter())
-            .map(|((worker, worker_results), worker_samples)| WorkerSummary {
-                name: worker.name.to_string(),
-                threads: worker.threads,
-                stats: benchmark_stats_from_samples(
-                    worker_results,
-                    worker_samples,
-                    config.target_samples,
-                ),
-            })
+            .zip(summed_worker_counters.iter())
+            .map(
+                |(((worker, worker_results), worker_samples), worker_counters)| {
+                    let stats = benchmark_stats_from_samples(
+                        worker_results,
+                        worker_samples,
+                        config.target_samples,
+                    );
+                    WorkerSummary {
+                        name: worker.name.to_string(),
+                        threads: worker.threads,
+                        counters: summarize_worker_counters(
+                            worker_counters,
+                            stats.operations,
+                            stats.total_duration_sec,
+                        ),
+                        stats,
+                    }
+                },
+            )
             .collect();
 
         render_concurrent_results(name, &stats, &worker_summaries);

@@ -1,17 +1,3 @@
-// Copyright 2026 Ryan Daum
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use micromeasure::{
     ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker, ConcurrentWorkerResult,
     benchmark_main, black_box,
@@ -36,6 +22,7 @@ fn optimistic_reader(
 ) -> ConcurrentWorkerResult {
     let mut operations = 0_u64;
     let mut read_misses = 0_u64;
+
     while !control.should_stop() {
         if let Ok(guard) = ctx.value.try_read() {
             black_box(*guard ^ control.thread_index() as u64 ^ control.role_thread_index() as u64);
@@ -44,6 +31,7 @@ fn optimistic_reader(
             read_misses = read_misses.wrapping_add(1);
         }
     }
+
     ConcurrentWorkerResult::operations(operations).with_counter("read_misses", read_misses)
 }
 
@@ -52,12 +40,14 @@ fn exclusive_writer(
     control: &ConcurrentBenchControl,
 ) -> ConcurrentWorkerResult {
     let mut operations = 0_u64;
+
     while !control.should_stop() {
         let mut guard = ctx.value.write().expect("rwlock poisoned");
         *guard = guard.wrapping_add(control.thread_index() as u64 + 1);
         black_box(*guard);
         operations = operations.wrapping_add(1);
     }
+
     ConcurrentWorkerResult::operations(operations)
 }
 
@@ -77,7 +67,7 @@ benchmark_main!(|runner| {
 
     runner.concurrent_group::<CounterLatch>("Contention", |g| {
         g.bench(
-            "rwlock_readers_vs_writer",
+            "rwlock_readers_vs_writer_with_counters",
             Duration::from_millis(50),
             &workers,
         );

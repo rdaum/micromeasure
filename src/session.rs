@@ -72,11 +72,21 @@ pub struct BenchmarkStats {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerCounterSummary {
+    pub name: String,
+    pub total: u64,
+    pub per_op: f64,
+    pub per_sec: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerSummary {
     pub name: String,
     pub threads: usize,
     #[serde(flatten)]
     pub stats: BenchmarkStats,
+    #[serde(default)]
+    pub counters: Vec<WorkerCounterSummary>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

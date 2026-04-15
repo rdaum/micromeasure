@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use micromeasure::{BenchmarkRunner, ComparisonPolicy, NoContext, black_box};
+use micromeasure::{NoContext, benchmark_main, black_box};
 
 fn add_loop(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
     let mut acc = black_box(0_u64);
@@ -23,14 +23,8 @@ fn add_loop(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
     black_box(acc);
 }
 
-fn main() {
-    let runner = BenchmarkRunner::new();
-
+benchmark_main!(|runner| {
     runner.group::<NoContext>("Arithmetic", |g| {
         g.bench("add_loop", add_loop);
     });
-
-    let report = runner.report();
-    report.print_summary_with(ComparisonPolicy::LatestCompatible);
-    let _ = report.save_to_default_location();
-}
+});

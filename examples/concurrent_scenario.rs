@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use micromeasure::{
-    BenchmarkRunner, ComparisonPolicy, ConcurrentBenchContext, ConcurrentBenchControl,
-    ConcurrentWorker, black_box,
+    ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker, benchmark_main, black_box,
 };
 use std::sync::RwLock;
 use std::time::Duration;
@@ -52,8 +51,7 @@ fn exclusive_writer(ctx: &CounterLatch, control: &ConcurrentBenchControl) -> u64
     operations
 }
 
-fn main() {
-    let runner = BenchmarkRunner::new();
+benchmark_main!(|runner| {
     let workers = [
         ConcurrentWorker {
             name: "optimistic_reader",
@@ -74,8 +72,4 @@ fn main() {
             &workers,
         );
     });
-
-    let report = runner.report();
-    report.print_summary_with(ComparisonPolicy::LatestCompatible);
-    let _ = report.save_to_default_location();
-}
+});

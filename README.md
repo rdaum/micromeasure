@@ -90,6 +90,9 @@ harness = false
 
 That bench target usually lives at `benches/basic.rs`.
 
+For the bench entrypoint itself, prefer the shared launcher instead of hand-rolling argument
+parsing, report printing, and result persistence in every benchmark binary.
+
 ## Example
 
 For a standalone example in this repository, run:
@@ -115,7 +118,7 @@ Example output:
 ![micromeasure example output](screenshot.png)
 
 ```rust
-use micromeasure::{BenchmarkRunner, ComparisonPolicy, NoContext, black_box};
+use micromeasure::{NoContext, benchmark_main, black_box};
 
 fn add_bench(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
     let mut acc = black_box(0_u64);
@@ -126,18 +129,22 @@ fn add_bench(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
     black_box(acc);
 }
 
-fn main() {
-    let runner = BenchmarkRunner::new();
-
+benchmark_main!(|runner| {
     runner.group::<NoContext>("Arithmetic", |g| {
         g.bench("add_loop", add_bench);
     });
-
-    let report = runner.report();
-    report.print_summary_with(ComparisonPolicy::LatestCompatible);
-    let _ = report.save_to_default_location();
-}
+});
 ```
+
+`benchmark_main!` handles:
+
+- parsing an optional benchmark filter from the command line
+- constructing `BenchmarkRunner` with that filter
+- printing the session summary
+- saving the report to the default location
+
+If you want a custom suite name or custom filter help text, use
+`run_benchmark_main(BenchmarkMainOptions { ... }, |runner| { ... })` instead.
 
 ## Concurrent Benchmarks
 

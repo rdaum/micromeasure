@@ -23,6 +23,7 @@
 //! - Generic table formatting
 
 pub mod bench;
+mod launcher;
 mod session;
 pub mod table;
 mod threading;
@@ -31,6 +32,7 @@ pub use bench::{
     BenchContext, BenchmarkRunner, ConcurrentBenchContext, ConcurrentBenchControl,
     ConcurrentBenchmarkGroup, ConcurrentWorker, NoContext,
 };
+pub use launcher::{BenchmarkMainOptions, benchmark_filter_from_args, benchmark_filter_from_env, run_benchmark_main};
 pub use table::{Alignment, BorderColor, TableFormatter};
 
 #[cfg(target_os = "linux")]
@@ -46,3 +48,17 @@ pub use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 pub use perf_event;
+
+#[macro_export]
+macro_rules! benchmark_main {
+    (|$runner:ident| $body:block) => {
+        fn main() {
+            let _ = $crate::run_benchmark_main($crate::BenchmarkMainOptions::default(), |$runner| $body);
+        }
+    };
+    ($options:expr, |$runner:ident| $body:block) => {
+        fn main() {
+            let _ = $crate::run_benchmark_main($options, |$runner| $body);
+        }
+    };
+}

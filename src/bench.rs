@@ -34,7 +34,7 @@ use stats::{
 use std::time::Instant;
 use std::{
     hint::black_box,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     sync::Barrier,
     thread,
     time::Duration,
@@ -141,14 +141,24 @@ pub(super) struct ConcurrentWorkerMeasurement {
 
 #[derive(Clone, Default)]
 pub struct Results {
+    pub cycles: u64,
     pub instructions: u64,
+    pub cache_references: u64,
+    pub l1i_misses: u64,
     pub branches: u64,
     pub branch_misses: u64,
     pub cache_misses: u64,
+    pub stalled_cycles_frontend: u64,
+    pub stalled_cycles_backend: u64,
+    pub has_cycles: bool,
     pub has_instructions: bool,
+    pub has_cache_references: bool,
+    pub has_l1i_misses: bool,
     pub has_branches: bool,
     pub has_branch_misses: bool,
     pub has_cache_misses: bool,
+    pub has_stalled_cycles_frontend: bool,
+    pub has_stalled_cycles_backend: bool,
     pub pmu_time_enabled_ns: u64,
     pub pmu_time_running_ns: u64,
     pub duration: Duration,
@@ -158,14 +168,24 @@ pub struct Results {
 
 impl Results {
     pub fn add(&mut self, other: &Results) {
+        self.cycles += other.cycles;
         self.instructions += other.instructions;
+        self.cache_references += other.cache_references;
+        self.l1i_misses += other.l1i_misses;
         self.branches += other.branches;
         self.branch_misses += other.branch_misses;
         self.cache_misses += other.cache_misses;
+        self.stalled_cycles_frontend += other.stalled_cycles_frontend;
+        self.stalled_cycles_backend += other.stalled_cycles_backend;
+        self.has_cycles |= other.has_cycles;
         self.has_instructions |= other.has_instructions;
+        self.has_cache_references |= other.has_cache_references;
+        self.has_l1i_misses |= other.has_l1i_misses;
         self.has_branches |= other.has_branches;
         self.has_branch_misses |= other.has_branch_misses;
         self.has_cache_misses |= other.has_cache_misses;
+        self.has_stalled_cycles_frontend |= other.has_stalled_cycles_frontend;
+        self.has_stalled_cycles_backend |= other.has_stalled_cycles_backend;
         self.pmu_time_enabled_ns += other.pmu_time_enabled_ns;
         self.pmu_time_running_ns += other.pmu_time_running_ns;
         self.duration += other.duration;
@@ -178,10 +198,15 @@ impl Results {
             return;
         }
 
+        self.cycles /= divisor;
         self.instructions /= divisor;
+        self.cache_references /= divisor;
+        self.l1i_misses /= divisor;
         self.branches /= divisor;
         self.branch_misses /= divisor;
         self.cache_misses /= divisor;
+        self.stalled_cycles_frontend /= divisor;
+        self.stalled_cycles_backend /= divisor;
         self.pmu_time_enabled_ns /= divisor;
         self.pmu_time_running_ns /= divisor;
         self.duration /= divisor as u32;
@@ -269,14 +294,21 @@ fn estimated_mops_display(ops_per_sec: f64) -> String {
 }
 
 fn has_perf_counters(results: &Results) -> bool {
-    results.has_instructions
+    results.has_cycles
+        || results.has_instructions
+        || results.has_cache_references
+        || results.has_l1i_misses
         || results.has_branches
         || results.has_branch_misses
         || results.has_cache_misses
+        || results.has_stalled_cycles_frontend
+        || results.has_stalled_cycles_backend
 }
 
 fn has_full_perf_counters(results: &Results) -> bool {
-    results.has_instructions
+    results.has_cycles
+        && results.has_instructions
+        && results.has_cache_references
         && results.has_branches
         && results.has_branch_misses
         && results.has_cache_misses
@@ -284,10 +316,15 @@ fn has_full_perf_counters(results: &Results) -> bool {
 
 fn measurement_results_from_stats(stats: &crate::BenchmarkStats) -> Results {
     Results {
+        has_cycles: stats.has_cycles,
         has_instructions: stats.has_instructions,
+        has_cache_references: stats.has_cache_references,
+        has_l1i_misses: stats.has_l1i_misses,
         has_branches: stats.has_branches,
         has_branch_misses: stats.has_branch_misses,
         has_cache_misses: stats.has_cache_misses,
+        has_stalled_cycles_frontend: stats.has_stalled_cycles_frontend,
+        has_stalled_cycles_backend: stats.has_stalled_cycles_backend,
         pmu_time_enabled_ns: stats.pmu_time_enabled_ns,
         pmu_time_running_ns: stats.pmu_time_running_ns,
         ..Results::default()
@@ -403,6 +440,8 @@ fn render_result_section(
     ) {
         println!("{pmu_byline}");
     }
+
+    render_diagnostics(stats);
 }
 
 fn render_standard_results(name: &str, stats: &crate::BenchmarkStats) {
@@ -415,6 +454,7 @@ fn render_standard_results(name: &str, stats: &crate::BenchmarkStats) {
     if let Some(pmu_byline) = render_stats_table(stats, measurement_label(has_perf), None) {
         println!("{pmu_byline}");
     }
+    render_diagnostics(stats);
 }
 
 fn render_concurrent_results(
@@ -442,6 +482,92 @@ fn render_concurrent_results(
         println!();
     }
     render_result_section("workers combined", combined_stats, true, None);
+}
+
+fn render_diagnostics(stats: &crate::BenchmarkStats) {
+    let diagnostics = diagnose_stats(stats);
+    if diagnostics.is_empty() {
+        return;
+    }
+
+    println!("  possible bottlenecks:");
+    for diagnostic in diagnostics {
+        println!("    - {}", colorize_problem(&diagnostic));
+    }
+}
+
+fn colorize_problem(text: &str) -> String {
+    if !std::io::stdout().is_terminal() {
+        return text.to_string();
+    }
+
+    format!("\x1b[31m{text}\x1b[0m")
+}
+
+fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+
+    if stats.has_cycles
+        && stats.has_stalled_cycles_backend
+        && stats.backend_stall_percent >= 20.0
+        && stats.has_cache_misses
+        && ((stats.has_cache_references && stats.cache_miss_percent >= 5.0)
+            || stats.cache_misses_per_op >= 0.05)
+    {
+        diagnostics.push(format!(
+            "Likely data-side memory latency: backend stall is {:.1}% with cache pressure at {:.2}% miss rate and {:.4} misses/op",
+            stats.backend_stall_percent,
+            stats.cache_miss_percent,
+            stats.cache_misses_per_op
+        ));
+    }
+
+    if stats.has_cycles
+        && stats.has_stalled_cycles_frontend
+        && stats.frontend_stall_percent >= 20.0
+        && stats.has_branches
+        && stats.has_branch_misses
+        && stats.branch_miss_rate >= 3.0
+    {
+        diagnostics.push(format!(
+            "Likely branch predictor or fetch disruption: frontend stall is {:.1}% with {:.2}% branch misses",
+            stats.frontend_stall_percent,
+            stats.branch_miss_rate
+        ));
+    }
+
+    if stats.has_cycles
+        && stats.has_stalled_cycles_frontend
+        && stats.frontend_stall_percent >= 20.0
+        && stats.has_l1i_misses
+        && stats.l1i_misses_per_op >= 0.01
+    {
+        diagnostics.push(format!(
+            "Likely instruction-cache pressure: frontend stall is {:.1}% with {:.4} L1I misses/op",
+            stats.frontend_stall_percent, stats.l1i_misses_per_op
+        ));
+    }
+
+    if stats.has_cycles
+        && stats.has_instructions
+        && stats.ipc > 0.0
+        && stats.ipc < 1.0
+        && diagnostics.is_empty()
+    {
+        diagnostics.push(format!(
+            "Low IPC ({:.3}) suggests poor machine utilization; look for dependency chains, execution-port pressure, or latent memory effects",
+            stats.ipc
+        ));
+    }
+
+    if stats.cv_percent >= 10.0 || stats.outlier_count >= (stats.samples / 10).max(2) {
+        diagnostics.push(format!(
+            "Run stability is weak: CV {:.2}% with {} outliers across {} samples",
+            stats.cv_percent, stats.outlier_count, stats.samples
+        ));
+    }
+
+    diagnostics
 }
 
 fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(

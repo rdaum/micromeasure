@@ -9,7 +9,9 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use perf_event::{Builder, Group, events::Hardware};
+use perf_event::events::{Cache, CacheId, CacheOp, CacheResult, Hardware};
+#[cfg(target_os = "linux")]
+use perf_event::{Builder, Group};
 #[cfg(target_os = "linux")]
 use std::sync::{Mutex, OnceLock};
 
@@ -18,10 +20,15 @@ const MIN_PMU_ACTIVE_PERCENT: f64 = 90.0;
 #[cfg(target_os = "linux")]
 struct PerfGroupCounters {
     group: Group,
+    cycles: Option<perf_event::Counter>,
     instructions: Option<perf_event::Counter>,
+    cache_references: Option<perf_event::Counter>,
+    l1i_misses: Option<perf_event::Counter>,
     branches: Option<perf_event::Counter>,
     branch_misses: Option<perf_event::Counter>,
     cache_misses: Option<perf_event::Counter>,
+    stalled_cycles_frontend: Option<perf_event::Counter>,
+    stalled_cycles_backend: Option<perf_event::Counter>,
 }
 
 pub(super) fn pmu_active_percent(results: &Results) -> f64 {
@@ -203,6 +210,38 @@ fn try_add_group_counter(
 }
 
 #[cfg(target_os = "linux")]
+fn try_add_l1i_group_counter(group: &mut Group) -> Option<perf_event::Counter> {
+    match group.add(&Builder::new(Cache {
+        which: CacheId::L1I,
+        operation: CacheOp::READ,
+        result: CacheResult::MISS,
+    })) {
+        Ok(counter) => Some(counter),
+        Err(error) => {
+            record_perf_issue(format!("perf event 'l1i-misses' unavailable: {error}"));
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_build_l1i_counter() -> Option<perf_event::Counter> {
+    match Builder::new(Cache {
+        which: CacheId::L1I,
+        operation: CacheOp::READ,
+        result: CacheResult::MISS,
+    })
+    .build()
+    {
+        Ok(counter) => Some(counter),
+        Err(error) => {
+            record_perf_issue(format!("perf event 'l1i-misses' unavailable: {error}"));
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn build_perf_counter_group() -> Option<PerfGroupCounters> {
     let mut group = match Group::new() {
         Ok(group) => group,
@@ -212,15 +251,34 @@ fn build_perf_counter_group() -> Option<PerfGroupCounters> {
         }
     };
 
+    let cycles = try_add_group_counter(&mut group, Hardware::CPU_CYCLES, "cycles");
     let instructions = try_add_group_counter(&mut group, Hardware::INSTRUCTIONS, "instructions");
+    let cache_references =
+        try_add_group_counter(&mut group, Hardware::CACHE_REFERENCES, "cache-references");
+    let l1i_misses = try_add_l1i_group_counter(&mut group);
     let branches = try_add_group_counter(&mut group, Hardware::BRANCH_INSTRUCTIONS, "branches");
     let branch_misses = try_add_group_counter(&mut group, Hardware::BRANCH_MISSES, "branch-misses");
     let cache_misses = try_add_group_counter(&mut group, Hardware::CACHE_MISSES, "cache-misses");
+    let stalled_cycles_frontend = try_add_group_counter(
+        &mut group,
+        Hardware::STALLED_CYCLES_FRONTEND,
+        "stalled-cycles-frontend",
+    );
+    let stalled_cycles_backend = try_add_group_counter(
+        &mut group,
+        Hardware::STALLED_CYCLES_BACKEND,
+        "stalled-cycles-backend",
+    );
 
-    if instructions.is_none()
+    if cycles.is_none()
+        && instructions.is_none()
+        && cache_references.is_none()
+        && l1i_misses.is_none()
         && branches.is_none()
         && branch_misses.is_none()
         && cache_misses.is_none()
+        && stalled_cycles_frontend.is_none()
+        && stalled_cycles_backend.is_none()
     {
         record_perf_issue("no perf events could be added to perf group".to_string());
         return None;
@@ -228,10 +286,15 @@ fn build_perf_counter_group() -> Option<PerfGroupCounters> {
 
     Some(PerfGroupCounters {
         group,
+        cycles,
         instructions,
+        cache_references,
+        l1i_misses,
         branches,
         branch_misses,
         cache_misses,
+        stalled_cycles_frontend,
+        stalled_cycles_backend,
     })
 }
 
@@ -298,8 +361,7 @@ fn disable_counter(counter: &mut Option<perf_event::Counter>, name: &str) {
 }
 
 #[cfg(target_os = "linux")]
-fn timing_window(timing_candidates: [(u64, u64); 4]) -> (u64, u64) {
-
+fn timing_window(timing_candidates: &[(u64, u64)]) -> (u64, u64) {
     timing_candidates
         .iter()
         .copied()
@@ -315,19 +377,32 @@ fn timing_window(timing_candidates: [(u64, u64); 4]) -> (u64, u64) {
 
 #[cfg(target_os = "linux")]
 fn run_with_individual_counters(run: &mut impl FnMut() -> u64) -> Results {
+    let mut cycles_counter = try_build_individual_counter(Hardware::CPU_CYCLES, "cycles");
     let mut instructions_counter =
         try_build_individual_counter(Hardware::INSTRUCTIONS, "instructions");
+    let mut cache_references_counter =
+        try_build_individual_counter(Hardware::CACHE_REFERENCES, "cache-references");
+    let mut l1i_misses_counter = try_build_l1i_counter();
     let mut branches_counter =
         try_build_individual_counter(Hardware::BRANCH_INSTRUCTIONS, "branches");
     let mut branch_misses_counter =
         try_build_individual_counter(Hardware::BRANCH_MISSES, "branch-misses");
     let mut cache_misses_counter =
         try_build_individual_counter(Hardware::CACHE_MISSES, "cache-misses");
+    let mut stalled_cycles_frontend_counter =
+        try_build_individual_counter(Hardware::STALLED_CYCLES_FRONTEND, "stalled-cycles-frontend");
+    let mut stalled_cycles_backend_counter =
+        try_build_individual_counter(Hardware::STALLED_CYCLES_BACKEND, "stalled-cycles-backend");
 
-    if instructions_counter.is_none()
+    if cycles_counter.is_none()
+        && instructions_counter.is_none()
+        && cache_references_counter.is_none()
+        && l1i_misses_counter.is_none()
         && branches_counter.is_none()
         && branch_misses_counter.is_none()
         && cache_misses_counter.is_none()
+        && stalled_cycles_frontend_counter.is_none()
+        && stalled_cycles_backend_counter.is_none()
     {
         let start_time = Instant::now();
         let iterations = run();
@@ -341,45 +416,104 @@ fn run_with_individual_counters(run: &mut impl FnMut() -> u64) -> Results {
 
     record_perf_issue("using ungrouped perf counters fallback".to_string());
 
+    enable_counter(&mut cycles_counter, "cycles");
     enable_counter(&mut instructions_counter, "instructions");
+    enable_counter(&mut cache_references_counter, "cache-references");
+    enable_counter(&mut l1i_misses_counter, "l1i-misses");
     enable_counter(&mut branches_counter, "branches");
     enable_counter(&mut branch_misses_counter, "branch-misses");
     enable_counter(&mut cache_misses_counter, "cache-misses");
+    enable_counter(
+        &mut stalled_cycles_frontend_counter,
+        "stalled-cycles-frontend",
+    );
+    enable_counter(
+        &mut stalled_cycles_backend_counter,
+        "stalled-cycles-backend",
+    );
 
     let start_time = Instant::now();
     let iterations = run();
     let duration = start_time.elapsed();
 
+    disable_counter(&mut cycles_counter, "cycles");
     disable_counter(&mut instructions_counter, "instructions");
+    disable_counter(&mut cache_references_counter, "cache-references");
+    disable_counter(&mut l1i_misses_counter, "l1i-misses");
     disable_counter(&mut branches_counter, "branches");
     disable_counter(&mut branch_misses_counter, "branch-misses");
     disable_counter(&mut cache_misses_counter, "cache-misses");
+    disable_counter(
+        &mut stalled_cycles_frontend_counter,
+        "stalled-cycles-frontend",
+    );
+    disable_counter(
+        &mut stalled_cycles_backend_counter,
+        "stalled-cycles-backend",
+    );
 
+    let (cycles, cycles_enabled, cycles_running) =
+        read_scaled_counter(&mut cycles_counter, "cycles");
     let (instructions, instructions_enabled, instructions_running) =
         read_scaled_counter(&mut instructions_counter, "instructions");
+    let (cache_references, cache_references_enabled, cache_references_running) =
+        read_scaled_counter(&mut cache_references_counter, "cache-references");
+    let (l1i_misses, l1i_misses_enabled, l1i_misses_running) =
+        read_scaled_counter(&mut l1i_misses_counter, "l1i-misses");
     let (branches, branches_enabled, branches_running) =
         read_scaled_counter(&mut branches_counter, "branches");
     let (branch_misses, branch_misses_enabled, branch_misses_running) =
         read_scaled_counter(&mut branch_misses_counter, "branch-misses");
     let (cache_misses, cache_misses_enabled, cache_misses_running) =
         read_scaled_counter(&mut cache_misses_counter, "cache-misses");
+    let (stalled_cycles_frontend, stalled_cycles_frontend_enabled, stalled_cycles_frontend_running) =
+        read_scaled_counter(
+            &mut stalled_cycles_frontend_counter,
+            "stalled-cycles-frontend",
+        );
+    let (stalled_cycles_backend, stalled_cycles_backend_enabled, stalled_cycles_backend_running) =
+        read_scaled_counter(
+            &mut stalled_cycles_backend_counter,
+            "stalled-cycles-backend",
+        );
 
-    let (pmu_time_enabled_ns, pmu_time_running_ns) = timing_window([
+    let (pmu_time_enabled_ns, pmu_time_running_ns) = timing_window(&[
+        (cycles_enabled, cycles_running),
         (instructions_enabled, instructions_running),
+        (cache_references_enabled, cache_references_running),
+        (l1i_misses_enabled, l1i_misses_running),
         (branches_enabled, branches_running),
         (branch_misses_enabled, branch_misses_running),
         (cache_misses_enabled, cache_misses_running),
+        (
+            stalled_cycles_frontend_enabled,
+            stalled_cycles_frontend_running,
+        ),
+        (
+            stalled_cycles_backend_enabled,
+            stalled_cycles_backend_running,
+        ),
     ]);
 
     Results {
+        cycles,
         instructions,
+        cache_references,
+        l1i_misses,
         branches,
         branch_misses,
         cache_misses,
+        stalled_cycles_frontend,
+        stalled_cycles_backend,
+        has_cycles: cycles_counter.is_some(),
         has_instructions: instructions_counter.is_some(),
+        has_cache_references: cache_references_counter.is_some(),
+        has_l1i_misses: l1i_misses_counter.is_some(),
         has_branches: branches_counter.is_some(),
         has_branch_misses: branch_misses_counter.is_some(),
         has_cache_misses: cache_misses_counter.is_some(),
+        has_stalled_cycles_frontend: stalled_cycles_frontend_counter.is_some(),
+        has_stalled_cycles_backend: stalled_cycles_backend_counter.is_some(),
         pmu_time_enabled_ns,
         pmu_time_running_ns,
         duration,
@@ -420,8 +554,23 @@ fn run_with_perf_group(run: &mut impl FnMut() -> u64) -> Option<Results> {
         .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
         .unwrap_or(0);
 
+    let cycles_raw = perf
+        .cycles
+        .as_ref()
+        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+        .unwrap_or(0);
     let instructions_raw = perf
         .instructions
+        .as_ref()
+        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+        .unwrap_or(0);
+    let cache_references_raw = perf
+        .cache_references
+        .as_ref()
+        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+        .unwrap_or(0);
+    let l1i_misses_raw = perf
+        .l1i_misses
         .as_ref()
         .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
         .unwrap_or(0);
@@ -440,12 +589,27 @@ fn run_with_perf_group(run: &mut impl FnMut() -> u64) -> Option<Results> {
         .as_ref()
         .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
         .unwrap_or(0);
+    let stalled_cycles_frontend_raw = perf
+        .stalled_cycles_frontend
+        .as_ref()
+        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+        .unwrap_or(0);
+    let stalled_cycles_backend_raw = perf
+        .stalled_cycles_backend
+        .as_ref()
+        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+        .unwrap_or(0);
 
     if (enabled_ns == 0 || running_ns == 0)
+        && cycles_raw == 0
         && instructions_raw == 0
+        && cache_references_raw == 0
+        && l1i_misses_raw == 0
         && branches_raw == 0
         && branch_misses_raw == 0
         && cache_misses_raw == 0
+        && stalled_cycles_frontend_raw == 0
+        && stalled_cycles_backend_raw == 0
     {
         record_perf_issue(
             "perf counters reported unusable timing window (enabled/running)".to_string(),
@@ -460,14 +624,32 @@ fn run_with_perf_group(run: &mut impl FnMut() -> u64) -> Option<Results> {
     }
 
     Some(Results {
+        cycles: scale_multiplexed_count(cycles_raw, enabled_ns, running_ns),
         instructions: scale_multiplexed_count(instructions_raw, enabled_ns, running_ns),
+        cache_references: scale_multiplexed_count(cache_references_raw, enabled_ns, running_ns),
+        l1i_misses: scale_multiplexed_count(l1i_misses_raw, enabled_ns, running_ns),
         branches: scale_multiplexed_count(branches_raw, enabled_ns, running_ns),
         branch_misses: scale_multiplexed_count(branch_misses_raw, enabled_ns, running_ns),
         cache_misses: scale_multiplexed_count(cache_misses_raw, enabled_ns, running_ns),
+        stalled_cycles_frontend: scale_multiplexed_count(
+            stalled_cycles_frontend_raw,
+            enabled_ns,
+            running_ns,
+        ),
+        stalled_cycles_backend: scale_multiplexed_count(
+            stalled_cycles_backend_raw,
+            enabled_ns,
+            running_ns,
+        ),
+        has_cycles: perf.cycles.is_some(),
         has_instructions: perf.instructions.is_some(),
+        has_cache_references: perf.cache_references.is_some(),
+        has_l1i_misses: perf.l1i_misses.is_some(),
         has_branches: perf.branches.is_some(),
         has_branch_misses: perf.branch_misses.is_some(),
         has_cache_misses: perf.cache_misses.is_some(),
+        has_stalled_cycles_frontend: perf.stalled_cycles_frontend.is_some(),
+        has_stalled_cycles_backend: perf.stalled_cycles_backend.is_some(),
         pmu_time_enabled_ns: enabled_ns,
         pmu_time_running_ns: running_ns,
         duration,
@@ -529,9 +711,14 @@ impl PerfCounters {
             branch_counter: Builder::new(Hardware::BRANCH_INSTRUCTIONS).build()?,
             branch_misses: Builder::new(Hardware::BRANCH_MISSES).build()?,
             cache_misses: Builder::new(Hardware::CACHE_MISSES).build()?,
-            l1i_misses: Builder::new(Hardware::CACHE_MISSES).build()?,
-            stalled_frontend: Builder::new(Hardware::CACHE_MISSES).build()?,
-            stalled_backend: Builder::new(Hardware::CACHE_MISSES).build()?,
+            l1i_misses: Builder::new(Cache {
+                which: CacheId::L1I,
+                operation: CacheOp::READ,
+                result: CacheResult::MISS,
+            })
+            .build()?,
+            stalled_frontend: Builder::new(Hardware::STALLED_CYCLES_FRONTEND).build()?,
+            stalled_backend: Builder::new(Hardware::STALLED_CYCLES_BACKEND).build()?,
             start_time: None,
         })
     }

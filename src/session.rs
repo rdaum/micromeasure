@@ -43,11 +43,20 @@ pub struct BenchmarkStats {
     pub median_ns_per_op: f64,
     pub p95_ns_per_op: f64,
     pub mad_ns_per_op: f64,
+    pub cycles_per_op: f64,
     pub instructions_per_op: f64,
+    pub ipc: f64,
+    pub cache_references_per_op: f64,
+    pub l1i_misses_per_op: f64,
     pub branches_per_op: f64,
     pub branch_miss_rate: f64,
     pub branch_misses_per_op: f64,
-    pub cache_miss_rate: f64,
+    pub cache_misses_per_op: f64,
+    pub cache_miss_percent: f64,
+    pub frontend_stall_cycles_per_op: f64,
+    pub frontend_stall_percent: f64,
+    pub backend_stall_cycles_per_op: f64,
+    pub backend_stall_percent: f64,
     pub cv_percent: f64,
     pub outlier_count: usize,
     pub samples: usize,
@@ -58,13 +67,23 @@ pub struct BenchmarkStats {
     #[serde(default)]
     pub sample_latency_ns_per_op: Vec<f64>,
     #[serde(default)]
+    pub has_cycles: bool,
+    #[serde(default)]
     pub has_instructions: bool,
+    #[serde(default)]
+    pub has_cache_references: bool,
+    #[serde(default)]
+    pub has_l1i_misses: bool,
     #[serde(default)]
     pub has_branches: bool,
     #[serde(default)]
     pub has_branch_misses: bool,
     #[serde(default)]
     pub has_cache_misses: bool,
+    #[serde(default)]
+    pub has_stalled_cycles_frontend: bool,
+    #[serde(default)]
+    pub has_stalled_cycles_backend: bool,
     #[serde(default)]
     pub pmu_time_enabled_ns: u64,
     #[serde(default)]
@@ -302,7 +321,7 @@ impl BenchmarkReport {
                         Alignment::Right,
                     ]);
 
-                    for (result, previous) in comparable_results {
+                    for &(result, previous) in &comparable_results {
                         comparison_table.add_row(vec![
                             &colorize_label(&result.name),
                             &format_improvement(safe_improvement_percent(
@@ -336,6 +355,87 @@ impl BenchmarkReport {
                     println!("   Per-stat comparison:");
                     comparison_table.print();
                     println!();
+
+                    let mut pmu_comparison_table = TableFormatter::new(
+                        vec![
+                            "Benchmark",
+                            "IPC",
+                            "BrMiss",
+                            "Cache",
+                            "FE Stall",
+                            "BE Stall",
+                        ],
+                        vec![25, 10, 10, 10, 10, 10],
+                    )
+                    .with_alignments(vec![
+                        Alignment::Left,
+                        Alignment::Right,
+                        Alignment::Right,
+                        Alignment::Right,
+                        Alignment::Right,
+                        Alignment::Right,
+                    ]);
+
+                    let mut any_pmu_deltas = false;
+                    for &(result, previous) in &comparable_results {
+                        let ipc = pmu_metric_improvement(result, previous, pmu_ipc, false);
+                        let branch =
+                            pmu_metric_improvement(result, previous, pmu_branch_miss_metric, true);
+                        let cache =
+                            pmu_metric_improvement(result, previous, pmu_cache_metric, true);
+                        let frontend = pmu_metric_improvement(
+                            result,
+                            previous,
+                            pmu_frontend_stall_metric,
+                            true,
+                        );
+                        let backend = pmu_metric_improvement(
+                            result,
+                            previous,
+                            pmu_backend_stall_metric,
+                            true,
+                        );
+
+                        if ipc.is_some()
+                            || branch.is_some()
+                            || cache.is_some()
+                            || frontend.is_some()
+                            || backend.is_some()
+                        {
+                            any_pmu_deltas = true;
+                        }
+
+                        pmu_comparison_table.add_row(vec![
+                            &colorize_label(&result.name),
+                            &format_improvement(ipc),
+                            &format_improvement(branch),
+                            &format_improvement(cache),
+                            &format_improvement(frontend),
+                            &format_improvement(backend),
+                        ]);
+                    }
+
+                    if any_pmu_deltas {
+                        println!("   PMU comparison:");
+                        pmu_comparison_table.print();
+                        println!();
+                    }
+
+                    let comparative_diagnostics: Vec<_> = comparable_results
+                        .iter()
+                        .filter_map(|&(result, previous)| {
+                            let diagnosis = comparative_diagnosis(result, previous);
+                            (!diagnosis.is_empty()).then_some((result.name.as_str(), diagnosis))
+                        })
+                        .collect();
+
+                    if !comparative_diagnostics.is_empty() {
+                        println!("   Comparative diagnosis:");
+                        for (name, diagnosis) in comparative_diagnostics {
+                            println!("   - {}: {}", name, colorize_problem(&diagnosis));
+                        }
+                        println!();
+                    }
                 }
             }
         }
@@ -493,6 +593,14 @@ fn colorize_value(text: &str) -> String {
     format!("\x1b[97m{text}\x1b[0m")
 }
 
+fn colorize_problem(text: &str) -> String {
+    if !std::io::stdout().is_terminal() {
+        return text.to_string();
+    }
+
+    format!("\x1b[31m{text}\x1b[0m")
+}
+
 fn matching_previous_result<'a>(
     previous_report: &'a BenchmarkReport,
     result: &BenchmarkResult,
@@ -543,6 +651,188 @@ fn result_mad_latency(result: &BenchmarkResult) -> f64 {
 
     let median = result_median_latency(result);
     median_absolute_deviation_latency(&result.stats.sample_latency_ns_per_op, median)
+}
+
+fn pmu_metric_improvement(
+    current: &BenchmarkResult,
+    previous: &BenchmarkResult,
+    metric: impl Fn(&BenchmarkStats) -> Option<f64>,
+    lower_is_better: bool,
+) -> Option<f64> {
+    let current = metric(&current.stats)?;
+    let previous = metric(&previous.stats)?;
+    safe_improvement_percent(current, previous, lower_is_better)
+}
+
+fn pmu_ipc(stats: &BenchmarkStats) -> Option<f64> {
+    (stats.has_cycles && stats.has_instructions && stats.ipc.is_finite() && stats.ipc > 0.0)
+        .then_some(stats.ipc)
+}
+
+fn pmu_branch_miss_metric(stats: &BenchmarkStats) -> Option<f64> {
+    (stats.has_branches
+        && stats.has_branch_misses
+        && stats.branch_miss_rate.is_finite()
+        && stats.branch_miss_rate >= 0.0)
+        .then_some(stats.branch_miss_rate)
+}
+
+fn pmu_cache_metric(stats: &BenchmarkStats) -> Option<f64> {
+    if stats.has_cache_references && stats.has_cache_misses {
+        return (stats.cache_miss_percent.is_finite() && stats.cache_miss_percent >= 0.0)
+            .then_some(stats.cache_miss_percent);
+    }
+
+    (stats.has_cache_misses
+        && stats.cache_misses_per_op.is_finite()
+        && stats.cache_misses_per_op >= 0.0)
+        .then_some(stats.cache_misses_per_op)
+}
+
+fn pmu_frontend_stall_metric(stats: &BenchmarkStats) -> Option<f64> {
+    (stats.has_cycles
+        && stats.has_stalled_cycles_frontend
+        && stats.frontend_stall_percent.is_finite()
+        && stats.frontend_stall_percent >= 0.0)
+        .then_some(stats.frontend_stall_percent)
+}
+
+fn pmu_backend_stall_metric(stats: &BenchmarkStats) -> Option<f64> {
+    (stats.has_cycles
+        && stats.has_stalled_cycles_backend
+        && stats.backend_stall_percent.is_finite()
+        && stats.backend_stall_percent >= 0.0)
+        .then_some(stats.backend_stall_percent)
+}
+
+fn comparative_diagnosis(current: &BenchmarkResult, previous: &BenchmarkResult) -> String {
+    let throughput_change =
+        safe_percent_change(current.stats.mops_per_sec, previous.stats.mops_per_sec);
+    let ipc_change = safe_percent_change(current.stats.ipc, previous.stats.ipc);
+    let instructions_change = safe_percent_change(
+        current.stats.instructions_per_op,
+        previous.stats.instructions_per_op,
+    );
+    let frontend_change = safe_percent_change(
+        current.stats.frontend_stall_percent,
+        previous.stats.frontend_stall_percent,
+    );
+    let backend_change = safe_percent_change(
+        current.stats.backend_stall_percent,
+        previous.stats.backend_stall_percent,
+    );
+    let branch_change = safe_percent_change(
+        current.stats.branch_miss_rate,
+        previous.stats.branch_miss_rate,
+    );
+    let cache_percent_change = safe_percent_change(
+        current.stats.cache_miss_percent,
+        previous.stats.cache_miss_percent,
+    );
+    let cache_per_op_change = safe_percent_change(
+        current.stats.cache_misses_per_op,
+        previous.stats.cache_misses_per_op,
+    );
+    let l1i_change = safe_percent_change(
+        current.stats.l1i_misses_per_op,
+        previous.stats.l1i_misses_per_op,
+    );
+    let cv_change = safe_percent_change(current.stats.cv_percent, previous.stats.cv_percent);
+
+    let mut notes = Vec::new();
+    let is_regression = matches!(throughput_change, Some(change) if change <= -2.0);
+    let is_improvement = matches!(throughput_change, Some(change) if change >= 2.0);
+
+    if (is_regression || is_improvement)
+        && matches!(instructions_change, Some(change) if change.abs() <= 5.0)
+        && matches!(ipc_change, Some(change) if change.abs() >= 5.0)
+    {
+        let direction = if is_regression {
+            "same work, worse utilization"
+        } else {
+            "same work, better utilization"
+        };
+        let ipc = ipc_change.unwrap_or(0.0);
+        notes.push(format!(
+            "{direction}: instructions/op stayed roughly flat while IPC moved {ipc:+.1}%"
+        ));
+    }
+
+    if (is_regression || is_improvement)
+        && matches!(backend_change, Some(change) if change.abs() >= 10.0)
+        && (matches!(cache_percent_change, Some(change) if change.abs() >= 10.0)
+            || matches!(cache_per_op_change, Some(change) if change.abs() >= 10.0))
+    {
+        let direction = if is_regression {
+            "memory-latency signature"
+        } else {
+            "memory-latency relief"
+        };
+        let backend = backend_change.unwrap_or(0.0);
+        let cache = cache_percent_change.or(cache_per_op_change).unwrap_or(0.0);
+        notes.push(format!(
+            "{direction}: backend stalls moved {backend:+.1}% and cache pressure moved {cache:+.1}%"
+        ));
+    }
+
+    if (is_regression || is_improvement)
+        && matches!(frontend_change, Some(change) if change.abs() >= 10.0)
+        && matches!(branch_change, Some(change) if change.abs() >= 10.0)
+    {
+        let direction = if is_regression {
+            "frontend/predictor regression"
+        } else {
+            "frontend/predictor improvement"
+        };
+        let frontend = frontend_change.unwrap_or(0.0);
+        let branch = branch_change.unwrap_or(0.0);
+        notes.push(format!("{direction}: frontend stalls moved {frontend:+.1}% and branch miss rate moved {branch:+.1}%"));
+    }
+
+    if (is_regression || is_improvement)
+        && matches!(frontend_change, Some(change) if change.abs() >= 10.0)
+        && matches!(l1i_change, Some(change) if change.abs() >= 10.0)
+    {
+        let direction = if is_regression {
+            "instruction-cache regression"
+        } else {
+            "instruction-cache improvement"
+        };
+        let frontend = frontend_change.unwrap_or(0.0);
+        let l1i = l1i_change.unwrap_or(0.0);
+        notes.push(format!(
+            "{direction}: frontend stalls moved {frontend:+.1}% and L1I misses/op moved {l1i:+.1}%"
+        ));
+    }
+
+    if (is_regression || is_improvement)
+        && matches!(instructions_change, Some(change) if change.abs() >= 5.0)
+        && matches!(ipc_change, Some(change) if change.abs() <= 5.0)
+    {
+        let direction = if is_regression {
+            "heavier code path"
+        } else {
+            "lighter code path"
+        };
+        let inst = instructions_change.unwrap_or(0.0);
+        notes.push(format!(
+            "{direction}: instructions/op moved {inst:+.1}% while IPC stayed roughly flat"
+        ));
+    }
+
+    if matches!(cv_change, Some(change) if change.abs() >= 20.0) {
+        let cv = cv_change.unwrap_or(0.0);
+        let direction = if cv > 0.0 {
+            "stability worsened"
+        } else {
+            "stability improved"
+        };
+        notes.push(format!(
+            "{direction}: coefficient of variation moved {cv:+.1}%"
+        ));
+    }
+
+    notes.join("; ")
 }
 
 fn percentile_latency(sorted_values: &[f64], percentile: f64) -> f64 {
@@ -716,11 +1006,20 @@ mod tests {
                 median_ns_per_op: 1.0,
                 p95_ns_per_op: 1.0,
                 mad_ns_per_op: 0.0,
+                cycles_per_op: 1.0,
                 instructions_per_op: 1.0,
+                ipc: 1.0,
+                cache_references_per_op: 1.0,
+                l1i_misses_per_op: 0.0,
                 branches_per_op: 1.0,
                 branch_miss_rate: 0.0,
                 branch_misses_per_op: 0.0,
-                cache_miss_rate: 0.0,
+                cache_misses_per_op: 0.0,
+                cache_miss_percent: 0.0,
+                frontend_stall_cycles_per_op: 0.0,
+                frontend_stall_percent: 0.0,
+                backend_stall_cycles_per_op: 0.0,
+                backend_stall_percent: 0.0,
                 cv_percent: 0.0,
                 outlier_count: 0,
                 samples: 1,
@@ -728,10 +1027,15 @@ mod tests {
                 total_duration_sec: 1.0,
                 sample_throughput_mops_per_sec: vec![mops_per_sec],
                 sample_latency_ns_per_op: vec![1.0],
+                has_cycles: false,
                 has_instructions: false,
+                has_cache_references: false,
+                has_l1i_misses: false,
                 has_branches: false,
                 has_branch_misses: false,
                 has_cache_misses: false,
+                has_stalled_cycles_frontend: false,
+                has_stalled_cycles_backend: false,
                 pmu_time_enabled_ns: 0,
                 pmu_time_running_ns: 0,
             },

@@ -78,7 +78,7 @@ Add `micromeasure` as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-micromeasure = "0.5"
+micromeasure = "0.6"
 ```
 
 Then add a custom bench target in your `Cargo.toml`:

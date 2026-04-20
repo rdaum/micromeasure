@@ -14,18 +14,21 @@
 
 use micromeasure::{NoContext, Throughput, benchmark_main, black_box};
 
-fn add_loop(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
-    let mut acc = black_box(0_u64);
-    let limit = black_box(chunk_size as u64);
-    for i in 0..limit {
-        acc = acc.wrapping_add(black_box(i));
+const LINES_PER_COMPILATION: usize = 1_000;
+
+fn compile_lines(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
+    let mut checksum = black_box(0_u64);
+    for chunk in 0..chunk_size {
+        for line in 0..LINES_PER_COMPILATION {
+            checksum = checksum.wrapping_add(black_box((chunk ^ line) as u64));
+        }
     }
-    black_box(acc);
+    black_box(checksum);
 }
 
 benchmark_main!(|runner| {
-    runner.group::<NoContext>("Arithmetic", |g| {
-        g.throughput(Throughput::per_operation(8, "bytes"))
-            .bench("add_loop", add_loop);
+    runner.group::<NoContext>("Compiler", |g| {
+        g.throughput(Throughput::per_operation(LINES_PER_COMPILATION as u64, "lines"))
+            .bench("compile_lines", compile_lines);
     });
 });

@@ -31,6 +31,7 @@ use stats::{
     benchmark_stats_from_samples, colorize_section_heading, render_combined_stats_table,
     render_stats_table,
 };
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use std::{
     hint::black_box,
@@ -218,13 +219,85 @@ impl Results {
 pub struct BenchmarkConfig {
     pub chunk_size: usize,
     pub target_samples: usize,
-    pub estimated_ops_per_sec: f64,
+    pub estimated_throughput_per_sec: f64,
 }
 
 struct ConcurrentBenchmarkConfig {
     sample_duration: Duration,
     target_samples: usize,
-    estimated_ops_per_sec: f64,
+    estimated_throughput_per_sec: f64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Throughput {
+    amount_per_operation: u64,
+    unit: String,
+}
+
+impl Default for Throughput {
+    fn default() -> Self {
+        Self::ops()
+    }
+}
+
+impl Throughput {
+    pub fn per_operation(amount_per_operation: u64, unit: impl Into<String>) -> Self {
+        let unit = unit.into();
+        assert!(
+            amount_per_operation > 0,
+            "throughput amount per operation must be > 0"
+        );
+        assert!(
+            !unit.trim().is_empty(),
+            "throughput unit must not be empty"
+        );
+
+        Self {
+            amount_per_operation,
+            unit,
+        }
+    }
+
+    pub fn bytes(bytes_per_operation: u64) -> Self {
+        Self::per_operation(bytes_per_operation, "bytes")
+    }
+
+    pub fn ops() -> Self {
+        Self::per_operation(1, "ops")
+    }
+
+    pub fn amount_per_operation(&self) -> u64 {
+        self.amount_per_operation
+    }
+
+    pub fn unit(&self) -> &str {
+        &self.unit
+    }
+
+    pub(crate) fn rate_for_operations(&self, operations: u64, duration_secs: f64) -> f64 {
+        safe_ratio_f64(
+            operations as f64 * self.amount_per_operation as f64,
+            duration_secs,
+        )
+    }
+
+    pub(crate) fn format_rate(&self, throughput_per_sec: f64) -> String {
+        if !throughput_per_sec.is_finite() || throughput_per_sec <= 0.0 {
+            return "n/a".to_string();
+        }
+
+        let (scaled, prefix) = if throughput_per_sec >= 1_000_000_000.0 {
+            (throughput_per_sec / 1_000_000_000.0, "G")
+        } else if throughput_per_sec >= 1_000_000.0 {
+            (throughput_per_sec / 1_000_000.0, "M")
+        } else if throughput_per_sec >= 1_000.0 {
+            (throughput_per_sec / 1_000.0, "k")
+        } else {
+            (throughput_per_sec, "")
+        };
+
+        format!("{scaled:.2} {prefix}{}/s", self.unit)
+    }
 }
 
 /// Generic benchmark context that can hold any preparation data
@@ -285,14 +358,6 @@ fn throughput_ops_per_sec(result: &Results) -> Option<f64> {
     Some(result.iterations as f64 / seconds)
 }
 
-fn estimated_mops_display(ops_per_sec: f64) -> String {
-    if ops_per_sec > 0.0 {
-        format!("{:.2} Mops/s", ops_per_sec / 1_000_000.0)
-    } else {
-        "n/a".to_string()
-    }
-}
-
 fn has_perf_counters(results: &Results) -> bool {
     results.has_cycles
         || results.has_instructions
@@ -331,11 +396,15 @@ fn measurement_results_from_stats(stats: &crate::BenchmarkStats) -> Results {
     }
 }
 
-fn update_running_throughput(running_throughput: &mut f64, result: &Results) {
-    let sample_throughput_mops =
-        safe_ratio_f64(result.iterations as f64, result.duration.as_secs_f64()) / 1_000_000.0;
-    if sample_throughput_mops > 0.0 {
-        *running_throughput = *running_throughput * 0.9 + sample_throughput_mops * 0.1;
+fn update_running_throughput(
+    running_throughput: &mut f64,
+    result: &Results,
+    throughput: &Throughput,
+) {
+    let sample_throughput =
+        throughput.rate_for_operations(result.iterations, result.duration.as_secs_f64());
+    if sample_throughput > 0.0 {
+        *running_throughput = *running_throughput * 0.9 + sample_throughput * 0.1;
     }
 }
 
@@ -573,6 +642,7 @@ fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
 fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
     f: &BenchFunction<T>,
     factory: &F,
+    throughput: &Throughput,
 ) -> BenchmarkConfig {
     rewrite_line("🔥 calibrating benchmark");
 
@@ -595,13 +665,13 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
         return BenchmarkConfig {
             chunk_size: preferred_chunk_size,
             target_samples: MIN_SAMPLES,
-            estimated_ops_per_sec: 0.0,
+            estimated_throughput_per_sec: 0.0,
         };
     }
 
     let mut chunk_size = MIN_CHUNK_SIZE;
     let mut best_chunk_size = chunk_size;
-    let mut ops_per_sec = 0.0;
+    let mut estimated_throughput_per_sec = 0.0;
 
     for i in 0..15 {
         let mut prepared = factory();
@@ -611,7 +681,10 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
         let duration_secs = duration.as_secs_f64();
 
         if duration_secs >= 0.0001 {
-            ops_per_sec = chunk_size as f64 / duration_secs;
+            estimated_throughput_per_sec = throughput.rate_for_operations(
+                chunk_size as u64,
+                duration_secs,
+            );
             if duration >= TARGET_CHUNK_DURATION.mul_f64(0.8)
                 && duration <= TARGET_CHUNK_DURATION.mul_f64(1.2)
             {
@@ -631,10 +704,10 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
         }
 
         rewrite_line(&format!(
-            "🔥 calibrating benchmark  pass: {:>2}/15  chunk: {:>9}  est: {:>8.2} Mops/s",
+            "🔥 calibrating benchmark  pass: {:>2}/15  chunk: {:>9}  est: {}",
             i + 1,
             chunk_size,
-            ops_per_sec / 1_000_000.0
+            throughput.format_rate(estimated_throughput_per_sec)
         ));
     }
 
@@ -652,8 +725,9 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
         ));
     }
 
-    let estimated_chunk_duration_secs = if ops_per_sec > 0.0 {
-        best_chunk_size as f64 / ops_per_sec
+    let estimated_chunk_duration_secs = if estimated_throughput_per_sec > 0.0 {
+        let chunk_throughput_amount = best_chunk_size as f64 * throughput.amount_per_operation as f64;
+        chunk_throughput_amount / estimated_throughput_per_sec
     } else {
         TARGET_CHUNK_DURATION.as_secs_f64()
     };
@@ -665,7 +739,7 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
     BenchmarkConfig {
         chunk_size: best_chunk_size,
         target_samples,
-        estimated_ops_per_sec: ops_per_sec,
+        estimated_throughput_per_sec,
     }
 }
 
@@ -677,25 +751,26 @@ fn warm_up_concurrent_engine<T: ConcurrentBenchContext + Sync, F: Fn(usize) -> T
     sample_duration: Duration,
     workers: &[ConcurrentWorker<T>],
     factory: &F,
+    throughput: &Throughput,
 ) -> ConcurrentBenchmarkConfig {
     rewrite_line("🔥 calibrating benchmark");
 
     let total_threads = total_worker_threads(workers);
     let warm_up_end = Instant::now() + WARM_UP_DURATION;
-    let mut estimated_ops_per_sec = 0.0;
+    let mut estimated_throughput_per_sec = 0.0;
 
     while Instant::now() < warm_up_end {
         let prepared = factory(total_threads);
         let result = execute_concurrent_timing_only(&prepared, sample_duration, workers);
-        let throughput = safe_ratio_f64(
-            result.results.iterations as f64,
+        let sample_throughput = throughput.rate_for_operations(
+            result.results.iterations,
             result.results.duration.as_secs_f64(),
         );
-        if throughput > 0.0 {
-            estimated_ops_per_sec = if estimated_ops_per_sec > 0.0 {
-                estimated_ops_per_sec * 0.8 + throughput * 0.2
+        if sample_throughput > 0.0 {
+            estimated_throughput_per_sec = if estimated_throughput_per_sec > 0.0 {
+                estimated_throughput_per_sec * 0.8 + sample_throughput * 0.2
             } else {
-                throughput
+                sample_throughput
             };
         }
         let remaining_ms = warm_up_end
@@ -704,7 +779,7 @@ fn warm_up_concurrent_engine<T: ConcurrentBenchContext + Sync, F: Fn(usize) -> T
         rewrite_line(&format!(
             "🔥 calibrating benchmark  warmup remaining: {remaining_ms:>4} ms  sample: {:>4} ms  est: {}",
             sample_duration.as_millis(),
-            estimated_mops_display(estimated_ops_per_sec)
+            throughput.format_rate(estimated_throughput_per_sec)
         ));
     }
 
@@ -716,7 +791,7 @@ fn warm_up_concurrent_engine<T: ConcurrentBenchContext + Sync, F: Fn(usize) -> T
     ConcurrentBenchmarkConfig {
         sample_duration,
         target_samples,
-        estimated_ops_per_sec,
+        estimated_throughput_per_sec,
     }
 }
 
@@ -907,7 +982,12 @@ fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
     })
 }
 
-fn update_progress_bar(current: usize, total: usize, current_throughput: f64) {
+fn update_progress_bar(
+    current: usize,
+    total: usize,
+    current_throughput: f64,
+    throughput: &Throughput,
+) {
     let width = 40;
     let filled = (current * width / total.max(1)).min(width);
     let empty = width - filled;
@@ -926,11 +1006,7 @@ fn update_progress_bar(current: usize, total: usize, current_throughput: f64) {
     }
 
     let throughput_display = if current_throughput.is_finite() && current_throughput > 0.0 {
-        if current_throughput > 1000.0 {
-            format!("{current_throughput:.0} Mops/s")
-        } else {
-            format!("{current_throughput:.1} Mops/s")
-        }
+        throughput.format_rate(current_throughput)
     } else {
         "Calculating...".to_string()
     };
@@ -972,6 +1048,7 @@ impl BenchmarkRunner {
         let group = BenchmarkGroup {
             runner: self,
             name,
+            throughput: Throughput::ops(),
             _marker: std::marker::PhantomData,
         };
         f(&group);
@@ -985,6 +1062,7 @@ impl BenchmarkRunner {
         let group = ConcurrentBenchmarkGroup {
             runner: self,
             name,
+            throughput: Throughput::ops(),
             _marker: std::marker::PhantomData,
         };
         f(&group);
@@ -1006,7 +1084,13 @@ impl BenchmarkRunner {
     }
 
     pub fn run<T: BenchContext>(&self, name: &str, group: &str, f: BenchFunction<T>) {
-        self.run_with_factory(name, group, f, &|| T::prepare(MIN_CHUNK_SIZE));
+        self.run_with_factory_and_throughput(
+            name,
+            group,
+            f,
+            &|| T::prepare(MIN_CHUNK_SIZE),
+            Throughput::ops(),
+        );
     }
 
     pub fn run_with_factory<T: BenchContext, F: Fn() -> T + ?Sized>(
@@ -1015,6 +1099,17 @@ impl BenchmarkRunner {
         group: &str,
         f: BenchFunction<T>,
         factory: &F,
+    ) {
+        self.run_with_factory_and_throughput(name, group, f, factory, Throughput::ops());
+    }
+
+    pub fn run_with_factory_and_throughput<T: BenchContext, F: Fn() -> T + ?Sized>(
+        &self,
+        name: &str,
+        group: &str,
+        f: BenchFunction<T>,
+        factory: &F,
+        throughput: Throughput,
     ) {
         if !self.should_run(name, group) {
             return;
@@ -1026,18 +1121,18 @@ impl BenchmarkRunner {
         let _affinity_guard = BenchAffinityGuard::acquire();
         println!("\nBenchmark: {name}");
 
-        let config = calibrate_engine(&f, factory);
+        let config = calibrate_engine(&f, factory, &throughput);
         println!(
             "  calibrated: chunk={} samples={} estimate={}",
             config.chunk_size,
             config.target_samples,
-            estimated_mops_display(config.estimated_ops_per_sec),
+            throughput.format_rate(config.estimated_throughput_per_sec),
         );
 
         rewrite_line(&format!("⚡ running 0/{} samples", config.target_samples));
         let mut all_results = Vec::with_capacity(config.target_samples);
         let mut summed_results = Results::default();
-        let mut running_throughput = config.estimated_ops_per_sec / 1_000_000.0;
+        let mut running_throughput = config.estimated_throughput_per_sec;
 
         for sample in 0..config.target_samples {
             let mut prepared = factory();
@@ -1045,20 +1140,29 @@ impl BenchmarkRunner {
             let sample_result =
                 execute_standard_sample(&f, &mut prepared, config.chunk_size, sample, ops);
 
-            update_running_throughput(&mut running_throughput, &sample_result);
+            update_running_throughput(&mut running_throughput, &sample_result, &throughput);
             summed_results.add(&sample_result);
             all_results.push(sample_result);
 
             if sample % 2 == 0 || sample == config.target_samples - 1 {
-                update_progress_bar(sample + 1, config.target_samples, running_throughput);
+                update_progress_bar(
+                    sample + 1,
+                    config.target_samples,
+                    running_throughput,
+                    &throughput,
+                );
             }
         }
 
         clear_line();
         println!("  samples complete: {}", config.target_samples);
 
-        let stats =
-            benchmark_stats_from_samples(&summed_results, &all_results, config.target_samples);
+        let stats = benchmark_stats_from_samples(
+            &summed_results,
+            &all_results,
+            config.target_samples,
+            &throughput,
+        );
         render_standard_results(name, &stats);
 
         self.session.add_result(BenchmarkResult {
@@ -1077,9 +1181,14 @@ impl BenchmarkRunner {
         sample_duration: Duration,
         workers: &[ConcurrentWorker<T>],
     ) {
-        self.run_concurrent_with_factory(name, group, sample_duration, workers, &|num_threads| {
-            T::prepare(num_threads)
-        });
+        self.run_concurrent_with_factory_and_throughput(
+            name,
+            group,
+            sample_duration,
+            workers,
+            &|num_threads| T::prepare(num_threads),
+            Throughput::ops(),
+        );
     }
 
     pub fn run_concurrent_with_factory<
@@ -1092,6 +1201,28 @@ impl BenchmarkRunner {
         sample_duration: Duration,
         workers: &[ConcurrentWorker<T>],
         factory: &F,
+    ) {
+        self.run_concurrent_with_factory_and_throughput(
+            name,
+            group,
+            sample_duration,
+            workers,
+            factory,
+            Throughput::ops(),
+        );
+    }
+
+    pub fn run_concurrent_with_factory_and_throughput<
+        T: ConcurrentBenchContext + Send + Sync,
+        F: Fn(usize) -> T + ?Sized,
+    >(
+        &self,
+        name: &str,
+        group: &str,
+        sample_duration: Duration,
+        workers: &[ConcurrentWorker<T>],
+        factory: &F,
+        throughput: Throughput,
     ) {
         if !self.should_run(name, group) {
             return;
@@ -1110,12 +1241,12 @@ impl BenchmarkRunner {
 
         println!("\nBenchmark: {name}");
 
-        let config = warm_up_concurrent_engine(sample_duration, workers, factory);
+        let config = warm_up_concurrent_engine(sample_duration, workers, factory, &throughput);
         println!(
             "  calibrated: sample={}ms samples={} estimate={}",
             config.sample_duration.as_millis(),
             config.target_samples,
-            estimated_mops_display(config.estimated_ops_per_sec),
+            throughput.format_rate(config.estimated_throughput_per_sec),
         );
 
         rewrite_line(&format!("⚡ running 0/{} samples", config.target_samples));
@@ -1136,7 +1267,7 @@ impl BenchmarkRunner {
         let mut summed_worker_results = vec![Results::default(); workers.len()];
         let mut summed_worker_counters = vec![Vec::<CounterValue>::new(); workers.len()];
         let mut all_worker_results = vec![Vec::with_capacity(config.target_samples); workers.len()];
-        let mut running_throughput = config.estimated_ops_per_sec / 1_000_000.0;
+        let mut running_throughput = config.estimated_throughput_per_sec;
 
         for sample in 0..config.target_samples {
             let prepared = factory(total_threads);
@@ -1148,7 +1279,7 @@ impl BenchmarkRunner {
                 &pin_cores,
             );
 
-            update_running_throughput(&mut running_throughput, &sample_result.results);
+            update_running_throughput(&mut running_throughput, &sample_result.results, &throughput);
             for (index, worker_summary) in sample_result.worker_summaries.iter().enumerate() {
                 summed_worker_results[index].add(&worker_summary.results);
                 merge_counter_values(&mut summed_worker_counters[index], &worker_summary.counters);
@@ -1159,15 +1290,24 @@ impl BenchmarkRunner {
             all_results.push(sample_result.results);
 
             if sample % 2 == 0 || sample == config.target_samples - 1 {
-                update_progress_bar(sample + 1, config.target_samples, running_throughput);
+                update_progress_bar(
+                    sample + 1,
+                    config.target_samples,
+                    running_throughput,
+                    &throughput,
+                );
             }
         }
 
         clear_line();
         println!("  samples complete: {}", config.target_samples);
 
-        let stats =
-            benchmark_stats_from_samples(&summed_results, &all_results, config.target_samples);
+        let stats = benchmark_stats_from_samples(
+            &summed_results,
+            &all_results,
+            config.target_samples,
+            &throughput,
+        );
         let worker_summaries: Vec<WorkerSummary> = workers
             .iter()
             .zip(summed_worker_results.iter())
@@ -1179,6 +1319,7 @@ impl BenchmarkRunner {
                         worker_results,
                         worker_samples,
                         config.target_samples,
+                        &throughput,
                     );
                     WorkerSummary {
                         name: worker.name.to_string(),
@@ -1209,12 +1350,33 @@ impl BenchmarkRunner {
 pub struct BenchmarkGroup<'a, T: BenchContext> {
     runner: &'a BenchmarkRunner,
     name: &'static str,
+    throughput: Throughput,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
+    pub fn throughput(&self, throughput: Throughput) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     pub fn bench(&self, name: &str, f: BenchFunction<T>) {
-        self.runner.run(name, self.name, f);
+        self.runner.run_with_factory_and_throughput(
+            name,
+            self.name,
+            f,
+            &|| T::prepare(MIN_CHUNK_SIZE),
+            self.throughput.clone(),
+        );
+    }
+
+    pub fn bench_with_throughput(&self, name: &str, throughput: Throughput, f: BenchFunction<T>) {
+        self.runner
+            .run_with_factory_and_throughput(name, self.name, f, &|| T::prepare(MIN_CHUNK_SIZE), throughput);
     }
 
     pub fn bench_with_factory<F: Fn() -> T + ?Sized>(
@@ -1223,13 +1385,26 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
         factory: &F,
         f: BenchFunction<T>,
     ) {
-        self.runner.run_with_factory(name, self.name, f, factory);
+        self.runner
+            .run_with_factory_and_throughput(name, self.name, f, factory, self.throughput.clone());
+    }
+
+    pub fn bench_with_factory_and_throughput<F: Fn() -> T + ?Sized>(
+        &self,
+        name: &str,
+        factory: &F,
+        throughput: Throughput,
+        f: BenchFunction<T>,
+    ) {
+        self.runner
+            .run_with_factory_and_throughput(name, self.name, f, factory, throughput);
     }
 }
 
 pub struct ConcurrentBenchmarkGroup<'a, T: ConcurrentBenchContext> {
     runner: &'a BenchmarkRunner,
     name: &'static str,
+    throughput: Throughput,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -1237,9 +1412,41 @@ impl<'a, T: ConcurrentBenchContext> ConcurrentBenchmarkGroup<'a, T>
 where
     T: Send + Sync,
 {
+    pub fn throughput(&self, throughput: Throughput) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     pub fn bench(&self, name: &str, sample_duration: Duration, workers: &[ConcurrentWorker<T>]) {
-        self.runner
-            .run_concurrent(name, self.name, sample_duration, workers);
+        self.runner.run_concurrent_with_factory_and_throughput(
+            name,
+            self.name,
+            sample_duration,
+            workers,
+            &|num_threads| T::prepare(num_threads),
+            self.throughput.clone(),
+        );
+    }
+
+    pub fn bench_with_throughput(
+        &self,
+        name: &str,
+        sample_duration: Duration,
+        workers: &[ConcurrentWorker<T>],
+        throughput: Throughput,
+    ) {
+        self.runner.run_concurrent_with_factory_and_throughput(
+            name,
+            self.name,
+            sample_duration,
+            workers,
+            &|num_threads| T::prepare(num_threads),
+            throughput,
+        );
     }
 
     pub fn bench_with_factory<F: Fn(usize) -> T + ?Sized>(
@@ -1249,14 +1456,39 @@ where
         workers: &[ConcurrentWorker<T>],
         factory: &F,
     ) {
-        self.runner
-            .run_concurrent_with_factory(name, self.name, sample_duration, workers, factory);
+        self.runner.run_concurrent_with_factory_and_throughput(
+            name,
+            self.name,
+            sample_duration,
+            workers,
+            factory,
+            self.throughput.clone(),
+        );
+    }
+
+    pub fn bench_with_factory_and_throughput<F: Fn(usize) -> T + ?Sized>(
+        &self,
+        name: &str,
+        sample_duration: Duration,
+        workers: &[ConcurrentWorker<T>],
+        factory: &F,
+        throughput: Throughput,
+    ) {
+        self.runner.run_concurrent_with_factory_and_throughput(
+            name,
+            self.name,
+            sample_duration,
+            workers,
+            factory,
+            throughput,
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::stats::{median, median_absolute_deviation, percentile, tukey_outlier_count};
+    use super::Throughput;
 
     #[test]
     fn percentile_interpolates_sorted_values() {
@@ -1277,5 +1509,11 @@ mod tests {
     fn tukey_outlier_count_flags_far_values() {
         let values = [10.0, 10.0, 11.0, 11.0, 12.0, 100.0];
         assert_eq!(tukey_outlier_count(&values), 1);
+    }
+
+    #[test]
+    fn throughput_format_scales_custom_units() {
+        let throughput = Throughput::per_operation(1000, "lines");
+        assert_eq!(throughput.format_rate(12_500.0), "12.50 klines/s");
     }
 }

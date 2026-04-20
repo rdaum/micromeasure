@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Alignment, TableFormatter};
+use crate::{Alignment, TableFormatter, Throughput};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -37,8 +37,12 @@ pub struct BenchmarkResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BenchmarkStats {
-    pub mops_per_sec: f64,
-    pub median_mops_per_sec: f64,
+    #[serde(default)]
+    pub throughput: Throughput,
+    #[serde(default)]
+    pub throughput_per_sec: f64,
+    #[serde(default)]
+    pub median_throughput_per_sec: f64,
     pub ns_per_op: f64,
     pub median_ns_per_op: f64,
     pub p95_ns_per_op: f64,
@@ -63,7 +67,7 @@ pub struct BenchmarkStats {
     pub operations: u64,
     pub total_duration_sec: f64,
     #[serde(default)]
-    pub sample_throughput_mops_per_sec: Vec<f64>,
+    pub sample_throughput_per_sec: Vec<f64>,
     #[serde(default)]
     pub sample_latency_ns_per_op: Vec<f64>,
     #[serde(default)]
@@ -261,8 +265,8 @@ impl BenchmarkReport {
             );
 
             let mut table = TableFormatter::new(
-                vec!["Benchmark", "Mops/s", "Median ns/op", "P95 ns/op", "Change"],
-                vec![25, 13, 14, 12, 16],
+                vec!["Benchmark", "Throughput", "Median ns/op", "P95 ns/op", "Change"],
+                vec![25, 20, 14, 12, 16],
             )
             .with_alignments(vec![
                 Alignment::Left,
@@ -277,8 +281,8 @@ impl BenchmarkReport {
                     matching_previous_result(prev, result)
                         .map(|prev_result| {
                             let change = safe_percent_change(
-                                result.stats.mops_per_sec,
-                                prev_result.stats.mops_per_sec,
+                                comparable_throughput_per_sec(result, prev_result),
+                                comparable_throughput_per_sec(prev_result, result),
                             );
                             format_percent_change(change)
                         })
@@ -289,7 +293,12 @@ impl BenchmarkReport {
 
                 table.add_row(vec![
                     &colorize_label(&result.name),
-                    &colorize_value(&format!("{:.1}", result.stats.mops_per_sec)),
+                    &colorize_value(
+                        &result
+                            .stats
+                            .throughput
+                            .format_rate(result.stats.throughput_per_sec),
+                    ),
                     &colorize_value(&format!("{:.2}", result.stats.median_ns_per_op)),
                     &colorize_value(&format!("{:.2}", result.stats.p95_ns_per_op)),
                     &change_info,
@@ -441,27 +450,39 @@ impl BenchmarkReport {
         }
 
         println!("🔍 KEY INSIGHTS:");
-        let fastest = self
-            .results
-            .iter()
-            .filter_map(|result| finite_mops(result).map(|mops| (result, mops)))
-            .max_by(|a, b| a.1.total_cmp(&b.1));
-        let slowest = self
-            .results
-            .iter()
-            .filter_map(|result| finite_mops(result).map(|mops| (result, mops)))
-            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if unique_throughput_unit(&self.results).is_some() {
+            let fastest = self
+                .results
+                .iter()
+                .filter_map(|result| finite_throughput(result).map(|rate| (result, rate)))
+                .max_by(|a, b| a.1.total_cmp(&b.1));
+            let slowest = self
+                .results
+                .iter()
+                .filter_map(|result| finite_throughput(result).map(|rate| (result, rate)))
+                .min_by(|a, b| a.1.total_cmp(&b.1));
 
-        if let (Some((fast, fast_mops)), Some((slow, slow_mops))) = (fastest, slowest) {
-            println!("   🏆 Fastest: {} ({:.1} Mops/s)", fast.name, fast_mops);
-            println!("   🐌 Slowest: {} ({:.1} Mops/s)", slow.name, slow_mops);
-            if slow_mops > f64::EPSILON {
-                println!("   📊 Speed difference: {:.1}x", fast_mops / slow_mops);
+            if let (Some((fast, fastest_rate)), Some((slow, slowest_rate))) = (fastest, slowest) {
+                println!(
+                    "   🏆 Fastest: {} ({})",
+                    fast.name,
+                    fast.stats.throughput.format_rate(fastest_rate)
+                );
+                println!(
+                    "   🐌 Slowest: {} ({})",
+                    slow.name,
+                    slow.stats.throughput.format_rate(slowest_rate)
+                );
+                if slowest_rate > f64::EPSILON {
+                    println!("   📊 Speed difference: {:.1}x", fastest_rate / slowest_rate);
+                } else {
+                    println!("   📊 Speed difference: n/a");
+                }
             } else {
-                println!("   📊 Speed difference: n/a");
+                println!("   No finite throughput values available for insights.");
             }
         } else {
-            println!("   No finite throughput values available for insights.");
+            println!("   Mixed throughput units across benchmarks; skipping fastest/slowest comparison.");
         }
 
         if let Some(ref prev) = previous_session {
@@ -473,8 +494,8 @@ impl BenchmarkReport {
             for result in &self.results {
                 if let Some(prev_result) = matching_previous_result(prev, result)
                     && let Some(change) = safe_percent_change(
-                        result.stats.mops_per_sec,
-                        prev_result.stats.mops_per_sec,
+                        comparable_throughput_per_sec(result, prev_result),
+                        comparable_throughput_per_sec(prev_result, result),
                     )
                 {
                     comparable_count += 1;
@@ -612,16 +633,16 @@ fn matching_previous_result<'a>(
 }
 
 fn result_mean_throughput(result: &BenchmarkResult) -> f64 {
-    if result.stats.sample_throughput_mops_per_sec.is_empty() {
-        return result.stats.mops_per_sec;
+    if result.stats.sample_throughput_per_sec.is_empty() {
+        return result.stats.throughput_per_sec;
     }
 
     result
         .stats
-        .sample_throughput_mops_per_sec
+        .sample_throughput_per_sec
         .iter()
         .sum::<f64>()
-        / result.stats.sample_throughput_mops_per_sec.len() as f64
+        / result.stats.sample_throughput_per_sec.len() as f64
 }
 
 fn result_median_latency(result: &BenchmarkResult) -> f64 {
@@ -707,7 +728,10 @@ fn pmu_backend_stall_metric(stats: &BenchmarkStats) -> Option<f64> {
 
 fn comparative_diagnosis(current: &BenchmarkResult, previous: &BenchmarkResult) -> String {
     let throughput_change =
-        safe_percent_change(current.stats.mops_per_sec, previous.stats.mops_per_sec);
+        safe_percent_change(
+            comparable_throughput_per_sec(current, previous),
+            comparable_throughput_per_sec(previous, current),
+        );
     let ipc_change = safe_percent_change(current.stats.ipc, previous.stats.ipc);
     let instructions_change = safe_percent_change(
         current.stats.instructions_per_op,
@@ -866,13 +890,33 @@ fn median_absolute_deviation_latency(values: &[f64], median_value: f64) -> f64 {
     percentile_latency(&deviations, 0.5)
 }
 
-fn finite_mops(result: &BenchmarkResult) -> Option<f64> {
-    let mops = result.stats.mops_per_sec;
-    if mops.is_finite() && mops >= 0.0 {
-        Some(mops)
+fn throughput_units_match(current: &BenchmarkResult, previous: &BenchmarkResult) -> bool {
+    current.stats.throughput.unit() == previous.stats.throughput.unit()
+}
+
+fn comparable_throughput_per_sec(current: &BenchmarkResult, previous: &BenchmarkResult) -> f64 {
+    if throughput_units_match(current, previous) {
+        current.stats.throughput_per_sec
+    } else {
+        f64::NAN
+    }
+}
+
+fn finite_throughput(result: &BenchmarkResult) -> Option<f64> {
+    let throughput = result.stats.throughput_per_sec;
+    if throughput.is_finite() && throughput >= 0.0 {
+        Some(throughput)
     } else {
         None
     }
+}
+
+fn unique_throughput_unit(results: &[BenchmarkResult]) -> Option<&str> {
+    let first = results.first()?.stats.throughput.unit();
+    results
+        .iter()
+        .all(|result| result.stats.throughput.unit() == first)
+        .then_some(first)
 }
 
 fn default_suite_name() -> String {
@@ -994,14 +1038,15 @@ fn load_comparison_session(
 mod tests {
     use super::*;
 
-    fn make_result(name: &str, mops_per_sec: f64) -> BenchmarkResult {
+    fn make_result(name: &str, throughput_per_sec: f64) -> BenchmarkResult {
         BenchmarkResult {
             name: name.to_string(),
             group: "test".to_string(),
             kind: BenchmarkKind::Standard,
             stats: BenchmarkStats {
-                mops_per_sec,
-                median_mops_per_sec: mops_per_sec,
+                throughput: Throughput::ops(),
+                throughput_per_sec,
+                median_throughput_per_sec: throughput_per_sec,
                 ns_per_op: 1.0,
                 median_ns_per_op: 1.0,
                 p95_ns_per_op: 1.0,
@@ -1025,7 +1070,7 @@ mod tests {
                 samples: 1,
                 operations: 1,
                 total_duration_sec: 1.0,
-                sample_throughput_mops_per_sec: vec![mops_per_sec],
+                sample_throughput_per_sec: vec![throughput_per_sec],
                 sample_latency_ns_per_op: vec![1.0],
                 has_cycles: false,
                 has_instructions: false,
@@ -1073,10 +1118,10 @@ mod tests {
     }
 
     #[test]
-    fn finite_mops_filters_out_non_finite_values() {
-        assert_eq!(finite_mops(&make_result("ok", 1.0)), Some(1.0));
-        assert_eq!(finite_mops(&make_result("nan", f64::NAN)), None);
-        assert_eq!(finite_mops(&make_result("neg", -1.0)), None);
+    fn finite_throughput_filters_out_non_finite_values() {
+        assert_eq!(finite_throughput(&make_result("ok", 1.0)), Some(1.0));
+        assert_eq!(finite_throughput(&make_result("nan", f64::NAN)), None);
+        assert_eq!(finite_throughput(&make_result("neg", -1.0)), None);
     }
 
     #[test]

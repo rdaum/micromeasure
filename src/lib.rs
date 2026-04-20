@@ -31,6 +31,7 @@ mod threading;
 pub use bench::{
     BenchContext, BenchmarkRunner, ConcurrentBenchContext, ConcurrentBenchControl,
     ConcurrentBenchmarkGroup, ConcurrentWorker, ConcurrentWorkerResult, CounterValue, NoContext,
+    Throughput,
 };
 pub use launcher::{
     BenchmarkMainOptions, benchmark_filter_from_args, benchmark_filter_from_env, run_benchmark_main,

@@ -1,4 +1,4 @@
-use super::{Results, safe_ratio_f64, throughput_ops_per_sec};
+use super::{Results, Throughput, safe_ratio_f64, throughput_ops_per_sec};
 use crate::{Alignment, BenchmarkStats, BorderColor, TableFormatter};
 use std::io::IsTerminal;
 
@@ -34,11 +34,13 @@ pub(super) fn benchmark_stats_from_samples(
     summed_results: &Results,
     all_results: &[Results],
     sample_count: usize,
+    throughput: &Throughput,
 ) -> BenchmarkStats {
     let mut results = summed_results.clone();
     results.divide(sample_count as u64);
 
-    let ops_per_sec = safe_ratio_f64(results.iterations as f64, results.duration.as_secs_f64());
+    let throughput_per_sec =
+        throughput.rate_for_operations(results.iterations, results.duration.as_secs_f64());
     let ns_per_op = safe_ratio_f64(
         results.duration.as_nanos() as f64,
         results.iterations as f64,
@@ -74,9 +76,9 @@ pub(super) fn benchmark_stats_from_samples(
     let backend_stall_percent =
         safe_ratio_f64(results.stalled_cycles_backend as f64, results.cycles as f64) * 100.0;
     let cv_percent = coefficient_of_variation_percent(all_results);
-    let mut throughput_samples = sample_mops_per_sec(all_results);
+    let mut throughput_samples = sample_throughput_per_sec(all_results, throughput);
     throughput_samples.sort_by(|a, b| a.total_cmp(b));
-    let median_mops_per_sec = median(&throughput_samples);
+    let median_throughput_per_sec = median(&throughput_samples);
     let mut latency_samples = sample_ns_per_op(all_results);
     latency_samples.sort_by(|a, b| a.total_cmp(b));
     let median_ns_per_op = median(&latency_samples);
@@ -85,8 +87,9 @@ pub(super) fn benchmark_stats_from_samples(
     let outlier_count = tukey_outlier_count(&latency_samples);
 
     BenchmarkStats {
-        mops_per_sec: ops_per_sec / 1_000_000.0,
-        median_mops_per_sec,
+        throughput: throughput.clone(),
+        throughput_per_sec,
+        median_throughput_per_sec,
         ns_per_op,
         median_ns_per_op,
         p95_ns_per_op,
@@ -110,7 +113,7 @@ pub(super) fn benchmark_stats_from_samples(
         samples: sample_count,
         operations: results.iterations,
         total_duration_sec: summed_results.duration.as_secs_f64(),
-        sample_throughput_mops_per_sec: throughput_samples,
+        sample_throughput_per_sec: throughput_samples,
         sample_latency_ns_per_op: latency_samples,
         has_cycles: results.has_cycles,
         has_instructions: results.has_instructions,
@@ -175,9 +178,9 @@ fn render_stats_table_impl(
 fn add_full_stat_rows(table: &mut TableFormatter, stats: &BenchmarkStats, measurement_label: &str) {
     table.add_row(vec![
         &colorize_label("Throughput"),
-        &colorize_value(&format!("{:.2} Mops/s", stats.mops_per_sec)),
+        &colorize_value(&stats.throughput.format_rate(stats.throughput_per_sec)),
         &colorize_label("Median Throughput"),
-        &colorize_value(&format!("{:.2} Mops/s", stats.median_mops_per_sec)),
+        &colorize_value(&stats.throughput.format_rate(stats.median_throughput_per_sec)),
     ]);
     table.add_row(vec![
         &colorize_label("Mean Latency"),
@@ -394,11 +397,11 @@ fn coefficient_of_variation_percent(samples: &[Results]) -> f64 {
     (variance.sqrt() / mean) * 100.0
 }
 
-fn sample_mops_per_sec(samples: &[Results]) -> Vec<f64> {
+fn sample_throughput_per_sec(samples: &[Results], throughput: &Throughput) -> Vec<f64> {
     samples
         .iter()
         .filter_map(throughput_ops_per_sec)
-        .map(|v| v / 1_000_000.0)
+        .map(|ops_per_sec| ops_per_sec * throughput.amount_per_operation() as f64)
         .collect()
 }
 

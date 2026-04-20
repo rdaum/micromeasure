@@ -64,6 +64,7 @@ am sharing it.
 `micromeasure` currently emphasizes:
 
 - timing and throughput
+- explicit throughput units per measured operation, so reports can say `lines/s`, `bytes/s`, `rows/s`, not just generic ops
 - median, p95, MAD, coefficient of variation, and outlier counts
 - coordinated concurrent microbenchmarks with the same sample/report pipeline
 - Linux perf counters when available
@@ -113,6 +114,12 @@ For a concurrent workload example with bench-defined event counters, run:
 cargo run --example concurrent_counters --release
 ```
 
+For an example that reports domain throughput like `lines/s`, run:
+
+```sh
+cargo run --example throughput_units --release
+```
+
 In a consuming crate, you would usually run your benchmark with:
 
 ```sh
@@ -124,7 +131,7 @@ Example output:
 ![micromeasure example output](screenshot.png)
 
 ```rust
-use micromeasure::{NoContext, benchmark_main, black_box};
+use micromeasure::{NoContext, Throughput, benchmark_main, black_box};
 
 fn add_bench(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
     let mut acc = black_box(0_u64);
@@ -137,10 +144,16 @@ fn add_bench(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
 
 benchmark_main!(|runner| {
     runner.group::<NoContext>("Arithmetic", |g| {
-        g.bench("add_loop", add_bench);
+        g.throughput(Throughput::per_operation(8, "bytes"))
+            .bench("add_loop", add_bench);
     });
 });
 ```
+
+If one measured operation represents something other than a single logical op, declare it on the
+group or benchmark. For example, if each measured operation compiles 1000 lines of code, use
+`g.throughput(Throughput::per_operation(1000, "lines"))` and the report will render throughput as
+`lines/s`.
 
 `benchmark_main!` handles:
 

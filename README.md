@@ -189,8 +189,35 @@ runner.concurrent_group::<SharedState>("Contention", |g| {
 - printing the session summary
 - saving the report to the default location
 
-If you want a custom suite name or custom filter help text, use
+If you want a custom suite name, custom filter help text, or custom runtime options, use
 `run_benchmark_main(BenchmarkMainOptions { ... }, |runner| { ... })` instead.
+
+## Runtime Configuration
+
+You can configure the benchmark runtime behavior (warm-up duration, target benchmark duration, and
+sample counts) either on the `BenchmarkRunner` or via `BenchmarkMainOptions`.
+
+```rust
+benchmark_main!(|runner| {
+    let runtime = BenchmarkRuntimeOptions {
+        warm_up_duration: Duration::from_millis(500),
+        benchmark_duration: Duration::from_secs(2),
+        ..BenchmarkRuntimeOptions::default()
+    };
+
+    runner
+        .set_runtime(runtime)
+        .group::<NoContext>("Arithmetic", |g| {
+            g.bench("add_loop", add_bench);
+        });
+});
+```
+
+Default values are:
+- `warm_up_duration`: 1 second
+- `benchmark_duration`: 5 seconds
+- `min_samples`: 20
+- `max_samples`: 100
 
 ## Concurrent Benchmarks
 

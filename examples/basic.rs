@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use micromeasure::{NoContext, Throughput, benchmark_main, black_box};
+use micromeasure::{BenchmarkRuntimeOptions, NoContext, Throughput, benchmark_main, black_box};
+use std::time::Duration;
 
 fn add_loop(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
     let mut acc = black_box(0_u64);
@@ -24,8 +25,17 @@ fn add_loop(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
 }
 
 benchmark_main!(|runner| {
-    runner.group::<NoContext>("Arithmetic", |g| {
-        g.throughput(Throughput::per_operation(8, "bytes"))
-            .bench("add_loop", add_loop);
-    });
+    // Configure runtime options for the entire session
+    let runtime = BenchmarkRuntimeOptions {
+        warm_up_duration: Duration::from_millis(500),
+        benchmark_duration: Duration::from_secs(2),
+        ..BenchmarkRuntimeOptions::default()
+    };
+
+    runner
+        .set_runtime(runtime)
+        .group::<NoContext>("Arithmetic", |g| {
+            g.throughput(Throughput::per_operation(8, "bytes"))
+                .bench("add_loop", add_loop);
+        });
 });

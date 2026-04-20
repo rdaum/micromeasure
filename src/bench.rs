@@ -48,8 +48,8 @@ const MIN_CHUNK_SIZE: usize = 100_000;
 const MAX_CHUNK_SIZE: usize = 50_000_000;
 const TARGET_CHUNK_DURATION: Duration = Duration::from_millis(50);
 const DEFAULT_CONCURRENT_SAMPLE_DURATION: Duration = Duration::from_millis(50);
-const WARM_UP_DURATION: Duration = Duration::from_secs(1);
-const MIN_BENCHMARK_DURATION: Duration = Duration::from_secs(5);
+const DEFAULT_WARM_UP_DURATION: Duration = Duration::from_secs(1);
+const DEFAULT_BENCHMARK_DURATION: Duration = Duration::from_secs(5);
 const MIN_SAMPLES: usize = 20;
 const MAX_SAMPLES: usize = 100;
 
@@ -227,6 +227,44 @@ struct ConcurrentBenchmarkConfig {
     sample_duration: Duration,
     target_samples: usize,
     estimated_throughput_per_sec: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct BenchmarkRuntimeOptions {
+    pub warm_up_duration: Duration,
+    pub benchmark_duration: Duration,
+    pub min_samples: usize,
+    pub max_samples: usize,
+}
+
+impl Default for BenchmarkRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            warm_up_duration: DEFAULT_WARM_UP_DURATION,
+            benchmark_duration: DEFAULT_BENCHMARK_DURATION,
+            min_samples: MIN_SAMPLES,
+            max_samples: MAX_SAMPLES,
+        }
+    }
+}
+
+impl BenchmarkRuntimeOptions {
+    fn validate(&self) {
+        assert!(
+            self.warm_up_duration > Duration::ZERO,
+            "warm_up_duration must be > 0"
+        );
+        assert!(
+            self.benchmark_duration > Duration::ZERO,
+            "benchmark_duration must be > 0"
+        );
+        assert!(self.min_samples > 0, "min_samples must be > 0");
+        assert!(self.max_samples > 0, "max_samples must be > 0");
+        assert!(
+            self.min_samples <= self.max_samples,
+            "min_samples must be <= max_samples"
+        );
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -641,11 +679,12 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
     f: &BenchFunction<T>,
     factory: &F,
     throughput: &Throughput,
+    runtime: &BenchmarkRuntimeOptions,
 ) -> BenchmarkConfig {
     rewrite_line("🔥 calibrating benchmark");
 
     if let Some(preferred_chunk_size) = T::chunk_size() {
-        let warm_up_end = Instant::now() + WARM_UP_DURATION;
+        let warm_up_end = Instant::now() + runtime.warm_up_duration;
         let mut warm_up_count = 0;
         while Instant::now() < warm_up_end {
             let mut prepared = factory();
@@ -662,7 +701,7 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
         clear_line();
         return BenchmarkConfig {
             chunk_size: preferred_chunk_size,
-            target_samples: MIN_SAMPLES,
+            target_samples: runtime.min_samples,
             estimated_throughput_per_sec: 0.0,
         };
     }
@@ -707,7 +746,7 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
         ));
     }
 
-    let warm_up_end = Instant::now() + WARM_UP_DURATION;
+    let warm_up_end = Instant::now() + runtime.warm_up_duration;
     let mut warm_up_count = 0;
     while Instant::now() < warm_up_end {
         let mut prepared = factory();
@@ -728,9 +767,9 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
     } else {
         TARGET_CHUNK_DURATION.as_secs_f64()
     };
-    let target_samples = ((MIN_BENCHMARK_DURATION.as_secs_f64() / estimated_chunk_duration_secs)
-        as usize)
-        .clamp(MIN_SAMPLES, MAX_SAMPLES);
+    let target_samples =
+        ((runtime.benchmark_duration.as_secs_f64() / estimated_chunk_duration_secs) as usize)
+            .clamp(runtime.min_samples, runtime.max_samples);
 
     clear_line();
     BenchmarkConfig {
@@ -749,11 +788,12 @@ fn warm_up_concurrent_engine<T: ConcurrentBenchContext + Sync, F: Fn(usize) -> T
     workers: &[ConcurrentWorker<T>],
     factory: &F,
     throughput: &Throughput,
+    runtime: &BenchmarkRuntimeOptions,
 ) -> ConcurrentBenchmarkConfig {
     rewrite_line("🔥 calibrating benchmark");
 
     let total_threads = total_worker_threads(workers);
-    let warm_up_end = Instant::now() + WARM_UP_DURATION;
+    let warm_up_end = Instant::now() + runtime.warm_up_duration;
     let mut estimated_throughput_per_sec = 0.0;
 
     while Instant::now() < warm_up_end {
@@ -781,9 +821,9 @@ fn warm_up_concurrent_engine<T: ConcurrentBenchContext + Sync, F: Fn(usize) -> T
     }
 
     clear_line();
-    let target_samples = ((MIN_BENCHMARK_DURATION.as_secs_f64() / sample_duration.as_secs_f64())
-        as usize)
-        .clamp(MIN_SAMPLES, MAX_SAMPLES);
+    let target_samples =
+        ((runtime.benchmark_duration.as_secs_f64() / sample_duration.as_secs_f64()) as usize)
+            .clamp(runtime.min_samples, runtime.max_samples);
 
     ConcurrentBenchmarkConfig {
         sample_duration,
@@ -1015,6 +1055,7 @@ fn update_progress_bar(
 pub struct BenchmarkRunner {
     session: std::sync::Arc<BenchmarkSession>,
     filter: Option<String>,
+    runtime: BenchmarkRuntimeOptions,
 }
 
 impl Default for BenchmarkRunner {
@@ -1028,6 +1069,7 @@ impl BenchmarkRunner {
         Self {
             session: std::sync::Arc::new(BenchmarkSession::new()),
             filter: None,
+            runtime: BenchmarkRuntimeOptions::default(),
         }
     }
 
@@ -1038,6 +1080,17 @@ impl BenchmarkRunner {
 
     pub fn with_filter(mut self, filter: Option<&str>) -> Self {
         self.filter = filter.map(str::to_string);
+        self
+    }
+
+    pub fn with_runtime(mut self, runtime: BenchmarkRuntimeOptions) -> Self {
+        self.set_runtime(runtime);
+        self
+    }
+
+    pub fn set_runtime(&mut self, runtime: BenchmarkRuntimeOptions) -> &mut Self {
+        runtime.validate();
+        self.runtime = runtime;
         self
     }
 
@@ -1085,7 +1138,7 @@ impl BenchmarkRunner {
             name,
             group,
             f,
-            &|| T::prepare(MIN_CHUNK_SIZE),
+            &|| T::prepare(T::chunk_size().unwrap_or(MIN_CHUNK_SIZE)),
             Throughput::ops(),
         );
     }
@@ -1118,7 +1171,7 @@ impl BenchmarkRunner {
         let _affinity_guard = BenchAffinityGuard::acquire();
         println!("\nBenchmark: {name}");
 
-        let config = calibrate_engine(&f, factory, &throughput);
+        let config = calibrate_engine(&f, factory, &throughput, &self.runtime);
         println!(
             "  calibrated: chunk={} samples={} estimate={}",
             config.chunk_size,
@@ -1238,7 +1291,13 @@ impl BenchmarkRunner {
 
         println!("\nBenchmark: {name}");
 
-        let config = warm_up_concurrent_engine(sample_duration, workers, factory, &throughput);
+        let config = warm_up_concurrent_engine(
+            sample_duration,
+            workers,
+            factory,
+            &throughput,
+            &self.runtime,
+        );
         println!(
             "  calibrated: sample={}ms samples={} estimate={}",
             config.sample_duration.as_millis(),
@@ -1392,7 +1451,7 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             name,
             self.name,
             f,
-            &|| T::prepare(MIN_CHUNK_SIZE),
+            &|| T::prepare(T::chunk_size().unwrap_or(MIN_CHUNK_SIZE)),
             self.throughput.clone(),
         );
     }

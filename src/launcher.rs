@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{BenchmarkReport, BenchmarkRunner, ComparisonPolicy};
-use std::env;
+use crate::{BenchmarkReport, BenchmarkRunner, BenchmarkRuntimeOptions, ComparisonPolicy};
+use std::{env, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct BenchmarkMainOptions {
@@ -21,6 +21,7 @@ pub struct BenchmarkMainOptions {
     pub filter_help: Option<String>,
     pub comparison_policy: ComparisonPolicy,
     pub save_results: bool,
+    pub runtime: BenchmarkRuntimeOptions,
 }
 
 impl Default for BenchmarkMainOptions {
@@ -30,6 +31,12 @@ impl Default for BenchmarkMainOptions {
             filter_help: None,
             comparison_policy: ComparisonPolicy::LatestCompatible,
             save_results: true,
+            runtime: BenchmarkRuntimeOptions {
+                warm_up_duration: Duration::from_secs(1),
+                benchmark_duration: Duration::from_secs(5),
+                min_samples: 20,
+                max_samples: 100,
+            },
         }
     }
 }
@@ -53,7 +60,7 @@ pub fn benchmark_filter_from_env() -> Option<String> {
 
 pub fn run_benchmark_main(
     options: BenchmarkMainOptions,
-    register: impl FnOnce(&BenchmarkRunner),
+    register: impl FnOnce(&mut BenchmarkRunner),
 ) -> BenchmarkReport {
     let filter = benchmark_filter_from_env();
 
@@ -69,8 +76,9 @@ pub fn run_benchmark_main(
     if let Some(suite) = options.suite {
         runner = runner.with_suite(suite);
     }
+    runner = runner.with_runtime(options.runtime.clone());
 
-    register(&runner);
+    register(&mut runner);
 
     if filter.is_some() {
         eprintln!("\nBenchmark filtering complete.");

@@ -27,11 +27,11 @@ use affinity::{BenchAffinityGuard, warn_affinity_once};
 #[cfg(target_os = "linux")]
 use perf::{clear_perf_issues, execute_concurrent_worker, execute_standard};
 use perf::{enforce_pmu_quality, measurement_label, warn_perf_status};
+use serde::{Deserialize, Serialize};
 use stats::{
     benchmark_stats_from_samples, colorize_section_heading, render_combined_stats_table,
     render_stats_table,
 };
-use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use std::{
     hint::black_box,
@@ -47,6 +47,7 @@ pub use perf::PerfCounters;
 const MIN_CHUNK_SIZE: usize = 100_000;
 const MAX_CHUNK_SIZE: usize = 50_000_000;
 const TARGET_CHUNK_DURATION: Duration = Duration::from_millis(50);
+const DEFAULT_CONCURRENT_SAMPLE_DURATION: Duration = Duration::from_millis(50);
 const WARM_UP_DURATION: Duration = Duration::from_secs(1);
 const MIN_BENCHMARK_DURATION: Duration = Duration::from_secs(5);
 const MIN_SAMPLES: usize = 20;
@@ -247,10 +248,7 @@ impl Throughput {
             amount_per_operation > 0,
             "throughput amount per operation must be > 0"
         );
-        assert!(
-            !unit.trim().is_empty(),
-            "throughput unit must not be empty"
-        );
+        assert!(!unit.trim().is_empty(), "throughput unit must not be empty");
 
         Self {
             amount_per_operation,
@@ -681,10 +679,8 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
         let duration_secs = duration.as_secs_f64();
 
         if duration_secs >= 0.0001 {
-            estimated_throughput_per_sec = throughput.rate_for_operations(
-                chunk_size as u64,
-                duration_secs,
-            );
+            estimated_throughput_per_sec =
+                throughput.rate_for_operations(chunk_size as u64, duration_secs);
             if duration >= TARGET_CHUNK_DURATION.mul_f64(0.8)
                 && duration <= TARGET_CHUNK_DURATION.mul_f64(1.2)
             {
@@ -726,7 +722,8 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
     }
 
     let estimated_chunk_duration_secs = if estimated_throughput_per_sec > 0.0 {
-        let chunk_throughput_amount = best_chunk_size as f64 * throughput.amount_per_operation as f64;
+        let chunk_throughput_amount =
+            best_chunk_size as f64 * throughput.amount_per_operation as f64;
         chunk_throughput_amount / estimated_throughput_per_sec
     } else {
         TARGET_CHUNK_DURATION.as_secs_f64()
@@ -1354,6 +1351,13 @@ pub struct BenchmarkGroup<'a, T: BenchContext> {
     _marker: std::marker::PhantomData<T>,
 }
 
+pub struct BenchmarkGroupWithFactory<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> {
+    runner: &'a BenchmarkRunner,
+    name: &'static str,
+    throughput: Throughput,
+    factory: &'f F,
+}
+
 impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
     pub fn throughput(&self, throughput: Throughput) -> Self {
         Self {
@@ -1362,6 +1366,25 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             throughput,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    pub fn factory<'f, F: Fn() -> T + ?Sized>(
+        &self,
+        factory: &'f F,
+    ) -> BenchmarkGroupWithFactory<'a, 'f, T, F> {
+        BenchmarkGroupWithFactory {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            factory,
+        }
+    }
+
+    pub fn with_factory<'f, F: Fn() -> T + ?Sized>(
+        &self,
+        factory: &'f F,
+    ) -> BenchmarkGroupWithFactory<'a, 'f, T, F> {
+        self.factory(factory)
     }
 
     pub fn bench(&self, name: &str, f: BenchFunction<T>) {
@@ -1374,21 +1397,22 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
         );
     }
 
+    #[deprecated(note = "use g.throughput(...).bench(...) instead")]
     pub fn bench_with_throughput(&self, name: &str, throughput: Throughput, f: BenchFunction<T>) {
-        self.runner
-            .run_with_factory_and_throughput(name, self.name, f, &|| T::prepare(MIN_CHUNK_SIZE), throughput);
+        self.throughput(throughput).bench(name, f);
     }
 
+    #[deprecated(note = "use g.factory(...).bench(...) instead")]
     pub fn bench_with_factory<F: Fn() -> T + ?Sized>(
         &self,
         name: &str,
         factory: &F,
         f: BenchFunction<T>,
     ) {
-        self.runner
-            .run_with_factory_and_throughput(name, self.name, f, factory, self.throughput.clone());
+        self.factory(factory).bench(name, f);
     }
 
+    #[deprecated(note = "use g.throughput(...).factory(...).bench(...) instead")]
     pub fn bench_with_factory_and_throughput<F: Fn() -> T + ?Sized>(
         &self,
         name: &str,
@@ -1396,8 +1420,28 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
         throughput: Throughput,
         f: BenchFunction<T>,
     ) {
-        self.runner
-            .run_with_factory_and_throughput(name, self.name, f, factory, throughput);
+        self.throughput(throughput).factory(factory).bench(name, f);
+    }
+}
+
+impl<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> BenchmarkGroupWithFactory<'a, 'f, T, F> {
+    pub fn throughput(&self, throughput: Throughput) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput,
+            factory: self.factory,
+        }
+    }
+
+    pub fn bench(&self, name: &str, f: BenchFunction<T>) {
+        self.runner.run_with_factory_and_throughput(
+            name,
+            self.name,
+            f,
+            self.factory,
+            self.throughput.clone(),
+        );
     }
 }
 
@@ -1406,6 +1450,27 @@ pub struct ConcurrentBenchmarkGroup<'a, T: ConcurrentBenchContext> {
     name: &'static str,
     throughput: Throughput,
     _marker: std::marker::PhantomData<T>,
+}
+
+pub struct ConcurrentBenchmarkGroupWithDuration<'a, T: ConcurrentBenchContext> {
+    runner: &'a BenchmarkRunner,
+    name: &'static str,
+    throughput: Throughput,
+    sample_duration: Duration,
+    _marker: std::marker::PhantomData<T>,
+}
+
+pub struct ConcurrentBenchmarkGroupWithFactory<
+    'a,
+    'f,
+    T: ConcurrentBenchContext,
+    F: Fn(usize) -> T + ?Sized,
+> {
+    runner: &'a BenchmarkRunner,
+    name: &'static str,
+    throughput: Throughput,
+    sample_duration: Duration,
+    factory: &'f F,
 }
 
 impl<'a, T: ConcurrentBenchContext> ConcurrentBenchmarkGroup<'a, T>
@@ -1421,6 +1486,23 @@ where
         }
     }
 
+    pub fn sample_duration(
+        &self,
+        sample_duration: Duration,
+    ) -> ConcurrentBenchmarkGroupWithDuration<'a, T> {
+        assert!(
+            sample_duration > Duration::ZERO,
+            "concurrent benchmark sample_duration must be > 0"
+        );
+        ConcurrentBenchmarkGroupWithDuration {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            sample_duration,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     pub fn bench(&self, name: &str, sample_duration: Duration, workers: &[ConcurrentWorker<T>]) {
         self.runner.run_concurrent_with_factory_and_throughput(
             name,
@@ -1432,6 +1514,7 @@ where
         );
     }
 
+    #[deprecated(note = "use g.sample_duration(...).throughput(...).bench(...) instead")]
     pub fn bench_with_throughput(
         &self,
         name: &str,
@@ -1439,16 +1522,32 @@ where
         workers: &[ConcurrentWorker<T>],
         throughput: Throughput,
     ) {
-        self.runner.run_concurrent_with_factory_and_throughput(
-            name,
-            self.name,
-            sample_duration,
-            workers,
-            &|num_threads| T::prepare(num_threads),
-            throughput,
-        );
+        self.sample_duration(sample_duration)
+            .throughput(throughput)
+            .bench(name, workers);
     }
 
+    pub fn factory<'f, F: Fn(usize) -> T + ?Sized>(
+        &self,
+        factory: &'f F,
+    ) -> ConcurrentBenchmarkGroupWithFactory<'a, 'f, T, F> {
+        ConcurrentBenchmarkGroupWithFactory {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            sample_duration: DEFAULT_CONCURRENT_SAMPLE_DURATION,
+            factory,
+        }
+    }
+
+    pub fn with_factory<'f, F: Fn(usize) -> T + ?Sized>(
+        &self,
+        factory: &'f F,
+    ) -> ConcurrentBenchmarkGroupWithFactory<'a, 'f, T, F> {
+        self.factory(factory)
+    }
+
+    #[deprecated(note = "use g.sample_duration(...).factory(...).bench(...) instead")]
     pub fn bench_with_factory<F: Fn(usize) -> T + ?Sized>(
         &self,
         name: &str,
@@ -1456,16 +1555,15 @@ where
         workers: &[ConcurrentWorker<T>],
         factory: &F,
     ) {
-        self.runner.run_concurrent_with_factory_and_throughput(
-            name,
-            self.name,
-            sample_duration,
-            workers,
-            factory,
-            self.throughput.clone(),
-        );
+        self.sample_duration(sample_duration)
+            .throughput(self.throughput.clone())
+            .factory(factory)
+            .bench(name, workers);
     }
 
+    #[deprecated(
+        note = "use g.sample_duration(...).throughput(...).factory(...).bench(...) instead"
+    )]
     pub fn bench_with_factory_and_throughput<F: Fn(usize) -> T + ?Sized>(
         &self,
         name: &str,
@@ -1474,21 +1572,104 @@ where
         factory: &F,
         throughput: Throughput,
     ) {
+        self.sample_duration(sample_duration)
+            .throughput(throughput)
+            .factory(factory)
+            .bench(name, workers);
+    }
+}
+
+impl<'a, T: ConcurrentBenchContext> ConcurrentBenchmarkGroupWithDuration<'a, T>
+where
+    T: Send + Sync,
+{
+    pub fn throughput(&self, throughput: Throughput) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput,
+            sample_duration: self.sample_duration,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn factory<'f, F: Fn(usize) -> T + ?Sized>(
+        &self,
+        factory: &'f F,
+    ) -> ConcurrentBenchmarkGroupWithFactory<'a, 'f, T, F> {
+        ConcurrentBenchmarkGroupWithFactory {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            sample_duration: self.sample_duration,
+            factory,
+        }
+    }
+
+    pub fn with_factory<'f, F: Fn(usize) -> T + ?Sized>(
+        &self,
+        factory: &'f F,
+    ) -> ConcurrentBenchmarkGroupWithFactory<'a, 'f, T, F> {
+        self.factory(factory)
+    }
+
+    pub fn bench(&self, name: &str, workers: &[ConcurrentWorker<T>]) {
         self.runner.run_concurrent_with_factory_and_throughput(
             name,
             self.name,
-            sample_duration,
+            self.sample_duration,
             workers,
-            factory,
+            &|num_threads| T::prepare(num_threads),
+            self.throughput.clone(),
+        );
+    }
+}
+
+impl<'a, 'f, T: ConcurrentBenchContext, F: Fn(usize) -> T + ?Sized>
+    ConcurrentBenchmarkGroupWithFactory<'a, 'f, T, F>
+where
+    T: Send + Sync,
+{
+    pub fn throughput(&self, throughput: Throughput) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
             throughput,
+            sample_duration: self.sample_duration,
+            factory: self.factory,
+        }
+    }
+
+    pub fn sample_duration(&self, sample_duration: Duration) -> Self {
+        assert!(
+            sample_duration > Duration::ZERO,
+            "concurrent benchmark sample_duration must be > 0"
+        );
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            sample_duration,
+            factory: self.factory,
+        }
+    }
+
+    pub fn bench(&self, name: &str, workers: &[ConcurrentWorker<T>]) {
+        self.runner.run_concurrent_with_factory_and_throughput(
+            name,
+            self.name,
+            self.sample_duration,
+            workers,
+            self.factory,
+            self.throughput.clone(),
         );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::stats::{median, median_absolute_deviation, percentile, tukey_outlier_count};
     use super::Throughput;
+    use super::stats::{median, median_absolute_deviation, percentile, tukey_outlier_count};
 
     #[test]
     fn percentile_interpolates_sorted_values() {

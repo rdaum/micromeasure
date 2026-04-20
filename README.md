@@ -120,6 +120,12 @@ For an example that reports domain throughput like `lines/s`, run:
 cargo run --example throughput_units --release
 ```
 
+For an example that combines fluent `factory(...)` and throughput configuration, run:
+
+```sh
+cargo run --example factory_builder --release
+```
+
 In a consuming crate, you would usually run your benchmark with:
 
 ```sh
@@ -154,6 +160,27 @@ If one measured operation represents something other than a single logical op, d
 group or benchmark. For example, if each measured operation compiles 1000 lines of code, use
 `g.throughput(Throughput::per_operation(1000, "lines"))` and the report will render throughput as
 `lines/s`.
+
+Group configuration is fluent. That means you can apply shared benchmark setup once and then run
+multiple benches beneath it, for example:
+
+```rust
+runner.group::<MyContext>("Parser", |g| {
+    g.throughput(Throughput::per_operation(4096, "bytes"))
+        .factory(&|| MyContext::prepare_input())
+        .bench("parse_config", parse_config);
+});
+```
+
+Concurrent groups can also set sample duration fluently:
+
+```rust
+runner.concurrent_group::<SharedState>("Contention", |g| {
+    g.sample_duration(Duration::from_millis(50))
+        .throughput(Throughput::per_operation(1000, "lines"))
+        .bench("compile_under_lock", &workers);
+});
+```
 
 `benchmark_main!` handles:
 

@@ -76,10 +76,7 @@ benchmark_main!(|runner| {
     ];
 
     runner.concurrent_group::<CounterLatch>("Contention", |g| {
-        g.bench(
-            "rwlock_readers_vs_writer",
-            Duration::from_millis(50),
-            &workers,
-        );
+        g.sample_duration(Duration::from_millis(50))
+            .bench("rwlock_readers_vs_writer", &workers);
     });
 });

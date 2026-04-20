@@ -28,7 +28,10 @@ fn compile_lines(_ctx: &mut NoContext, chunk_size: usize, _chunk_num: usize) {
 
 benchmark_main!(|runner| {
     runner.group::<NoContext>("Compiler", |g| {
-        g.throughput(Throughput::per_operation(LINES_PER_COMPILATION as u64, "lines"))
-            .bench("compile_lines", compile_lines);
+        g.throughput(Throughput::per_operation(
+            LINES_PER_COMPILATION as u64,
+            "lines",
+        ))
+        .bench("compile_lines", compile_lines);
     });
 });

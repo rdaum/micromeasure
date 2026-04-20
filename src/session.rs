@@ -265,7 +265,13 @@ impl BenchmarkReport {
             );
 
             let mut table = TableFormatter::new(
-                vec!["Benchmark", "Throughput", "Median ns/op", "P95 ns/op", "Change"],
+                vec![
+                    "Benchmark",
+                    "Throughput",
+                    "Median ns/op",
+                    "P95 ns/op",
+                    "Change",
+                ],
                 vec![25, 20, 14, 12, 16],
             )
             .with_alignments(vec![
@@ -474,7 +480,10 @@ impl BenchmarkReport {
                     slow.stats.throughput.format_rate(slowest_rate)
                 );
                 if slowest_rate > f64::EPSILON {
-                    println!("   📊 Speed difference: {:.1}x", fastest_rate / slowest_rate);
+                    println!(
+                        "   📊 Speed difference: {:.1}x",
+                        fastest_rate / slowest_rate
+                    );
                 } else {
                     println!("   📊 Speed difference: n/a");
                 }
@@ -482,7 +491,9 @@ impl BenchmarkReport {
                 println!("   No finite throughput values available for insights.");
             }
         } else {
-            println!("   Mixed throughput units across benchmarks; skipping fastest/slowest comparison.");
+            println!(
+                "   Mixed throughput units across benchmarks; skipping fastest/slowest comparison."
+            );
         }
 
         if let Some(ref prev) = previous_session {
@@ -637,11 +648,7 @@ fn result_mean_throughput(result: &BenchmarkResult) -> f64 {
         return result.stats.throughput_per_sec;
     }
 
-    result
-        .stats
-        .sample_throughput_per_sec
-        .iter()
-        .sum::<f64>()
+    result.stats.sample_throughput_per_sec.iter().sum::<f64>()
         / result.stats.sample_throughput_per_sec.len() as f64
 }
 
@@ -727,11 +734,10 @@ fn pmu_backend_stall_metric(stats: &BenchmarkStats) -> Option<f64> {
 }
 
 fn comparative_diagnosis(current: &BenchmarkResult, previous: &BenchmarkResult) -> String {
-    let throughput_change =
-        safe_percent_change(
-            comparable_throughput_per_sec(current, previous),
-            comparable_throughput_per_sec(previous, current),
-        );
+    let throughput_change = safe_percent_change(
+        comparable_throughput_per_sec(current, previous),
+        comparable_throughput_per_sec(previous, current),
+    );
     let ipc_change = safe_percent_change(current.stats.ipc, previous.stats.ipc);
     let instructions_change = safe_percent_change(
         current.stats.instructions_per_op,

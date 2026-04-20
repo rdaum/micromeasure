@@ -180,7 +180,11 @@ fn add_full_stat_rows(table: &mut TableFormatter, stats: &BenchmarkStats, measur
         &colorize_label("Throughput"),
         &colorize_value(&stats.throughput.format_rate(stats.throughput_per_sec)),
         &colorize_label("Median Throughput"),
-        &colorize_value(&stats.throughput.format_rate(stats.median_throughput_per_sec)),
+        &colorize_value(
+            &stats
+                .throughput
+                .format_rate(stats.median_throughput_per_sec),
+        ),
     ]);
     table.add_row(vec![
         &colorize_label("Mean Latency"),

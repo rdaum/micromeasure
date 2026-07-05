@@ -129,6 +129,18 @@ fn requested_pin_core() -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
+fn pinning_disabled() -> bool {
+    std::env::var("MICROMEASURE_PIN")
+        .map(|value| {
+            value.eq_ignore_ascii_case("none")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("false")
+                || value == "0"
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
 fn selected_pin_core(allowed_core_ids: &[usize]) -> Option<usize> {
     requested_pin_core()
         .filter(|core_id| allowed_core_ids.contains(core_id))
@@ -200,6 +212,13 @@ impl BenchAffinityGuard {
     pub(super) fn acquire() -> Self {
         #[cfg(target_os = "linux")]
         {
+            if pinning_disabled() {
+                return Self {
+                    restore_mask: None,
+                    did_pin: false,
+                };
+            }
+
             let restore_mask = match capture_current_thread_affinity() {
                 Ok(mask) => Some(mask),
                 Err(error) => {

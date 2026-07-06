@@ -409,8 +409,6 @@ When PMU access is unavailable, the crate will fall back to timing-only measurem
 - not intended for large end-to-end benchmark suites
 - not trying to hide measurement mechanics behind a lot of framework structure
 - not a cross-platform PMU abstraction layer
-- not a GPU programming library — it measures GPU work but does not link CUDA or provide GPU
-  abstractions itself; backends and adapters live in consuming code
 
 ## Origin
 

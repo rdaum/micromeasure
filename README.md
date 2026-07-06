@@ -8,7 +8,7 @@
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink)](https://github.com/sponsors/rdaum)
 
 It is aimed at very focused operations where you care about instruction count, branch predictor behaviour, cache misses,
-and operation latency.
+and operation latency. It now also supports GPU benchmarks via pluggable measurement backends and per-sample custom metrics.
 
 It grew out of the needs of my [`mooR`](https://codeberg.org/timbran/moor) project, where many of the interesting
 questions were about tiny operations and internal data-structure mechanics. The goal was to measure things like:
@@ -71,6 +71,9 @@ am sharing it.
 - graceful fallback to timing-only runs when PMU access is unavailable
 - persisted benchmark reports with per-sample throughput and latency series
 - side-by-side comparison against the latest compatible saved report
+- GPU benchmarking with pluggable measurement backends (CUDA event timing, custom metrics)
+- per-sample custom metrics (e.g. `cuda_event_ms`, `tflops`, `host_overhead_ms`) with aggregation and JSON persistence
+- measurement domain tagging (`Cpu`, `Gpu`, `Mixed`) that suppresses or relabels CPU-PMU diagnostics for GPU work
 
 ## Wiring It Up
 
@@ -78,7 +81,7 @@ Add `micromeasure` as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-micromeasure = "0.6"
+micromeasure = "0.7"
 ```
 
 Then add a custom bench target in your `Cargo.toml`:
@@ -124,6 +127,14 @@ For an example that combines fluent `factory(...)` and throughput configuration,
 
 ```sh
 cargo run --example factory_builder --release
+```
+
+For GPU benchmarking examples, run:
+
+```sh
+cargo run --example gpu_domain --release        # measurement domain: suppress CPU-PMU diagnostics
+cargo run --example custom_metrics --release     # per-sample custom metrics with bench_sample()
+cargo run --example custom_backend --release     # pluggable MeasurementBackend (simulated CUDA events)
 ```
 
 In a consuming crate, you would usually run your benchmark with:
@@ -275,6 +286,64 @@ The `workers combined` section at the bottom is a whole-scenario aggregate. It i
 the PMU view of the entire interacting workload; the worker-role tables are usually the more
 meaningful place to interpret throughput and latency.
 
+## GPU Benchmarks
+
+`micromeasure` can benchmark GPU work (e.g. cuBLASLt GEMM, CUDA streams) alongside CPU
+microbenchmarks. Three features work together to make GPU output less misleading:
+
+**MeasurementDomain** (`g.measurement_domain(MeasurementDomain::Gpu)`):
+- `Gpu`: suppresses CPU-PMU bottleneck diagnostics (the host thread's counters describe launch/sync
+  orchestration, not the GPU kernel) and relabels the PMU coverage line as `host PMU (orchestration)`.
+- `Mixed`: emits CPU-PMU diagnostics with a `[host]` prefix.
+- `Cpu`: unchanged historic behaviour (the default).
+
+**MeasurementBackend** (`g.backend(|| Box::new(MyCudaBackend::new()))`):
+- Pluggable measurement window around the bench closure. The runner calls `begin()` / `end()` /
+  `collect()` per sample.
+- Default on Linux is `LinuxPerfBackend` (perf-event group + individual-counter fallback). On other
+  platforms it falls back to `WallClockBackend` (timing-only).
+- A CUDA event adapter (implemented in consuming code) records `cudaEventRecord` in `begin()` /
+  `end()`, computes elapsed in `collect()`, and pushes `cuda_event_ms` and `host_overhead_ms` as
+  custom metrics. No CUDA dependency in `micromeasure` itself.
+- The backend's `measurement_label()` (e.g. `"timing + CUDA events"`) is shown in the
+  `Measurement` row.
+
+**Per-sample custom metrics** (`g.bench_sample(name, f)`):
+- The bench function returns a `BenchSampleResult { operations, metrics }` instead of `()`.
+- `MetricValue` carries `name`, `value`, `unit`, an optional `display_name`, and a `format` hint
+  (`Number` or `Integer` for IDs/counts).
+- The runner aggregates per `(name, unit)` across samples into `MetricSummary` (mean, median, p95,
+  min, max, contributing sample count) and renders a `custom metrics:` table.
+- Bench-function metrics and backend-pushed metrics are merged into one table.
+- JSON persistence works through the existing `BenchmarkStats` serde derive.
+
+```rust
+fn my_gpu_bench(ctx: &mut GpuContext, chunk_size: usize, _chunk_num: usize) -> BenchSampleResult {
+    let device_s = ctx.run_kernel(chunk_size);
+    BenchSampleResult::operations(chunk_size as u64)
+        .push_metric(
+            MetricValue::duration_ms("cuda_event_ms", Duration::from_secs_f64(device_s))
+                .with_display_name("CUDA event time"),
+        )
+        .push_metric(
+            MetricValue::throughput_tflops("tflops", 12345, device_s)
+                .with_display_name("TFLOP/s"),
+        )
+}
+
+benchmark_main!(|runner| {
+    runner.group::<GpuContext>("cuBLASLt FP4", |g| {
+        g.throughput(Throughput::bytes(8))
+            .measurement_domain(MeasurementDomain::Gpu)
+            .backend(|| Box::new(CudaEventBackend::new()))
+            .bench_sample("fp4_gemm", my_gpu_bench);
+    });
+});
+```
+
+See `examples/gpu_domain.rs`, `examples/custom_metrics.rs`, and `examples/custom_backend.rs` for
+complete runnable examples.
+
 ## Linux-first, and why
 
 This crate is strongly Linux-specific, as its main differentiator is direct integration with Linux perf events and PMU
@@ -340,6 +409,8 @@ When PMU access is unavailable, the crate will fall back to timing-only measurem
 - not intended for large end-to-end benchmark suites
 - not trying to hide measurement mechanics behind a lot of framework structure
 - not a cross-platform PMU abstraction layer
+- not a GPU programming library — it measures GPU work but does not link CUDA or provide GPU
+  abstractions itself; backends and adapters live in consuming code
 
 ## Origin
 

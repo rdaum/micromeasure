@@ -1,5 +1,7 @@
 use super::{Results, Throughput, safe_ratio_f64, throughput_ops_per_sec};
-use crate::{Alignment, BenchmarkStats, BorderColor, TableFormatter};
+use crate::bench::backend::{MetricFormat, MetricValue};
+use crate::session::MetricSummary;
+use crate::{Alignment, BenchmarkStats, BorderColor, MeasurementDomain, TableFormatter};
 use std::io::IsTerminal;
 
 pub(super) fn colorize_label(text: &str) -> String {
@@ -30,11 +32,16 @@ pub(super) fn colorize_section_heading(text: &str) -> String {
     format!("\x1b[1;96m{text}\x1b[0m")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn benchmark_stats_from_samples(
     summed_results: &Results,
     all_results: &[Results],
     sample_count: usize,
     throughput: &Throughput,
+    measurement_domain: MeasurementDomain,
+    measurement_label: &str,
+    emits_cpu_diagnostics: bool,
+    per_sample_metrics: &[Vec<MetricValue>],
 ) -> BenchmarkStats {
     let mut results = summed_results.clone();
     results.divide(sample_count as u64);
@@ -126,7 +133,125 @@ pub(super) fn benchmark_stats_from_samples(
         has_stalled_cycles_backend: results.has_stalled_cycles_backend,
         pmu_time_enabled_ns: results.pmu_time_enabled_ns,
         pmu_time_running_ns: results.pmu_time_running_ns,
+        measurement_domain,
+        measurement_label: measurement_label.to_string(),
+        emits_cpu_diagnostics,
+        metrics: aggregate_metrics(per_sample_metrics),
     }
+}
+
+/// Aggregate per-sample `Vec<MetricValue>` into one [`MetricSummary`] per
+/// `(name, unit)` pair, computing mean / median / p95 / min / max.
+///
+/// Grouping by `(name, unit)` means a metric reported in two different
+/// units (e.g. `"time_ms"` and `"time_us"`) is treated as two distinct
+/// summaries, which matches how a reader would scan a metrics table.
+///
+/// Samples that did not report a particular metric are simply excluded
+/// from that metric's value list — `samples` in the summary reflects how
+/// many samples actually contributed. This handles intermittent metrics
+/// (e.g. CUDA event timing that occasionally fails to record).
+///
+/// Within a single sample, if the same `(name, unit)` appears multiple
+/// times only the last value is kept — the typical case is one value per
+/// metric per sample.
+pub(super) fn aggregate_metrics(per_sample: &[Vec<MetricValue>]) -> Vec<MetricSummary> {
+    use std::collections::HashMap;
+
+    /// Last-writer-wins accumulator: maps `(name, unit)` to the values seen
+    /// across samples, plus first-insertion order index for stable output.
+    /// `display_name` and `format` are captured from the first-seen
+    /// `MetricValue` and preserved through aggregation.
+    struct Acc {
+        values: Vec<f64>,
+        order: usize,
+        display_name: &'static str,
+        format: MetricFormat,
+    }
+
+    let mut by_key: HashMap<(&'static str, &'static str), Acc> = HashMap::new();
+    let mut next_order = 0usize;
+
+    for metrics in per_sample {
+        // Dedupe within a sample (last-writer-wins) while preserving
+        // push order. A BTreeMap would silently reorder metrics
+        // lexicographically, which breaks the first-seen ordering
+        // contract — a bench pushing `tflops` before `cuda_event_ms`
+        // would see them reordered alphabetically in the output table.
+        type SampleEntry = ((&'static str, &'static str), (f64, &'static str, MetricFormat));
+        let mut seen_in_sample: Vec<SampleEntry> = Vec::new();
+        let mut seen_keys: std::collections::HashSet<(&'static str, &'static str)> =
+            std::collections::HashSet::new();
+        for m in metrics {
+            // NaN / inf are silently dropped — they would propagate through
+            // percentile computation and produce nonsensical summaries. This
+            // matches the existing `safe_ratio_f64` fallback convention.
+            if !m.value.is_finite() {
+                continue;
+            }
+            let key = (m.name, m.unit);
+            if seen_keys.insert(key) {
+                seen_in_sample.push((key, (m.value, m.display_name, m.format)));
+            } else {
+                // Last-writer-wins: update the value for this key.
+                if let Some((_, existing)) = seen_in_sample.iter_mut().find(|(k, _)| *k == key) {
+                    *existing = (m.value, m.display_name, m.format);
+                }
+            }
+        }
+        for (key, (value, display_name, format)) in seen_in_sample {
+            let acc = by_key.entry(key).or_insert_with(|| {
+                let order = next_order;
+                next_order += 1;
+                Acc {
+                    values: Vec::new(),
+                    order,
+                    display_name,
+                    format,
+                }
+            });
+            acc.values.push(value);
+        }
+    }
+
+    let mut summaries: Vec<(usize, MetricSummary)> = by_key
+        .into_iter()
+        .map(|((name, unit), acc)| {
+            let mut sorted = acc.values.clone();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let n = sorted.len();
+            let mean = if n == 0 {
+                0.0
+            } else {
+                sorted.iter().sum::<f64>() / n as f64
+            };
+            let median = median(&sorted);
+            let p95 = percentile(&sorted, 0.95);
+            let min = sorted.first().copied().unwrap_or(0.0);
+            let max = sorted.last().copied().unwrap_or(0.0);
+            (
+                acc.order,
+                MetricSummary {
+                    name: name.to_string(),
+                    unit: unit.to_string(),
+                    display_name: acc.display_name.to_string(),
+                    format: acc.format,
+                    mean,
+                    median,
+                    p95,
+                    min,
+                    max,
+                    samples: n,
+                },
+            )
+        })
+        .collect();
+
+    // Stable order by first insertion across all samples so the output
+    // table is deterministic and matches the order the benchmark author
+    // declared the metrics.
+    summaries.sort_by_key(|(order, _)| *order);
+    summaries.into_iter().map(|(_, s)| s).collect()
 }
 
 pub(super) fn render_stats_table(
@@ -145,6 +270,76 @@ pub(super) fn render_combined_stats_table(
     render_stats_table_impl(stats, measurement_label, border_color, false)
 }
 
+/// Render the `custom metrics:` table beneath the standard stats table.
+/// No-op when `stats.metrics` is empty, so callers (both `bench` and
+/// `bench_sample` paths) can invoke this unconditionally.
+pub(super) fn render_custom_metrics(stats: &BenchmarkStats) {
+    if stats.metrics.is_empty() {
+        return;
+    }
+
+    println!("  custom metrics:");
+    let mut table = TableFormatter::new(
+        vec!["Metric", "Mean", "Median", "P95", "Min", "Max", "Unit", "N"],
+        vec![22, 12, 12, 12, 12, 12, 10, 5],
+    )
+    .with_alignments(vec![
+        Alignment::Left,
+        Alignment::Right,
+        Alignment::Right,
+        Alignment::Right,
+        Alignment::Right,
+        Alignment::Right,
+        Alignment::Left,
+        Alignment::Right,
+    ]);
+
+    for m in &stats.metrics {
+        let label = if m.display_name.is_empty() {
+            &m.name
+        } else {
+            &m.display_name
+        };
+        table.add_row(vec![
+            &colorize_label(label),
+            &colorize_value(&format_metric_value(m.mean, m.format)),
+            &colorize_value(&format_metric_value(m.median, m.format)),
+            &colorize_value(&format_metric_value(m.p95, m.format)),
+            &colorize_value(&format_metric_value(m.min, m.format)),
+            &colorize_value(&format_metric_value(m.max, m.format)),
+            &m.unit,
+            &m.samples.to_string(),
+        ]);
+    }
+
+    table.print();
+}
+
+fn format_metric_value(value: f64, format: MetricFormat) -> String {
+    if !value.is_finite() {
+        return "n/a".to_string();
+    }
+    match format {
+        MetricFormat::Integer => {
+            // Round to nearest integer, no decimal places, no scientific
+            // notation. Use i64 formatting so IDs and counts render as
+            // `0`, `3`, `42` — never `1.500e0` or `0.006`.
+            format!("{}", value.round() as i64)
+        }
+        MetricFormat::Number => {
+            if value == 0.0 {
+                return "0".to_string();
+            }
+            let abs = value.abs();
+            if !(0.001..1000.0).contains(&abs) {
+                format!("{value:.3e}")
+            } else {
+                format!("{value:.3}")
+            }
+        }
+    }
+}
+
 fn render_stats_table_impl(
     stats: &BenchmarkStats,
     measurement_label: &str,
@@ -152,7 +347,7 @@ fn render_stats_table_impl(
     include_latency_rows: bool,
 ) -> Option<String> {
     let mut table =
-        TableFormatter::new(vec!["Stat", "Value", "Stat", "Value"], vec![22, 18, 22, 18])
+        TableFormatter::new(vec!["Stat", "Value", "Stat", "Value"], vec![22, 28, 22, 28])
             .with_alignments(vec![
                 Alignment::Left,
                 Alignment::Right,
@@ -361,8 +556,18 @@ fn pmu_byline(stats: &BenchmarkStats) -> Option<String> {
         return None;
     }
 
+    // On a GPU benchmark the CPU PMU counters describe the host thread
+    // driving CUDA, not the measured kernel. Keep the data visible for
+    // launch/sync overhead analysis, but relabel it so it is not read as
+    // a description of GPU behaviour.
+    let label = match stats.measurement_domain {
+        MeasurementDomain::Cpu => "PMU",
+        MeasurementDomain::Gpu => "host PMU (orchestration)",
+        MeasurementDomain::Mixed => "host PMU (mixed workload)",
+    };
+
     Some(format!(
-        "  PMU: coverage={} avg_running={:.3}s avg_enabled={:.3}s total_running={:.3}s total_enabled={:.3}s",
+        "  {label}: coverage={} avg_running={:.3}s avg_enabled={:.3}s total_running={:.3}s total_enabled={:.3}s",
         colorize_value(&format!(
             "{:.1}%",
             safe_ratio_f64(
@@ -472,4 +677,114 @@ pub(super) fn tukey_outlier_count(sorted_values: &[f64]) -> usize {
         .iter()
         .filter(|value| **value < lower || **value > upper)
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bench::backend::MetricValue;
+
+    #[test]
+    fn aggregate_metrics_handles_empty_input() {
+        assert!(aggregate_metrics(&[]).is_empty());
+        assert!(aggregate_metrics(&[Vec::new(), Vec::new()]).is_empty());
+    }
+
+    #[test]
+    fn aggregate_metrics_groups_by_name_and_unit() {
+        let per_sample = vec![
+            vec![
+                MetricValue::new("cuda_event_ms", 1.0, "ms"),
+                MetricValue::new("tflops", 10.0, "TFLOP/s"),
+            ],
+            vec![
+                MetricValue::new("cuda_event_ms", 3.0, "ms"),
+                MetricValue::new("tflops", 20.0, "TFLOP/s"),
+            ],
+        ];
+        let summary = aggregate_metrics(&per_sample);
+        assert_eq!(summary.len(), 2);
+        // Stable, first-insertion order: cuda_event_ms appears first.
+        assert_eq!(summary[0].name, "cuda_event_ms");
+        assert_eq!(summary[0].unit, "ms");
+        assert_eq!(summary[0].samples, 2);
+        assert_eq!(summary[0].mean, 2.0);
+        assert_eq!(summary[0].min, 1.0);
+        assert_eq!(summary[0].max, 3.0);
+        assert_eq!(summary[1].name, "tflops");
+        assert_eq!(summary[1].unit, "TFLOP/s");
+        assert_eq!(summary[1].mean, 15.0);
+    }
+
+    #[test]
+    fn aggregate_metrics_treats_distinct_units_as_distinct() {
+        let per_sample = vec![vec![
+            MetricValue::new("time", 1.0, "ms"),
+            MetricValue::new("time", 1000.0, "us"),
+        ]];
+        let summary = aggregate_metrics(&per_sample);
+        assert_eq!(summary.len(), 2);
+        assert!(summary.iter().any(|m| m.unit == "ms" && m.mean == 1.0));
+        assert!(summary.iter().any(|m| m.unit == "us" && m.mean == 1000.0));
+    }
+
+    #[test]
+    fn aggregate_metrics_handles_intermittent_reports() {
+        // Sample 0 reports the metric; sample 1 does not; sample 2 reports
+        // a different value. The summary should reflect 2 contributing
+        // samples, not 3.
+        let per_sample = vec![
+            vec![MetricValue::new("cuda_event_ms", 1.0, "ms")],
+            Vec::new(),
+            vec![MetricValue::new("cuda_event_ms", 3.0, "ms")],
+        ];
+        let summary = aggregate_metrics(&per_sample);
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].samples, 2);
+        assert_eq!(summary[0].mean, 2.0);
+    }
+
+    #[test]
+    fn aggregate_metrics_drops_non_finite_values() {
+        let per_sample = vec![vec![
+            MetricValue::new("x", 1.0, "u"),
+            MetricValue::new("x", f64::NAN, "u"),
+            MetricValue::new("x", f64::INFINITY, "u"),
+        ]];
+        // Only the finite value is kept; samples == 1.
+        let summary = aggregate_metrics(&per_sample);
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].samples, 1);
+        assert_eq!(summary[0].mean, 1.0);
+    }
+
+    #[test]
+    fn aggregate_metrics_last_writer_wins_within_sample() {
+        let per_sample = vec![vec![
+            MetricValue::new("x", 1.0, "u"),
+            MetricValue::new("x", 5.0, "u"),
+        ]];
+        let summary = aggregate_metrics(&per_sample);
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].samples, 1);
+        assert_eq!(summary[0].mean, 5.0);
+    }
+
+    #[test]
+    fn aggregate_metrics_preserves_push_order_not_lexicographic() {
+        // Push metrics in an order where push order differs from
+        // lexicographic order. If aggregation used a BTreeMap (as it
+        // once did), the output would be reordered to `alpha, zeta`.
+        // The fix uses a Vec + HashSet for dedup, so push order wins:
+        // `zeta` first, then `alpha`.
+        let per_sample = vec![vec![
+            MetricValue::new("zeta", 1.0, "u"),
+            MetricValue::new("alpha", 2.0, "u"),
+        ]];
+        let summary = aggregate_metrics(&per_sample);
+        assert_eq!(summary.len(), 2);
+        // Push order: zeta was pushed first, so it appears first.
+        assert_eq!(summary[0].name, "zeta", "expected push-order, not lexicographic");
+        assert_eq!(summary[1].name, "alpha");
+    }
 }

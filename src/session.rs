@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Alignment, TableFormatter, Throughput};
+use crate::{Alignment, MeasurementDomain, MetricFormat, TableFormatter, Throughput};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,6 +22,11 @@ use std::{
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// Serde default helper for [`BenchmarkStats::emits_cpu_diagnostics`].
+fn default_true() -> bool {
+    true
+}
 
 /// Collected benchmark result for session summary and JSON export
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,6 +97,40 @@ pub struct BenchmarkStats {
     pub pmu_time_enabled_ns: u64,
     #[serde(default)]
     pub pmu_time_running_ns: u64,
+    /// What this benchmark measures. Consulted by the diagnostics path to
+    /// suppress or relabel CPU-PMU bottleneck messages when the measured
+    /// operation is not CPU work (`Gpu` / `Mixed`). Defaults to `Cpu`, so
+    /// historical serialized reports deserialize unchanged.
+    #[serde(default)]
+    pub measurement_domain: MeasurementDomain,
+    /// Label shown in the "Measurement" row of the stats table. Populated
+    /// from [`crate::MeasurementBackend::measurement_label`] when a custom
+    /// backend is in use (e.g. `"timing + CUDA events"`). When empty, the
+    /// renderer falls back to the historic PMU-derived label
+    /// (`"timing + PMU"` or `"timing only"`).
+    #[serde(default)]
+    pub measurement_label: String,
+    /// When false, the backend has declared it does not emit CPU-PMU
+    /// diagnostics (e.g. a GPU CUDA event backend). The runner suppresses
+    /// CPU-PMU bottleneck diagnostics regardless of
+    /// [`measurement_domain`](Self::measurement_domain).
+    ///
+    /// This is the trait-level hook from
+    /// [`crate::MeasurementBackend::emits_cpu_diagnostics`], captured at
+    /// sample-collection time so the diagnostics path (which only sees
+    /// `BenchmarkStats`) can consult it without holding a backend
+    /// reference. Defaults to `true` (serde), preserving historic
+    /// behaviour for old reports.
+    #[serde(default = "default_true")]
+    pub emits_cpu_diagnostics: bool,
+    /// Aggregated custom per-sample metrics (mean, median, p95, min, max),
+    /// one entry per `(name, unit)` pair reported by a
+    /// [`crate::BenchSampleResult`]-returning benchmark. Empty for
+    /// benchmarks that use the plain `bench(...)` API; populated only by
+    /// `bench_sample(...)`. Persisted to JSON, rendered as a
+    /// `custom metrics:` table beneath the standard stats table.
+    #[serde(default)]
+    pub metrics: Vec<MetricSummary>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,6 +139,37 @@ pub struct WorkerCounterSummary {
     pub total: u64,
     pub per_op: f64,
     pub per_sec: f64,
+}
+
+/// Aggregated view of a custom per-sample metric, computed by
+/// [`crate::bench::stats::aggregate_metrics`] from `Vec<MetricValue>` per
+/// sample. One summary per `(name, unit)` pair across all samples of a
+/// benchmark.
+///
+/// This is the Phase 2 extension point for
+/// `docs/gpu-benchmarking-sharp-edges.md` ("No Per-Sample Custom Metrics"):
+/// benchmarks that report `cuda_event_ms`, `tflops`, `host_overhead_ms`,
+/// selected algorithm ID, etc. via [`crate::BenchSampleResult`] get them
+/// aggregated here and persisted in [`BenchmarkStats::metrics`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetricSummary {
+    pub name: String,
+    pub unit: String,
+    /// Human-readable label for table rendering, or empty to use `name`.
+    #[serde(default)]
+    pub display_name: String,
+    /// How to format `mean`/`median`/`p95`/`min`/`max` in the table.
+    #[serde(default)]
+    pub format: MetricFormat,
+    pub mean: f64,
+    pub median: f64,
+    pub p95: f64,
+    pub min: f64,
+    pub max: f64,
+    /// Number of samples that contributed to this summary. May be less than
+    /// `BenchmarkStats.samples` if the metric was reported intermittently
+    /// (e.g. only for samples where a CUDA event was successfully recorded).
+    pub samples: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -313,6 +383,43 @@ impl BenchmarkReport {
 
             table.print();
             println!();
+
+            // Key custom metrics table: shows median of each custom metric
+            // for benchmarks that use bench_sample(). Compact format so it
+            // fits alongside the main throughput/latency table.
+            let has_metrics = group_results
+                .iter()
+                .any(|r| !r.stats.metrics.is_empty());
+            if has_metrics {
+                let mut metric_table = TableFormatter::new(
+                    vec!["Benchmark", "Metric", "Median", "Unit"],
+                    vec![25, 22, 14, 10],
+                )
+                .with_alignments(vec![
+                    Alignment::Left,
+                    Alignment::Left,
+                    Alignment::Right,
+                    Alignment::Left,
+                ]);
+                for result in &group_results {
+                    for m in &result.stats.metrics {
+                        let label = if m.display_name.is_empty() {
+                            &m.name
+                        } else {
+                            &m.display_name
+                        };
+                        metric_table.add_row(vec![
+                            &colorize_label(&result.name),
+                            &colorize_value(label),
+                            &colorize_value(&format_summary_metric(m)),
+                            &m.unit,
+                        ]);
+                    }
+                }
+                println!("   Key custom metrics:");
+                metric_table.print();
+                println!();
+            }
 
             if let Some(ref prev) = previous_session {
                 let comparable_results: Vec<_> = group_results
@@ -551,6 +658,26 @@ impl BenchmarkReport {
     }
 }
 
+fn format_summary_metric(m: &MetricSummary) -> String {
+    if !m.median.is_finite() {
+        return "n/a".to_string();
+    }
+    match m.format {
+        MetricFormat::Integer => format!("{}", m.median.round() as i64),
+        MetricFormat::Number => {
+            if m.median == 0.0 {
+                return "0".to_string();
+            }
+            let abs = m.median.abs();
+            if !(0.001..1000.0).contains(&abs) {
+                format!("{:.3e}", m.median)
+            } else {
+                format!("{:.3}", m.median)
+            }
+        }
+    }
+}
+
 fn safe_percent_change(current: f64, previous: f64) -> Option<f64> {
     if !current.is_finite() || !previous.is_finite() || previous.abs() <= f64::EPSILON {
         return None;
@@ -769,11 +896,28 @@ fn comparative_diagnosis(current: &BenchmarkResult, previous: &BenchmarkResult) 
     );
     let cv_change = safe_percent_change(current.stats.cv_percent, previous.stats.cv_percent);
 
+    // Same domain rules as `diagnose_stats`: skip CPU-PMU comparative
+    // notes for `Gpu`, prefix them with `[host]` for `Mixed`, keep
+    // stability notes for every domain. CPU PMU data on a host thread
+    // driving CUDA is launch/sync orchestration context, not a description
+    // of GPU kernel behaviour.
+    //
+    // Also suppress when the backend declared it does not emit CPU-PMU
+    // diagnostics (e.g. a CUDA event backend), regardless of domain.
+    let host_prefix = match current.stats.measurement_domain {
+        MeasurementDomain::Cpu => "",
+        MeasurementDomain::Gpu => "",
+        MeasurementDomain::Mixed => "[host] ",
+    };
+    let suppress_cpu_pmu = !current.stats.emits_cpu_diagnostics
+        || matches!(current.stats.measurement_domain, MeasurementDomain::Gpu);
+
     let mut notes = Vec::new();
     let is_regression = matches!(throughput_change, Some(change) if change <= -2.0);
     let is_improvement = matches!(throughput_change, Some(change) if change >= 2.0);
 
-    if (is_regression || is_improvement)
+    if !suppress_cpu_pmu
+        && (is_regression || is_improvement)
         && matches!(instructions_change, Some(change) if change.abs() <= 5.0)
         && matches!(ipc_change, Some(change) if change.abs() >= 5.0)
     {
@@ -784,11 +928,12 @@ fn comparative_diagnosis(current: &BenchmarkResult, previous: &BenchmarkResult) 
         };
         let ipc = ipc_change.unwrap_or(0.0);
         notes.push(format!(
-            "{direction}: instructions/op stayed roughly flat while IPC moved {ipc:+.1}%"
+            "{host_prefix}{direction}: instructions/op stayed roughly flat while IPC moved {ipc:+.1}%"
         ));
     }
 
-    if (is_regression || is_improvement)
+    if !suppress_cpu_pmu
+        && (is_regression || is_improvement)
         && matches!(backend_change, Some(change) if change.abs() >= 10.0)
         && (matches!(cache_percent_change, Some(change) if change.abs() >= 10.0)
             || matches!(cache_per_op_change, Some(change) if change.abs() >= 10.0))
@@ -801,11 +946,12 @@ fn comparative_diagnosis(current: &BenchmarkResult, previous: &BenchmarkResult) 
         let backend = backend_change.unwrap_or(0.0);
         let cache = cache_percent_change.or(cache_per_op_change).unwrap_or(0.0);
         notes.push(format!(
-            "{direction}: backend stalls moved {backend:+.1}% and cache pressure moved {cache:+.1}%"
+            "{host_prefix}{direction}: backend stalls moved {backend:+.1}% and cache pressure moved {cache:+.1}%"
         ));
     }
 
-    if (is_regression || is_improvement)
+    if !suppress_cpu_pmu
+        && (is_regression || is_improvement)
         && matches!(frontend_change, Some(change) if change.abs() >= 10.0)
         && matches!(branch_change, Some(change) if change.abs() >= 10.0)
     {
@@ -816,10 +962,11 @@ fn comparative_diagnosis(current: &BenchmarkResult, previous: &BenchmarkResult) 
         };
         let frontend = frontend_change.unwrap_or(0.0);
         let branch = branch_change.unwrap_or(0.0);
-        notes.push(format!("{direction}: frontend stalls moved {frontend:+.1}% and branch miss rate moved {branch:+.1}%"));
+        notes.push(format!("{host_prefix}{direction}: frontend stalls moved {frontend:+.1}% and branch miss rate moved {branch:+.1}%"));
     }
 
-    if (is_regression || is_improvement)
+    if !suppress_cpu_pmu
+        && (is_regression || is_improvement)
         && matches!(frontend_change, Some(change) if change.abs() >= 10.0)
         && matches!(l1i_change, Some(change) if change.abs() >= 10.0)
     {
@@ -831,11 +978,12 @@ fn comparative_diagnosis(current: &BenchmarkResult, previous: &BenchmarkResult) 
         let frontend = frontend_change.unwrap_or(0.0);
         let l1i = l1i_change.unwrap_or(0.0);
         notes.push(format!(
-            "{direction}: frontend stalls moved {frontend:+.1}% and L1I misses/op moved {l1i:+.1}%"
+            "{host_prefix}{direction}: frontend stalls moved {frontend:+.1}% and L1I misses/op moved {l1i:+.1}%"
         ));
     }
 
-    if (is_regression || is_improvement)
+    if !suppress_cpu_pmu
+        && (is_regression || is_improvement)
         && matches!(instructions_change, Some(change) if change.abs() >= 5.0)
         && matches!(ipc_change, Some(change) if change.abs() <= 5.0)
     {
@@ -846,7 +994,7 @@ fn comparative_diagnosis(current: &BenchmarkResult, previous: &BenchmarkResult) 
         };
         let inst = instructions_change.unwrap_or(0.0);
         notes.push(format!(
-            "{direction}: instructions/op moved {inst:+.1}% while IPC stayed roughly flat"
+            "{host_prefix}{direction}: instructions/op moved {inst:+.1}% while IPC stayed roughly flat"
         ));
     }
 
@@ -1089,6 +1237,10 @@ mod tests {
                 has_stalled_cycles_backend: false,
                 pmu_time_enabled_ns: 0,
                 pmu_time_running_ns: 0,
+                measurement_domain: MeasurementDomain::Cpu,
+                measurement_label: String::new(),
+                emits_cpu_diagnostics: true,
+                metrics: Vec::new(),
             },
             worker_summaries: Vec::new(),
         }

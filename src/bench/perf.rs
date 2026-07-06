@@ -2,10 +2,11 @@ use super::{
     ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorkerMeasurement,
     ConcurrentWorkerResult, Results, safe_ratio_f64,
 };
+use crate::bench::backend::{MeasurementBackend, MetricValue};
 use std::{
     io,
     sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
@@ -772,5 +773,427 @@ impl PerfCounters {
             stalled_frontend,
             stalled_backend,
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MeasurementBackend implementation
+// ---------------------------------------------------------------------------
+
+/// Active perf measurement strategy for the current sample window.
+///
+/// Selected in [`LinuxPerfBackend::begin`] by trying the perf group first
+/// and falling back to individual counters, mirroring the historic
+/// `execute_standard` → `run_with_perf_group` → `run_with_individual_counters`
+/// chain.
+#[cfg(target_os = "linux")]
+enum PerfMode {
+    /// Not yet initialised for the current sample; no measurement is
+    /// active. Also the state after [`LinuxPerfBackend::collect`] resets
+    /// for the next sample.
+    Idle,
+    /// Perf event group is open and was enabled in `begin`.
+    Group(PerfGroupCounters),
+    /// Individual (ungrouped) counters are open and were enabled in
+    /// `begin`. This is the fallback when the perf group cannot be
+    /// created or enabled.
+    Individual(IndividualCounters),
+    /// No perf counters could be opened at all — timing-only mode for
+    /// this sample. `collect` will leave all `has_*` flags false.
+    None,
+}
+
+/// Standalone (ungrouped) perf counters, used when the grouped path is
+/// unavailable. Extracted from the historic `run_with_individual_counters`
+/// function so the counter handles can live across `begin` / `end` /
+/// `collect`.
+#[cfg(target_os = "linux")]
+struct IndividualCounters {
+    cycles: Option<perf_event::Counter>,
+    instructions: Option<perf_event::Counter>,
+    cache_references: Option<perf_event::Counter>,
+    l1i_misses: Option<perf_event::Counter>,
+    branches: Option<perf_event::Counter>,
+    branch_misses: Option<perf_event::Counter>,
+    cache_misses: Option<perf_event::Counter>,
+    stalled_cycles_frontend: Option<perf_event::Counter>,
+    stalled_cycles_backend: Option<perf_event::Counter>,
+}
+
+/// Performance counter measurement backend for Linux.
+///
+/// Implements [`MeasurementBackend`] by wrapping the existing perf-event
+/// group + individual-counter fallback chain. Each call to
+/// [`begin`](MeasurementBackend::begin) opens a fresh perf group (or
+/// individual counters as fallback), [`end`](MeasurementBackend::end)
+/// disables them, and [`collect`](MeasurementBackend::collect) reads and
+/// scales the counters into [`Results`].
+///
+/// This backend is the default on Linux; on other platforms
+/// [`WallClockBackend`] is the default.
+///
+/// ## Behavioural note
+///
+/// The historic `execute_standard` path re-ran the bench closure with
+/// individual counters if the perf group produced all-zero data after a
+/// successful run. This backend does NOT re-run the closure — if the
+/// perf group produces zero data, the sample is reported with empty PMU
+/// fields (effectively timing-only). This avoids the surprising
+/// double-execution of the bench closure and is the correct behaviour for
+/// a measurement backend that owns the sample window.
+#[cfg(target_os = "linux")]
+pub struct LinuxPerfBackend {
+    mode: PerfMode,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for LinuxPerfBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPerfBackend {
+    pub fn new() -> Self {
+        Self {
+            mode: PerfMode::Idle,
+        }
+    }
+
+    /// Try to build the grouped perf counters. Returns `None` and records
+    /// perf issues on failure — same as the historic `build_perf_counter_group`.
+    fn try_begin_group(&mut self) -> bool {
+        let Some(mut perf) = build_perf_counter_group() else {
+            return false;
+        };
+        if let Err(error) = perf.group.enable() {
+            record_perf_issue(format!("perf group enable failed: {error}"));
+            return false;
+        }
+        self.mode = PerfMode::Group(perf);
+        true
+    }
+
+    /// Build and enable individual counters as a fallback when the group
+    /// path is unavailable.
+    fn begin_individual(&mut self) {
+        let mut ind = IndividualCounters {
+            cycles: try_build_individual_counter(Hardware::CPU_CYCLES, "cycles"),
+            instructions: try_build_individual_counter(Hardware::INSTRUCTIONS, "instructions"),
+            cache_references: try_build_individual_counter(
+                Hardware::CACHE_REFERENCES,
+                "cache-references",
+            ),
+            l1i_misses: try_build_l1i_counter(),
+            branches: try_build_individual_counter(Hardware::BRANCH_INSTRUCTIONS, "branches"),
+            branch_misses: try_build_individual_counter(Hardware::BRANCH_MISSES, "branch-misses"),
+            cache_misses: try_build_individual_counter(Hardware::CACHE_MISSES, "cache-misses"),
+            stalled_cycles_frontend: try_build_individual_counter(
+                Hardware::STALLED_CYCLES_FRONTEND,
+                "stalled-cycles-frontend",
+            ),
+            stalled_cycles_backend: try_build_individual_counter(
+                Hardware::STALLED_CYCLES_BACKEND,
+                "stalled-cycles-backend",
+            ),
+        };
+
+        let all_none = ind.cycles.is_none()
+            && ind.instructions.is_none()
+            && ind.cache_references.is_none()
+            && ind.l1i_misses.is_none()
+            && ind.branches.is_none()
+            && ind.branch_misses.is_none()
+            && ind.cache_misses.is_none()
+            && ind.stalled_cycles_frontend.is_none()
+            && ind.stalled_cycles_backend.is_none();
+
+        if all_none {
+            // No counters at all — fall through to timing-only mode.
+            // `run_with_individual_counters` records this issue; we do
+            // the same for parity.
+            self.mode = PerfMode::None;
+            return;
+        }
+
+        record_perf_issue("using ungrouped perf counters fallback".to_string());
+
+        enable_counter(&mut ind.cycles, "cycles");
+        enable_counter(&mut ind.instructions, "instructions");
+        enable_counter(&mut ind.cache_references, "cache-references");
+        enable_counter(&mut ind.l1i_misses, "l1i-misses");
+        enable_counter(&mut ind.branches, "branches");
+        enable_counter(&mut ind.branch_misses, "branch-misses");
+        enable_counter(&mut ind.cache_misses, "cache-misses");
+        enable_counter(&mut ind.stalled_cycles_frontend, "stalled-cycles-frontend");
+        enable_counter(&mut ind.stalled_cycles_backend, "stalled-cycles-backend");
+
+        self.mode = PerfMode::Individual(ind);
+    }
+
+    fn disable_group(perf: &mut PerfGroupCounters) {
+        if let Err(error) = perf.group.disable() {
+            record_perf_issue(format!("perf group disable failed: {error}"));
+        }
+    }
+
+    fn disable_individual(ind: &mut IndividualCounters) {
+        disable_counter(&mut ind.cycles, "cycles");
+        disable_counter(&mut ind.instructions, "instructions");
+        disable_counter(&mut ind.cache_references, "cache-references");
+        disable_counter(&mut ind.l1i_misses, "l1i-misses");
+        disable_counter(&mut ind.branches, "branches");
+        disable_counter(&mut ind.branch_misses, "branch-misses");
+        disable_counter(&mut ind.cache_misses, "cache-misses");
+        disable_counter(&mut ind.stalled_cycles_frontend, "stalled-cycles-frontend");
+        disable_counter(&mut ind.stalled_cycles_backend, "stalled-cycles-backend");
+    }
+
+    fn collect_group(
+        perf: &mut PerfGroupCounters,
+        host_elapsed: Duration,
+        ops: u64,
+        results: &mut Results,
+    ) {
+        let counts = match perf.group.read() {
+            Ok(counts) => counts,
+            Err(error) => {
+                record_perf_issue(format!("perf group read failed: {error}"));
+                results.duration = host_elapsed;
+                results.iterations = ops;
+                results.chunks_executed = 1;
+                return;
+            }
+        };
+
+        let enabled_ns = counts
+            .time_enabled()
+            .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        let running_ns = counts
+            .time_running()
+            .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+
+        let cycles_raw = perf
+            .cycles
+            .as_ref()
+            .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+            .unwrap_or(0);
+        let instructions_raw = perf
+            .instructions
+            .as_ref()
+            .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+            .unwrap_or(0);
+        let cache_references_raw = perf
+            .cache_references
+            .as_ref()
+            .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+            .unwrap_or(0);
+        let l1i_misses_raw = perf
+            .l1i_misses
+            .as_ref()
+            .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+            .unwrap_or(0);
+        let branches_raw = perf
+            .branches
+            .as_ref()
+            .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+            .unwrap_or(0);
+        let branch_misses_raw = perf
+            .branch_misses
+            .as_ref()
+            .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+            .unwrap_or(0);
+        let cache_misses_raw = perf
+            .cache_misses
+            .as_ref()
+            .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+            .unwrap_or(0);
+        let stalled_cycles_frontend_raw = perf
+            .stalled_cycles_frontend
+            .as_ref()
+            .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+            .unwrap_or(0);
+        let stalled_cycles_backend_raw = perf
+            .stalled_cycles_backend
+            .as_ref()
+            .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
+            .unwrap_or(0);
+
+        if (enabled_ns == 0 || running_ns == 0)
+            && cycles_raw == 0
+            && instructions_raw == 0
+            && cache_references_raw == 0
+            && l1i_misses_raw == 0
+            && branches_raw == 0
+            && branch_misses_raw == 0
+            && cache_misses_raw == 0
+            && stalled_cycles_frontend_raw == 0
+            && stalled_cycles_backend_raw == 0
+        {
+            record_perf_issue(
+                "perf counters reported unusable timing window (enabled/running)".to_string(),
+            );
+        }
+
+        if enabled_ns == 0 || running_ns == 0 {
+            record_perf_issue(
+                "perf counters reported unusable timing window (enabled/running)".to_string(),
+            );
+        }
+
+        results.cycles = scale_multiplexed_count(cycles_raw, enabled_ns, running_ns);
+        results.instructions =
+            scale_multiplexed_count(instructions_raw, enabled_ns, running_ns);
+        results.cache_references =
+            scale_multiplexed_count(cache_references_raw, enabled_ns, running_ns);
+        results.l1i_misses = scale_multiplexed_count(l1i_misses_raw, enabled_ns, running_ns);
+        results.branches = scale_multiplexed_count(branches_raw, enabled_ns, running_ns);
+        results.branch_misses =
+            scale_multiplexed_count(branch_misses_raw, enabled_ns, running_ns);
+        results.cache_misses = scale_multiplexed_count(cache_misses_raw, enabled_ns, running_ns);
+        results.stalled_cycles_frontend =
+            scale_multiplexed_count(stalled_cycles_frontend_raw, enabled_ns, running_ns);
+        results.stalled_cycles_backend =
+            scale_multiplexed_count(stalled_cycles_backend_raw, enabled_ns, running_ns);
+        results.has_cycles = perf.cycles.is_some();
+        results.has_instructions = perf.instructions.is_some();
+        results.has_cache_references = perf.cache_references.is_some();
+        results.has_l1i_misses = perf.l1i_misses.is_some();
+        results.has_branches = perf.branches.is_some();
+        results.has_branch_misses = perf.branch_misses.is_some();
+        results.has_cache_misses = perf.cache_misses.is_some();
+        results.has_stalled_cycles_frontend = perf.stalled_cycles_frontend.is_some();
+        results.has_stalled_cycles_backend = perf.stalled_cycles_backend.is_some();
+        results.pmu_time_enabled_ns = enabled_ns;
+        results.pmu_time_running_ns = running_ns;
+        results.duration = host_elapsed;
+        results.iterations = ops;
+        results.chunks_executed = 1;
+    }
+
+    fn collect_individual(
+        ind: &mut IndividualCounters,
+        host_elapsed: Duration,
+        ops: u64,
+        results: &mut Results,
+    ) {
+        let (cycles, cycles_enabled, cycles_running) =
+            read_scaled_counter(&mut ind.cycles, "cycles");
+        let (instructions, instructions_enabled, instructions_running) =
+            read_scaled_counter(&mut ind.instructions, "instructions");
+        let (cache_references, cache_references_enabled, cache_references_running) =
+            read_scaled_counter(&mut ind.cache_references, "cache-references");
+        let (l1i_misses, l1i_misses_enabled, l1i_misses_running) =
+            read_scaled_counter(&mut ind.l1i_misses, "l1i-misses");
+        let (branches, branches_enabled, branches_running) =
+            read_scaled_counter(&mut ind.branches, "branches");
+        let (branch_misses, branch_misses_enabled, branch_misses_running) =
+            read_scaled_counter(&mut ind.branch_misses, "branch-misses");
+        let (cache_misses, cache_misses_enabled, cache_misses_running) =
+            read_scaled_counter(&mut ind.cache_misses, "cache-misses");
+        let (stalled_cycles_frontend, stalled_cycles_frontend_enabled, stalled_cycles_frontend_running) =
+            read_scaled_counter(&mut ind.stalled_cycles_frontend, "stalled-cycles-frontend");
+        let (stalled_cycles_backend, stalled_cycles_backend_enabled, stalled_cycles_backend_running) =
+            read_scaled_counter(&mut ind.stalled_cycles_backend, "stalled-cycles-backend");
+
+        let (pmu_time_enabled_ns, pmu_time_running_ns) = timing_window(&[
+            (cycles_enabled, cycles_running),
+            (instructions_enabled, instructions_running),
+            (cache_references_enabled, cache_references_running),
+            (l1i_misses_enabled, l1i_misses_running),
+            (branches_enabled, branches_running),
+            (branch_misses_enabled, branch_misses_running),
+            (cache_misses_enabled, cache_misses_running),
+            (
+                stalled_cycles_frontend_enabled,
+                stalled_cycles_frontend_running,
+            ),
+            (
+                stalled_cycles_backend_enabled,
+                stalled_cycles_backend_running,
+            ),
+        ]);
+
+        results.cycles = cycles;
+        results.instructions = instructions;
+        results.cache_references = cache_references;
+        results.l1i_misses = l1i_misses;
+        results.branches = branches;
+        results.branch_misses = branch_misses;
+        results.cache_misses = cache_misses;
+        results.stalled_cycles_frontend = stalled_cycles_frontend;
+        results.stalled_cycles_backend = stalled_cycles_backend;
+        results.has_cycles = ind.cycles.is_some();
+        results.has_instructions = ind.instructions.is_some();
+        results.has_cache_references = ind.cache_references.is_some();
+        results.has_l1i_misses = ind.l1i_misses.is_some();
+        results.has_branches = ind.branches.is_some();
+        results.has_branch_misses = ind.branch_misses.is_some();
+        results.has_cache_misses = ind.cache_misses.is_some();
+        results.has_stalled_cycles_frontend = ind.stalled_cycles_frontend.is_some();
+        results.has_stalled_cycles_backend = ind.stalled_cycles_backend.is_some();
+        results.pmu_time_enabled_ns = pmu_time_enabled_ns;
+        results.pmu_time_running_ns = pmu_time_running_ns;
+        results.duration = host_elapsed;
+        results.iterations = ops;
+        results.chunks_executed = 1;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl MeasurementBackend for LinuxPerfBackend {
+    fn begin(&mut self) {
+        // Reset state for the new sample window.
+        self.mode = PerfMode::Idle;
+
+        // Try the grouped path first; on failure fall back to individual
+        // counters, matching the historic execute_standard chain.
+        if !self.try_begin_group() {
+            self.begin_individual();
+        }
+    }
+
+    fn end(&mut self) {
+        match &mut self.mode {
+            PerfMode::Group(perf) => Self::disable_group(perf),
+            PerfMode::Individual(ind) => Self::disable_individual(ind),
+            PerfMode::None | PerfMode::Idle => {}
+        }
+    }
+
+    fn collect(
+        &mut self,
+        host_elapsed: Duration,
+        ops: u64,
+        _chunk_index: usize,
+        results: &mut Results,
+        _metrics: &mut Vec<MetricValue>,
+    ) {
+        match &mut self.mode {
+            PerfMode::Group(perf) => Self::collect_group(perf, host_elapsed, ops, results),
+            PerfMode::Individual(ind) => {
+                Self::collect_individual(ind, host_elapsed, ops, results)
+            }
+            PerfMode::None | PerfMode::Idle => {
+                // No PMU counters — write timing only.
+                results.duration = host_elapsed;
+                results.iterations = ops;
+                results.chunks_executed = 1;
+            }
+        }
+
+        // Reset for the next sample window.
+        self.mode = PerfMode::Idle;
+    }
+
+    fn measurement_label(&self) -> &'static str {
+        "timing + PMU"
+    }
+
+    fn emits_cpu_diagnostics(&self) -> bool {
+        true
     }
 }

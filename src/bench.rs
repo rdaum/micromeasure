@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod affinity;
+pub(crate) mod backend;
 mod perf;
 mod stats;
 
@@ -25,17 +26,18 @@ use crate::{
 use affinity::concurrent_worker_pin_cores;
 use affinity::{BenchAffinityGuard, warn_affinity_once};
 #[cfg(target_os = "linux")]
-use perf::{clear_perf_issues, execute_concurrent_worker, execute_standard};
+use perf::{clear_perf_issues, execute_concurrent_worker};
 use perf::{enforce_pmu_quality, measurement_label, warn_perf_status};
 use serde::{Deserialize, Serialize};
 use stats::{
     benchmark_stats_from_samples, colorize_section_heading, render_combined_stats_table,
-    render_stats_table,
+    render_custom_metrics, render_stats_table,
 };
 use std::time::Instant;
 use std::{
     hint::black_box,
     io::{self, IsTerminal, Write},
+    rc::Rc,
     sync::Barrier,
     thread,
     time::Duration,
@@ -43,6 +45,30 @@ use std::{
 
 #[cfg(target_os = "linux")]
 pub use perf::PerfCounters;
+#[cfg(target_os = "linux")]
+pub use perf::LinuxPerfBackend;
+pub use backend::{
+    MeasurementBackend, MeasurementDomain, MetricFormat, MetricValue, WallClockBackend,
+};
+
+/// Construct the platform-default [`MeasurementBackend`].
+///
+/// On Linux this returns a [`LinuxPerfBackend`] (preserving the historic
+/// perf-event group + individual-counter fallback chain). On other
+/// platforms it returns a [`WallClockBackend`].
+///
+/// Benchmarks that need a different backend (e.g. a CUDA event adapter)
+/// supply a factory via [`BenchmarkGroup::backend`].
+fn default_backend() -> Box<dyn MeasurementBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(LinuxPerfBackend::new())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Box::new(WallClockBackend::new())
+    }
+}
 
 const MIN_CHUNK_SIZE: usize = 100_000;
 const MAX_CHUNK_SIZE: usize = 50_000_000;
@@ -54,6 +80,7 @@ const MIN_SAMPLES: usize = 20;
 const MAX_SAMPLES: usize = 100;
 
 type BenchFunction<T> = fn(&mut T, usize, usize);
+type BenchSampleFunction<T> = fn(&mut T, usize, usize) -> crate::bench::backend::BenchSampleResult;
 type ConcurrentBenchFunction<T> = fn(&T, &ConcurrentBenchControl) -> ConcurrentWorkerResult;
 
 #[derive(Clone, Copy)]
@@ -540,26 +567,48 @@ fn render_result_section(
 
     if let Some(pmu_byline) = render(
         stats,
-        measurement_label(has_perf_counters(&measurement_results_from_stats(stats))),
+        &effective_measurement_label(
+            stats,
+            has_perf_counters(&measurement_results_from_stats(stats)),
+        ),
         border_color,
     ) {
         println!("{pmu_byline}");
     }
 
     render_diagnostics(stats);
+    render_custom_metrics(stats);
+}
+
+fn effective_measurement_label(stats: &crate::BenchmarkStats, has_perf: bool) -> String {
+    if !stats.measurement_label.is_empty() {
+        stats.measurement_label.clone()
+    } else {
+        measurement_label(has_perf).to_string()
+    }
 }
 
 fn render_standard_results(name: &str, stats: &crate::BenchmarkStats) {
     let results = measurement_results_from_stats(stats);
     let has_perf = has_perf_counters(&results);
-    warn_perf_status(has_perf, has_full_perf_counters(&results));
+
+    // For GPU-domain benchmarks, no CPU PMU is expected — the backend
+    // intentionally leaves has_* false. Suppress the "PMU unavailable"
+    // warning in that case; it is only relevant for CPU-domain benchmarks
+    // that expected PMU but didn't get it.
+    let suppress_perf_warning = stats.measurement_domain != MeasurementDomain::Cpu;
+    if !suppress_perf_warning {
+        warn_perf_status(has_perf, has_full_perf_counters(&results));
+    }
     enforce_pmu_quality(name, has_perf, &results);
 
+    let label = effective_measurement_label(stats, has_perf);
     println!("  results:");
-    if let Some(pmu_byline) = render_stats_table(stats, measurement_label(has_perf), None) {
+    if let Some(pmu_byline) = render_stats_table(stats, &label, None) {
         println!("{pmu_byline}");
     }
     render_diagnostics(stats);
+    render_custom_metrics(stats);
 }
 
 fn render_concurrent_results(
@@ -569,7 +618,10 @@ fn render_concurrent_results(
 ) {
     let results = measurement_results_from_stats(combined_stats);
     let has_perf = has_perf_counters(&results);
-    warn_perf_status(has_perf, has_full_perf_counters(&results));
+    let suppress_perf_warning = combined_stats.measurement_domain != MeasurementDomain::Cpu;
+    if !suppress_perf_warning {
+        warn_perf_status(has_perf, has_full_perf_counters(&results));
+    }
     enforce_pmu_quality(name, has_perf, &results);
 
     println!("  results:");
@@ -609,10 +661,43 @@ fn colorize_problem(text: &str) -> String {
     format!("\x1b[31m{text}\x1b[0m")
 }
 
+/// Emit CPU-PMU-derived bottleneck diagnostics for a benchmark.
+///
+/// Domain rules (see `docs/gpu-benchmarking-sharp-edges.md`):
+/// - `Cpu`: full historic diagnostics, unchanged.
+/// - `Gpu`: skip all CPU-PMU bottleneck diagnostics. The host thread's
+///   counters describe launch/sync orchestration, not the measured GPU
+///   kernel, so emitting them as the primary bottleneck would mislead.
+///   Run-stability warnings (CV, outliers) are kept because sample
+///   stability matters for any benchmark.
+/// - `Mixed`: emit each CPU-PMU diagnostic with a `[host]` prefix so the
+///   reader knows the signal is host-side context, not the primary
+///   bottleneck.
+///
+/// Additionally, when [`crate::MeasurementBackend::emits_cpu_diagnostics`]
+/// returned `false` (captured in
+/// [`crate::session::BenchmarkStats::emits_cpu_diagnostics`]), CPU-PMU
+/// diagnostics are suppressed regardless of domain. This lets a custom
+/// backend like a CUDA event adapter opt out of CPU-PMU bottleneck
+/// messages even for `Mixed` workloads where some host work is expected.
 fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
     let mut diagnostics = Vec::new();
 
-    if stats.has_cycles
+    let host_prefix = match stats.measurement_domain {
+        MeasurementDomain::Cpu => "",
+        MeasurementDomain::Gpu => "",
+        MeasurementDomain::Mixed => "[host] ",
+    };
+
+    // Suppress CPU-PMU diagnostics when the backend declared it does not
+    // emit them (e.g. a CUDA event backend) OR the measurement domain is
+    // Gpu. Mixed domain keeps diagnostics (with [host] prefix) unless the
+    // backend explicitly opts out via emits_cpu_diagnostics.
+    let suppress_cpu_pmu = !stats.emits_cpu_diagnostics
+        || matches!(stats.measurement_domain, MeasurementDomain::Gpu);
+
+    if !suppress_cpu_pmu
+        && stats.has_cycles
         && stats.has_stalled_cycles_backend
         && stats.backend_stall_percent >= 20.0
         && stats.has_cache_misses
@@ -620,14 +705,15 @@ fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
             || stats.cache_misses_per_op >= 0.05)
     {
         diagnostics.push(format!(
-            "Likely data-side memory latency: backend stall is {:.1}% with cache pressure at {:.2}% miss rate and {:.4} misses/op",
+            "{host_prefix}Likely data-side memory latency: backend stall is {:.1}% with cache pressure at {:.2}% miss rate and {:.4} misses/op",
             stats.backend_stall_percent,
             stats.cache_miss_percent,
             stats.cache_misses_per_op
         ));
     }
 
-    if stats.has_cycles
+    if !suppress_cpu_pmu
+        && stats.has_cycles
         && stats.has_stalled_cycles_frontend
         && stats.frontend_stall_percent >= 20.0
         && stats.has_branches
@@ -635,36 +721,41 @@ fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
         && stats.branch_miss_rate >= 3.0
     {
         diagnostics.push(format!(
-            "Likely branch predictor or fetch disruption: frontend stall is {:.1}% with {:.2}% branch misses",
+            "{host_prefix}Likely branch predictor or fetch disruption: frontend stall is {:.1}% with {:.2}% branch misses",
             stats.frontend_stall_percent,
             stats.branch_miss_rate
         ));
     }
 
-    if stats.has_cycles
+    if !suppress_cpu_pmu
+        && stats.has_cycles
         && stats.has_stalled_cycles_frontend
         && stats.frontend_stall_percent >= 20.0
         && stats.has_l1i_misses
         && stats.l1i_misses_per_op >= 0.01
     {
         diagnostics.push(format!(
-            "Likely instruction-cache pressure: frontend stall is {:.1}% with {:.4} L1I misses/op",
+            "{host_prefix}Likely instruction-cache pressure: frontend stall is {:.1}% with {:.4} L1I misses/op",
             stats.frontend_stall_percent, stats.l1i_misses_per_op
         ));
     }
 
-    if stats.has_cycles
+    if !suppress_cpu_pmu
+        && stats.has_cycles
         && stats.has_instructions
         && stats.ipc > 0.0
         && stats.ipc < 1.0
         && diagnostics.is_empty()
     {
         diagnostics.push(format!(
-            "Low IPC ({:.3}) suggests poor machine utilization; look for dependency chains, execution-port pressure, or latent memory effects",
+            "{host_prefix}Low IPC ({:.3}) suggests poor machine utilization; look for dependency chains, execution-port pressure, or latent memory effects",
             stats.ipc
         ));
     }
 
+    // Run-stability warnings apply to every domain: GPU benchmarks also
+    // need stable samples, and a noisy GPU run is still worth flagging
+    // (thermal throttling, algorithm selection changes, queue contention).
     if stats.cv_percent >= 10.0 || stats.outlier_count >= (stats.samples / 10).max(2) {
         diagnostics.push(format!(
             "Run stability is weak: CV {:.2}% with {} outliers across {} samples",
@@ -675,8 +766,8 @@ fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
     diagnostics
 }
 
-fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
-    f: &BenchFunction<T>,
+fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize, usize)>(
+    f: G,
     factory: &F,
     throughput: &Throughput,
     runtime: &BenchmarkRuntimeOptions,
@@ -686,16 +777,24 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
     if let Some(preferred_chunk_size) = T::chunk_size() {
         let warm_up_end = Instant::now() + runtime.warm_up_duration;
         let mut warm_up_count = 0;
+        let mut last_progress = Instant::now();
         while Instant::now() < warm_up_end {
             let mut prepared = factory();
             black_box(|| f(&mut prepared, preferred_chunk_size, warm_up_count))();
             warm_up_count += 1;
-            let remaining_ms = warm_up_end
-                .saturating_duration_since(Instant::now())
-                .as_millis();
-            rewrite_line(&format!(
-                "🔥 calibrating benchmark  warmup remaining: {remaining_ms:>4} ms  chunk: {preferred_chunk_size}"
-            ));
+
+            // Throttle progress updates to avoid spamming the terminal
+            // when the chunk size is small and the work loop is very
+            // fast (e.g. GPU benchmarks with fixed chunk_size()).
+            if last_progress.elapsed() >= Duration::from_millis(50) {
+                let remaining_ms = warm_up_end
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                rewrite_line(&format!(
+                    "🔥 calibrating benchmark  warmup remaining: {remaining_ms:>4} ms  chunk: {preferred_chunk_size}"
+                ));
+                last_progress = Instant::now();
+            }
         }
 
         clear_line();
@@ -748,16 +847,21 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized>(
 
     let warm_up_end = Instant::now() + runtime.warm_up_duration;
     let mut warm_up_count = 0;
+    let mut last_progress = Instant::now();
     while Instant::now() < warm_up_end {
         let mut prepared = factory();
         black_box(|| f(&mut prepared, best_chunk_size, warm_up_count))();
         warm_up_count += 1;
-        let remaining_ms = warm_up_end
-            .saturating_duration_since(Instant::now())
-            .as_millis();
-        rewrite_line(&format!(
-            "🔥 calibrating benchmark  warmup remaining: {remaining_ms:>4} ms  chunk: {best_chunk_size:>9}"
-        ));
+
+        if last_progress.elapsed() >= Duration::from_millis(50) {
+            let remaining_ms = warm_up_end
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            rewrite_line(&format!(
+                "🔥 calibrating benchmark  warmup remaining: {remaining_ms:>4} ms  chunk: {best_chunk_size:>9}"
+            ));
+            last_progress = Instant::now();
+        }
     }
 
     let estimated_chunk_duration_secs = if estimated_throughput_per_sec > 0.0 {
@@ -860,28 +964,71 @@ fn execute_concurrent_timing_only_measurement(
     }
 }
 
+/// Sample execution path for `bench(...)` benchmarks. The bench function
+/// returns no metrics; any metrics pushed by the backend via
+/// [`MeasurementBackend::collect`] are **dropped** here intentionally.
+///
+/// To capture backend-pushed metrics (e.g. `cuda_event_ms` from a CUDA
+/// event backend), use [`execute_standard_sample_with_metrics`] instead,
+/// which is the execution path behind `bench_sample(...)`.
 fn execute_standard_sample<T: BenchContext>(
     f: &BenchFunction<T>,
     prepared: &mut T,
     chunk_size: usize,
     chunk_num: usize,
     ops: u64,
+    backend: &mut dyn MeasurementBackend,
 ) -> Results {
-    #[cfg(target_os = "linux")]
-    {
-        execute_standard(|| {
-            black_box(|| f(prepared, chunk_size, chunk_num))();
-            ops
-        })
-    }
+    backend.begin();
+    let start = Instant::now();
+    black_box(|| f(prepared, chunk_size, chunk_num))();
+    let host_elapsed = start.elapsed();
+    backend.end();
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        execute_timing_only(|| {
-            black_box(|| f(prepared, chunk_size, chunk_num))();
-            ops
-        })
-    }
+    let mut results = Results::default();
+    let mut metrics = Vec::new();
+    backend.collect(host_elapsed, ops, chunk_num, &mut results, &mut metrics);
+    // Intentionally dropped: bench() does not capture per-sample custom
+    // metrics. Use bench_sample() to capture both bench-function metrics
+    // (from BenchSampleResult) and backend-pushed metrics.
+    drop(metrics);
+    results
+}
+
+/// Sample execution path for `bench_sample` benchmarks whose function
+/// returns [`crate::BenchSampleResult`] per sample, carrying both the
+/// operation count and any custom metrics. Same PMU/timing measurement as
+/// [`execute_standard_sample`] but the operation count and any custom
+/// metrics come from the closure's return value instead of
+/// `BenchContext::operations_per_chunk()`.
+///
+/// Backends that push their own metrics via
+/// [`MeasurementBackend::collect`] (e.g. a CUDA event backend pushing
+/// `cuda_event_ms` and `host_overhead_ms`) append to the same `metrics`
+/// Vec that the bench function already populated.
+fn execute_standard_sample_with_metrics<T: BenchContext>(
+    f: &BenchSampleFunction<T>,
+    prepared: &mut T,
+    chunk_size: usize,
+    chunk_num: usize,
+    backend: &mut dyn MeasurementBackend,
+) -> (Results, Vec<crate::bench::backend::MetricValue>) {
+    backend.begin();
+    let start = Instant::now();
+    let sample_result = black_box(|| f(prepared, chunk_size, chunk_num))();
+    let host_elapsed = start.elapsed();
+    backend.end();
+
+    let mut results = Results::default();
+    let mut metrics = sample_result.metrics;
+    backend.collect(
+        host_elapsed,
+        sample_result.operations,
+        chunk_num,
+        &mut results,
+        &mut metrics,
+    );
+    (results, metrics)
 }
 
 fn execute_concurrent_timing_only<T: ConcurrentBenchContext + Sync>(
@@ -1099,6 +1246,8 @@ impl BenchmarkRunner {
             runner: self,
             name,
             throughput: Throughput::ops(),
+            measurement_domain: MeasurementDomain::default(),
+            backend_factory: None,
             _marker: std::marker::PhantomData,
         };
         f(&group);
@@ -1113,6 +1262,7 @@ impl BenchmarkRunner {
             runner: self,
             name,
             throughput: Throughput::ops(),
+            measurement_domain: MeasurementDomain::default(),
             _marker: std::marker::PhantomData,
         };
         f(&group);
@@ -1140,6 +1290,8 @@ impl BenchmarkRunner {
             f,
             &|| T::prepare(T::chunk_size().unwrap_or(MIN_CHUNK_SIZE)),
             Throughput::ops(),
+            MeasurementDomain::default(),
+            default_backend(),
         );
     }
 
@@ -1150,9 +1302,18 @@ impl BenchmarkRunner {
         f: BenchFunction<T>,
         factory: &F,
     ) {
-        self.run_with_factory_and_throughput(name, group, f, factory, Throughput::ops());
+        self.run_with_factory_and_throughput(
+            name,
+            group,
+            f,
+            factory,
+            Throughput::ops(),
+            MeasurementDomain::default(),
+            default_backend(),
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_with_factory_and_throughput<T: BenchContext, F: Fn() -> T + ?Sized>(
         &self,
         name: &str,
@@ -1160,6 +1321,8 @@ impl BenchmarkRunner {
         f: BenchFunction<T>,
         factory: &F,
         throughput: Throughput,
+        measurement_domain: MeasurementDomain,
+        mut backend: Box<dyn MeasurementBackend>,
     ) {
         if !self.should_run(name, group) {
             return;
@@ -1171,7 +1334,7 @@ impl BenchmarkRunner {
         let _affinity_guard = BenchAffinityGuard::acquire();
         println!("\nBenchmark: {name}");
 
-        let config = calibrate_engine(&f, factory, &throughput, &self.runtime);
+        let config = calibrate_engine(f, factory, &throughput, &self.runtime);
         println!(
             "  calibrated: chunk={} samples={} estimate={}",
             config.chunk_size,
@@ -1187,8 +1350,14 @@ impl BenchmarkRunner {
         for sample in 0..config.target_samples {
             let mut prepared = factory();
             let ops = T::operations_per_chunk().unwrap_or(config.chunk_size as u64);
-            let sample_result =
-                execute_standard_sample(&f, &mut prepared, config.chunk_size, sample, ops);
+            let sample_result = execute_standard_sample(
+                &f,
+                &mut prepared,
+                config.chunk_size,
+                sample,
+                ops,
+                backend.as_mut(),
+            );
 
             update_running_throughput(&mut running_throughput, &sample_result, &throughput);
             summed_results.add(&sample_result);
@@ -1212,6 +1381,124 @@ impl BenchmarkRunner {
             &all_results,
             config.target_samples,
             &throughput,
+            measurement_domain,
+            backend.measurement_label(),
+            backend.emits_cpu_diagnostics(),
+            &[],
+        );
+        render_standard_results(name, &stats);
+
+        self.session.add_result(BenchmarkResult {
+            name: name.to_string(),
+            group: group.to_string(),
+            kind: BenchmarkKind::Standard,
+            stats,
+            worker_summaries: Vec::new(),
+        });
+    }
+
+    /// Variant of [`run_with_factory_and_throughput`](Self::run_with_factory_and_throughput)
+    /// for benches that return a [`crate::BenchSampleResult`] per sample,
+    /// carrying both operation count and custom metrics (e.g.
+    /// `cuda_event_ms`, `tflops`, `host_overhead_ms`).
+    ///
+    /// This is the Phase 2 entry point of
+    /// `docs/gpu-benchmarking-sharp-edges.md` ("No Per-Sample Custom
+    /// Metrics"). It accepts a `BenchSampleFunction<T>` rather than the
+    /// plain `BenchFunction<T>`, threads each sample's returned metrics
+    /// through the same PMU/timing pipeline, aggregates them into
+    /// [`crate::session::MetricSummary`] (mean, median, p95, min, max) and
+    /// renders a `custom metrics:` table beneath the standard stats table.
+    ///
+    /// Prefer the plain `run_with_factory_and_throughput` for tight CPU
+    /// loops where the framework-derived numbers tell the whole story; the
+    /// richer path is intended for GPU work and other cases where the
+    /// measured closure knows facts only available after execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_sample_with_factory_and_throughput<
+        T: BenchContext,
+        F: Fn() -> T + ?Sized,
+    >(
+        &self,
+        name: &str,
+        group: &str,
+        f: BenchSampleFunction<T>,
+        factory: &F,
+        throughput: Throughput,
+        measurement_domain: MeasurementDomain,
+        mut backend: Box<dyn MeasurementBackend>,
+    ) {
+        if !self.should_run(name, group) {
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        clear_perf_issues();
+
+        let _affinity_guard = BenchAffinityGuard::acquire();
+        println!("\nBenchmark: {name}");
+
+        // For calibration we wrap `f` so its `BenchSampleResult` return is
+        // discarded; calibration only needs to time the work, not collect
+        // metrics. Using a non-capturing closure here would require a
+        // function-pointer wrapper, which is awkward; the generalised
+        // `calibrate_engine` signature accepts `impl Fn(...)` so this
+        // closure works directly.
+        let calibrate_fn = |ctx: &mut T, cs: usize, cn: usize| {
+            let _ = f(ctx, cs, cn);
+        };
+        let config = calibrate_engine(calibrate_fn, factory, &throughput, &self.runtime);
+        println!(
+            "  calibrated: chunk={} samples={} estimate={}",
+            config.chunk_size,
+            config.target_samples,
+            throughput.format_rate(config.estimated_throughput_per_sec),
+        );
+
+        rewrite_line(&format!("⚡ running 0/{} samples", config.target_samples));
+        let mut all_results = Vec::with_capacity(config.target_samples);
+        let mut summed_results = Results::default();
+        let mut running_throughput = config.estimated_throughput_per_sec;
+        let mut all_metrics: Vec<Vec<crate::bench::backend::MetricValue>> =
+            Vec::with_capacity(config.target_samples);
+
+        for sample in 0..config.target_samples {
+            let mut prepared = factory();
+            let (sample_result, sample_metrics) = execute_standard_sample_with_metrics(
+                &f,
+                &mut prepared,
+                config.chunk_size,
+                sample,
+                backend.as_mut(),
+            );
+
+            update_running_throughput(&mut running_throughput, &sample_result, &throughput);
+            summed_results.add(&sample_result);
+            all_results.push(sample_result);
+            all_metrics.push(sample_metrics);
+
+            if sample % 2 == 0 || sample == config.target_samples - 1 {
+                update_progress_bar(
+                    sample + 1,
+                    config.target_samples,
+                    running_throughput,
+                    &throughput,
+                );
+            }
+        }
+
+        clear_line();
+        println!("  samples complete: {}", config.target_samples);
+
+        let stats = benchmark_stats_from_samples(
+            &summed_results,
+            &all_results,
+            config.target_samples,
+            &throughput,
+            measurement_domain,
+            backend.measurement_label(),
+            backend.emits_cpu_diagnostics(),
+            &all_metrics,
         );
         render_standard_results(name, &stats);
 
@@ -1238,6 +1525,7 @@ impl BenchmarkRunner {
             workers,
             &|num_threads| T::prepare(num_threads),
             Throughput::ops(),
+            MeasurementDomain::default(),
         );
     }
 
@@ -1259,9 +1547,11 @@ impl BenchmarkRunner {
             workers,
             factory,
             Throughput::ops(),
+            MeasurementDomain::default(),
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_concurrent_with_factory_and_throughput<
         T: ConcurrentBenchContext + Send + Sync,
         F: Fn(usize) -> T + ?Sized,
@@ -1273,6 +1563,7 @@ impl BenchmarkRunner {
         workers: &[ConcurrentWorker<T>],
         factory: &F,
         throughput: Throughput,
+        measurement_domain: MeasurementDomain,
     ) {
         if !self.should_run(name, group) {
             return;
@@ -1363,6 +1654,10 @@ impl BenchmarkRunner {
             &all_results,
             config.target_samples,
             &throughput,
+            measurement_domain,
+            "",
+            true,
+            &[],
         );
         let worker_summaries: Vec<WorkerSummary> = workers
             .iter()
@@ -1376,6 +1671,10 @@ impl BenchmarkRunner {
                         worker_samples,
                         config.target_samples,
                         &throughput,
+                        measurement_domain,
+                        "",
+                        true,
+                        &[],
                     );
                     WorkerSummary {
                         name: worker.name.to_string(),
@@ -1407,6 +1706,8 @@ pub struct BenchmarkGroup<'a, T: BenchContext> {
     runner: &'a BenchmarkRunner,
     name: &'static str,
     throughput: Throughput,
+    measurement_domain: MeasurementDomain,
+    backend_factory: Option<Rc<dyn Fn() -> Box<dyn MeasurementBackend>>>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -1414,6 +1715,8 @@ pub struct BenchmarkGroupWithFactory<'a, 'f, T: BenchContext, F: Fn() -> T + ?Si
     runner: &'a BenchmarkRunner,
     name: &'static str,
     throughput: Throughput,
+    measurement_domain: MeasurementDomain,
+    backend_factory: Option<Rc<dyn Fn() -> Box<dyn MeasurementBackend>>>,
     factory: &'f F,
 }
 
@@ -1423,6 +1726,69 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             runner: self.runner,
             name: self.name,
             throughput,
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Declare what this group measures. The runner consults this to
+    /// suppress or relabel CPU-PMU bottleneck diagnostics when the measured
+    /// operation is not CPU work (see `docs/gpu-benchmarking-sharp-edges.md`).
+    /// Defaults to [`MeasurementDomain::Cpu`], preserving historical
+    /// behavior.
+    pub fn measurement_domain(&self, measurement_domain: MeasurementDomain) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Supply a custom [`MeasurementBackend`] factory for this group.
+    ///
+    /// The factory is called once per benchmark to create a fresh backend
+    /// instance, which is then reused across all samples via
+    /// [`MeasurementBackend::begin`] / [`MeasurementBackend::end`] /
+    /// [`MeasurementBackend::collect`].
+    ///
+    /// When not set, the runner uses the platform default
+    /// ([`LinuxPerfBackend`] on Linux, [`WallClockBackend`] elsewhere).
+    ///
+    /// ```
+    /// use micromeasure::{MeasurementBackend, MeasurementDomain, Throughput, benchmark_main};
+    ///
+    /// struct MyBackend;
+    /// impl MeasurementBackend for MyBackend {
+    ///     fn begin(&mut self) {}
+    ///     fn end(&mut self) {}
+    ///     fn collect(
+    ///         &mut self,
+    ///         host_elapsed: std::time::Duration,
+    ///         ops: u64,
+    ///         _chunk_index: usize,
+    ///         results: &mut micromeasure::bench::Results,
+    ///         _metrics: &mut Vec<micromeasure::MetricValue>,
+    ///     ) {
+    ///         results.duration = host_elapsed;
+    ///         results.iterations = ops;
+    ///         results.chunks_executed = 1;
+    ///     }
+    /// }
+    /// ```
+    pub fn backend<F: Fn() -> Box<dyn MeasurementBackend> + 'static>(
+        &self,
+        backend_factory: F,
+    ) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: Some(Rc::new(backend_factory)),
             _marker: std::marker::PhantomData,
         }
     }
@@ -1435,6 +1801,8 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             runner: self.runner,
             name: self.name,
             throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
             factory,
         }
     }
@@ -1446,6 +1814,13 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
         self.factory(factory)
     }
 
+    fn make_backend(&self) -> Box<dyn MeasurementBackend> {
+        match &self.backend_factory {
+            Some(factory) => factory(),
+            None => default_backend(),
+        }
+    }
+
     pub fn bench(&self, name: &str, f: BenchFunction<T>) {
         self.runner.run_with_factory_and_throughput(
             name,
@@ -1453,6 +1828,32 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             f,
             &|| T::prepare(T::chunk_size().unwrap_or(MIN_CHUNK_SIZE)),
             self.throughput.clone(),
+            self.measurement_domain,
+            self.make_backend(),
+        );
+    }
+
+    /// Like [`bench`](Self::bench) but accepts a richer bench function that
+    /// returns a [`crate::BenchSampleResult`] per sample, carrying both the
+    /// operation count and any custom metrics (e.g. `cuda_event_ms`,
+    /// `tflops`, `host_overhead_ms`). The runner aggregates the metrics
+    /// across samples and renders a `custom metrics:` table beneath the
+    /// standard stats table.
+    ///
+    /// Use this when the measured closure knows facts only available after
+    /// execution — selected algorithm ID, device event elapsed time,
+    /// scenario-dependent bytes/flops, validation codes. For tight CPU
+    /// loops where the framework-derived numbers tell the whole story,
+    /// prefer `bench`.
+    pub fn bench_sample(&self, name: &str, f: BenchSampleFunction<T>) {
+        self.runner.run_sample_with_factory_and_throughput(
+            name,
+            self.name,
+            f,
+            &|| T::prepare(T::chunk_size().unwrap_or(MIN_CHUNK_SIZE)),
+            self.throughput.clone(),
+            self.measurement_domain,
+            self.make_backend(),
         );
     }
 
@@ -1489,7 +1890,45 @@ impl<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> BenchmarkGroupWithFactory<'
             runner: self.runner,
             name: self.name,
             throughput,
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
             factory: self.factory,
+        }
+    }
+
+    /// Declare what this group measures. See
+    /// [`BenchmarkGroup::measurement_domain`].
+    pub fn measurement_domain(&self, measurement_domain: MeasurementDomain) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            factory: self.factory,
+        }
+    }
+
+    /// Supply a custom [`MeasurementBackend`] factory for this group. See
+    /// [`BenchmarkGroup::backend`].
+    pub fn backend<B: Fn() -> Box<dyn MeasurementBackend> + 'static>(
+        &self,
+        backend_factory: B,
+    ) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: Some(Rc::new(backend_factory)),
+            factory: self.factory,
+        }
+    }
+
+    fn make_backend(&self) -> Box<dyn MeasurementBackend> {
+        match &self.backend_factory {
+            Some(factory) => factory(),
+            None => default_backend(),
         }
     }
 
@@ -1500,6 +1939,24 @@ impl<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> BenchmarkGroupWithFactory<'
             f,
             self.factory,
             self.throughput.clone(),
+            self.measurement_domain,
+            self.make_backend(),
+        );
+    }
+
+    /// Like [`bench`](Self::bench) but accepts a richer bench function that
+    /// returns a [`crate::BenchSampleResult`] per sample. See
+    /// [`BenchmarkGroup::bench_sample`] for when to use this instead of
+    /// `bench`.
+    pub fn bench_sample(&self, name: &str, f: BenchSampleFunction<T>) {
+        self.runner.run_sample_with_factory_and_throughput(
+            name,
+            self.name,
+            f,
+            self.factory,
+            self.throughput.clone(),
+            self.measurement_domain,
+            self.make_backend(),
         );
     }
 }
@@ -1508,6 +1965,7 @@ pub struct ConcurrentBenchmarkGroup<'a, T: ConcurrentBenchContext> {
     runner: &'a BenchmarkRunner,
     name: &'static str,
     throughput: Throughput,
+    measurement_domain: MeasurementDomain,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -1515,6 +1973,7 @@ pub struct ConcurrentBenchmarkGroupWithDuration<'a, T: ConcurrentBenchContext> {
     runner: &'a BenchmarkRunner,
     name: &'static str,
     throughput: Throughput,
+    measurement_domain: MeasurementDomain,
     sample_duration: Duration,
     _marker: std::marker::PhantomData<T>,
 }
@@ -1528,6 +1987,7 @@ pub struct ConcurrentBenchmarkGroupWithFactory<
     runner: &'a BenchmarkRunner,
     name: &'static str,
     throughput: Throughput,
+    measurement_domain: MeasurementDomain,
     sample_duration: Duration,
     factory: &'f F,
 }
@@ -1541,6 +2001,19 @@ where
             runner: self.runner,
             name: self.name,
             throughput,
+            measurement_domain: self.measurement_domain,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Declare what this group measures. See
+    /// [`BenchmarkGroup::measurement_domain`].
+    pub fn measurement_domain(&self, measurement_domain: MeasurementDomain) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain,
             _marker: std::marker::PhantomData,
         }
     }
@@ -1557,6 +2030,7 @@ where
             runner: self.runner,
             name: self.name,
             throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
             sample_duration,
             _marker: std::marker::PhantomData,
         }
@@ -1570,6 +2044,7 @@ where
             workers,
             &|num_threads| T::prepare(num_threads),
             self.throughput.clone(),
+            self.measurement_domain,
         );
     }
 
@@ -1594,6 +2069,7 @@ where
             runner: self.runner,
             name: self.name,
             throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
             sample_duration: DEFAULT_CONCURRENT_SAMPLE_DURATION,
             factory,
         }
@@ -1647,6 +2123,20 @@ where
             runner: self.runner,
             name: self.name,
             throughput,
+            measurement_domain: self.measurement_domain,
+            sample_duration: self.sample_duration,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Declare what this group measures. See
+    /// [`BenchmarkGroup::measurement_domain`].
+    pub fn measurement_domain(&self, measurement_domain: MeasurementDomain) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain,
             sample_duration: self.sample_duration,
             _marker: std::marker::PhantomData,
         }
@@ -1660,6 +2150,7 @@ where
             runner: self.runner,
             name: self.name,
             throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
             sample_duration: self.sample_duration,
             factory,
         }
@@ -1680,6 +2171,7 @@ where
             workers,
             &|num_threads| T::prepare(num_threads),
             self.throughput.clone(),
+            self.measurement_domain,
         );
     }
 }
@@ -1694,6 +2186,20 @@ where
             runner: self.runner,
             name: self.name,
             throughput,
+            measurement_domain: self.measurement_domain,
+            sample_duration: self.sample_duration,
+            factory: self.factory,
+        }
+    }
+
+    /// Declare what this group measures. See
+    /// [`BenchmarkGroup::measurement_domain`].
+    pub fn measurement_domain(&self, measurement_domain: MeasurementDomain) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain,
             sample_duration: self.sample_duration,
             factory: self.factory,
         }
@@ -1708,6 +2214,7 @@ where
             runner: self.runner,
             name: self.name,
             throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
             sample_duration,
             factory: self.factory,
         }
@@ -1721,14 +2228,139 @@ where
             workers,
             self.factory,
             self.throughput.clone(),
+            self.measurement_domain,
         );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Throughput;
+    use super::{MeasurementDomain, Throughput};
     use super::stats::{median, median_absolute_deviation, percentile, tukey_outlier_count};
+
+    use crate::BenchmarkStats;
+
+    fn stats_with_domain(domain: MeasurementDomain) -> BenchmarkStats {
+        // A benchmark whose CPU PMU fields would normally trigger the
+        // "data-side memory latency" diagnostic: high backend stalls plus
+        // cache pressure. The same numbers are reused across all three
+        // domain tests below so the only variable is `measurement_domain`.
+        BenchmarkStats {
+            throughput: Throughput::ops(),
+            throughput_per_sec: 1.0,
+            median_throughput_per_sec: 1.0,
+            ns_per_op: 100.0,
+            median_ns_per_op: 100.0,
+            p95_ns_per_op: 110.0,
+            mad_ns_per_op: 1.0,
+            cycles_per_op: 1000.0,
+            instructions_per_op: 100.0,
+            ipc: 0.1,
+            cache_references_per_op: 10.0,
+            l1i_misses_per_op: 0.5,
+            branches_per_op: 50.0,
+            branch_miss_rate: 10.0,
+            branch_misses_per_op: 5.0,
+            cache_misses_per_op: 5.0,
+            cache_miss_percent: 50.0,
+            frontend_stall_cycles_per_op: 50.0,
+            frontend_stall_percent: 50.0,
+            backend_stall_cycles_per_op: 50.0,
+            backend_stall_percent: 50.0,
+            cv_percent: 1.0,
+            outlier_count: 0,
+            samples: 30,
+            operations: 1000,
+            total_duration_sec: 1.0,
+            sample_throughput_per_sec: vec![1.0],
+            sample_latency_ns_per_op: vec![100.0],
+            has_cycles: true,
+            has_instructions: true,
+            has_cache_references: true,
+            has_l1i_misses: true,
+            has_branches: true,
+            has_branch_misses: true,
+            has_cache_misses: true,
+            has_stalled_cycles_frontend: true,
+            has_stalled_cycles_backend: true,
+            pmu_time_enabled_ns: 1_000_000_000,
+            pmu_time_running_ns: 1_000_000_000,
+            measurement_domain: domain,
+            measurement_label: String::new(),
+            emits_cpu_diagnostics: true,
+            metrics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn diagnose_stats_emits_cpu_pmu_bottlenecks_for_cpu_domain() {
+        let stats = stats_with_domain(MeasurementDomain::Cpu);
+        let diagnostics = super::diagnose_stats(&stats);
+        // On CPU domain, at least one CPU-PMU bottleneck (memory latency,
+        // branch/predictor, iCache pressure, low IPC) should fire.
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("memory latency")
+                    || d.contains("branch predictor")
+                    || d.contains("instruction-cache")
+                    || d.contains("Low IPC")),
+            "expected CPU-PMU bottleneck diagnostic for Cpu domain, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn diagnose_stats_suppresses_cpu_pmu_bottlenecks_for_gpu_domain() {
+        let stats = stats_with_domain(MeasurementDomain::Gpu);
+        let diagnostics = super::diagnose_stats(&stats);
+        // GPU domain must not surface CPU-PMU bottleneck messages — the
+        // host thread's counters describe launch/sync orchestration, not
+        // the GPU kernel. Stability warnings are still allowed.
+        for diagnostic in &diagnostics {
+            let is_cpu_pmu = diagnostic.contains("memory latency")
+                || diagnostic.contains("branch predictor")
+                || diagnostic.contains("instruction-cache")
+                || diagnostic.contains("Low IPC");
+            assert!(
+                !is_cpu_pmu,
+                "GPU domain should suppress CPU-PMU diagnostic: {diagnostic}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnose_stats_prefixes_cpu_pmu_bottlenecks_for_mixed_domain() {
+        let stats = stats_with_domain(MeasurementDomain::Mixed);
+        let diagnostics = super::diagnose_stats(&stats);
+        // Mixed domain emits CPU-PMU diagnostics but tags them as host-side
+        // context so a reader does not read them as the primary bottleneck.
+        let any_cpu_pmu_prefixed = diagnostics
+            .iter()
+            .any(|d| d.starts_with("[host] ") && (d.contains("memory latency")
+                || d.contains("branch predictor")
+                || d.contains("instruction-cache")
+                || d.contains("Low IPC")));
+        assert!(
+            any_cpu_pmu_prefixed,
+            "expected at least one [host]-prefixed CPU-PMU diagnostic for Mixed domain, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn diagnose_stats_keeps_stability_warnings_for_gpu_domain() {
+        let mut stats = stats_with_domain(MeasurementDomain::Gpu);
+        // Make the run stability diagnostic fire: high CV and outliers.
+        stats.cv_percent = 25.0;
+        stats.outlier_count = 10;
+        stats.samples = 30;
+        let diagnostics = super::diagnose_stats(&stats);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("Run stability is weak")),
+            "expected run-stability warning for GPU domain, got: {diagnostics:?}"
+        );
+    }
 
     #[test]
     fn percentile_interpolates_sorted_values() {
@@ -1755,5 +2387,71 @@ mod tests {
     fn throughput_format_scales_custom_units() {
         let throughput = Throughput::per_operation(1000, "lines");
         assert_eq!(throughput.format_rate(12_500.0), "12.50 klines/s");
+    }
+
+    /// End-to-end regression test: `bench_sample(...)` must populate
+    /// `BenchmarkStats.metrics` with the metrics returned by the bench
+    /// function. This test exists because a previous commit collected
+    /// `all_metrics` per sample but then passed `&[]` to
+    /// `benchmark_stats_from_samples`, silently dropping them.
+    #[test]
+    fn bench_sample_populates_custom_metrics() {
+        use crate::bench::backend::BenchSampleResult;
+        use std::time::Duration;
+
+        struct DummyCtx;
+        impl crate::BenchContext for DummyCtx {
+            fn prepare(_num_chunks: usize) -> Self {
+                DummyCtx
+            }
+            fn chunk_size() -> Option<usize> {
+                Some(1_000)
+            }
+        }
+
+        fn sample_bench(
+            _ctx: &mut DummyCtx,
+            chunk_size: usize,
+            _chunk_num: usize,
+        ) -> BenchSampleResult {
+            BenchSampleResult::operations(chunk_size as u64)
+                .with_metric("cuda_event_ms", 0.5, "ms")
+                .with_metric("tflops", 10.0, "TFLOP/s")
+        }
+
+        let runner = crate::BenchmarkRunner::new().with_runtime(crate::BenchmarkRuntimeOptions {
+            warm_up_duration: Duration::from_millis(10),
+            benchmark_duration: Duration::from_millis(50),
+            min_samples: 3,
+            max_samples: 5,
+        });
+
+        runner.run_sample_with_factory_and_throughput(
+            "test_bench_sample_metrics",
+            "test",
+            sample_bench as fn(&mut DummyCtx, usize, usize) -> BenchSampleResult,
+            &|| DummyCtx,
+            Throughput::ops(),
+            MeasurementDomain::Cpu,
+            Box::new(crate::WallClockBackend::new()),
+        );
+
+        let results = runner.results();
+        assert_eq!(results.len(), 1, "expected exactly one result");
+        let stats = &results[0].stats;
+        assert!(
+            !stats.metrics.is_empty(),
+            "bench_sample must populate stats.metrics — this is the regression where \
+             all_metrics was collected but &[] was passed to benchmark_stats_from_samples"
+        );
+        let names: Vec<&str> = stats.metrics.iter().map(|m| m.name.as_str()).collect();
+        assert!(
+            names.contains(&"cuda_event_ms"),
+            "expected cuda_event_ms in {names:?}"
+        );
+        assert!(
+            names.contains(&"tflops"),
+            "expected tflops in {names:?}"
+        );
     }
 }

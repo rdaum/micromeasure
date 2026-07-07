@@ -115,6 +115,7 @@ pub struct MetricValue {
     pub name: &'static str,
     pub value: f64,
     pub unit: &'static str,
+    pub section: &'static str,
     /// Cosmetic override for the table label. When empty, `name` is used.
     pub display_name: &'static str,
     /// Controls how `value` is formatted in the table.
@@ -128,6 +129,7 @@ impl MetricValue {
             name,
             value,
             unit,
+            section: "",
             display_name: "",
             format: MetricFormat::Number,
         }
@@ -137,6 +139,11 @@ impl MetricValue {
     /// aggregation key remains `name`; this is purely cosmetic.
     pub fn with_display_name(mut self, display_name: &'static str) -> Self {
         self.display_name = display_name;
+        self
+    }
+
+    pub fn with_section(mut self, section: &'static str) -> Self {
+        self.section = section;
         self
     }
 
@@ -174,6 +181,56 @@ impl MetricValue {
     /// kernel counts, etc.
     pub fn integer(name: &'static str, value: i64, unit: &'static str) -> Self {
         Self::new(name, value as f64, unit).with_format(MetricFormat::Integer)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DiagnosticResult {
+    pub section: &'static str,
+    pub metrics: Vec<MetricValue>,
+}
+
+impl DiagnosticResult {
+    pub fn new(section: &'static str) -> Self {
+        Self {
+            section,
+            metrics: Vec::new(),
+        }
+    }
+
+    pub fn push_metric(mut self, metric: MetricValue) -> Self {
+        let metric = if metric.section.is_empty() {
+            metric.with_section(self.section)
+        } else {
+            metric
+        };
+        self.metrics.push(metric);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticError {
+    pub message: String,
+}
+
+impl DiagnosticError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for DiagnosticError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for DiagnosticError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
     }
 }
 
@@ -240,8 +297,8 @@ pub struct BenchSampleResult {
     pub operations: u64,
     /// Custom per-sample metrics. Names should be stable across samples of
     /// the same benchmark so the aggregation path can group them. The
-    /// runner keys summaries by `(name, unit)` so a metric reported in
-    /// different units is treated as distinct.
+    /// runner keys summaries by `(section, name, unit)` so metrics with
+    /// different sections or units are treated as distinct.
     pub metrics: Vec<MetricValue>,
 }
 
@@ -584,6 +641,16 @@ mod tests {
         assert_eq!(m.value, 0.0);
         assert_eq!(m.name, "");
         assert_eq!(m.unit, "");
+    }
+
+    #[test]
+    fn diagnostic_result_section_is_default_not_override() {
+        let result = DiagnosticResult::new("diagnostic")
+            .push_metric(MetricValue::new("defaulted", 1.0, "u"))
+            .push_metric(MetricValue::new("explicit", 2.0, "u").with_section("profiler"));
+
+        assert_eq!(result.metrics[0].section, "diagnostic");
+        assert_eq!(result.metrics[1].section, "profiler");
     }
 
     #[test]

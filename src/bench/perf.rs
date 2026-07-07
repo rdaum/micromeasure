@@ -1045,14 +1045,12 @@ impl LinuxPerfBackend {
         }
 
         results.cycles = scale_multiplexed_count(cycles_raw, enabled_ns, running_ns);
-        results.instructions =
-            scale_multiplexed_count(instructions_raw, enabled_ns, running_ns);
+        results.instructions = scale_multiplexed_count(instructions_raw, enabled_ns, running_ns);
         results.cache_references =
             scale_multiplexed_count(cache_references_raw, enabled_ns, running_ns);
         results.l1i_misses = scale_multiplexed_count(l1i_misses_raw, enabled_ns, running_ns);
         results.branches = scale_multiplexed_count(branches_raw, enabled_ns, running_ns);
-        results.branch_misses =
-            scale_multiplexed_count(branch_misses_raw, enabled_ns, running_ns);
+        results.branch_misses = scale_multiplexed_count(branch_misses_raw, enabled_ns, running_ns);
         results.cache_misses = scale_multiplexed_count(cache_misses_raw, enabled_ns, running_ns);
         results.stalled_cycles_frontend =
             scale_multiplexed_count(stalled_cycles_frontend_raw, enabled_ns, running_ns);
@@ -1094,10 +1092,16 @@ impl LinuxPerfBackend {
             read_scaled_counter(&mut ind.branch_misses, "branch-misses");
         let (cache_misses, cache_misses_enabled, cache_misses_running) =
             read_scaled_counter(&mut ind.cache_misses, "cache-misses");
-        let (stalled_cycles_frontend, stalled_cycles_frontend_enabled, stalled_cycles_frontend_running) =
-            read_scaled_counter(&mut ind.stalled_cycles_frontend, "stalled-cycles-frontend");
-        let (stalled_cycles_backend, stalled_cycles_backend_enabled, stalled_cycles_backend_running) =
-            read_scaled_counter(&mut ind.stalled_cycles_backend, "stalled-cycles-backend");
+        let (
+            stalled_cycles_frontend,
+            stalled_cycles_frontend_enabled,
+            stalled_cycles_frontend_running,
+        ) = read_scaled_counter(&mut ind.stalled_cycles_frontend, "stalled-cycles-frontend");
+        let (
+            stalled_cycles_backend,
+            stalled_cycles_backend_enabled,
+            stalled_cycles_backend_running,
+        ) = read_scaled_counter(&mut ind.stalled_cycles_backend, "stalled-cycles-backend");
 
         let (pmu_time_enabled_ns, pmu_time_running_ns) = timing_window(&[
             (cycles_enabled, cycles_running),
@@ -1174,9 +1178,7 @@ impl MeasurementBackend for LinuxPerfBackend {
     ) {
         match &mut self.mode {
             PerfMode::Group(perf) => Self::collect_group(perf, host_elapsed, ops, results),
-            PerfMode::Individual(ind) => {
-                Self::collect_individual(ind, host_elapsed, ops, results)
-            }
+            PerfMode::Individual(ind) => Self::collect_individual(ind, host_elapsed, ops, results),
             PerfMode::None | PerfMode::Idle => {
                 // No PMU counters — write timing only.
                 results.duration = host_elapsed;

@@ -28,15 +28,15 @@ mod session;
 pub mod table;
 mod threading;
 
-pub use bench::{
-    BenchContext, BenchmarkRunner, BenchmarkRuntimeOptions, ConcurrentBenchContext,
-    ConcurrentBenchControl, ConcurrentBenchmarkGroup, ConcurrentWorker, ConcurrentWorkerResult,
-    CounterValue, MeasurementBackend, MeasurementDomain, MetricFormat, MetricValue, NoContext,
-    Throughput, WallClockBackend,
-};
 #[cfg(target_os = "linux")]
 pub use bench::LinuxPerfBackend;
 pub use bench::backend::BenchSampleResult;
+pub use bench::{
+    BenchContext, BenchmarkRunner, BenchmarkRuntimeOptions, ConcurrentBenchContext,
+    ConcurrentBenchControl, ConcurrentBenchmarkGroup, ConcurrentWorker, ConcurrentWorkerResult,
+    CounterValue, DiagnosticError, DiagnosticResult, MeasurementBackend, MeasurementDomain,
+    MetricFormat, MetricValue, NoContext, Throughput, WallClockBackend,
+};
 pub use launcher::{
     BenchmarkMainOptions, benchmark_filter_from_args, benchmark_filter_from_env, run_benchmark_main,
 };

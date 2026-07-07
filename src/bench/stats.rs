@@ -141,9 +141,9 @@ pub(super) fn benchmark_stats_from_samples(
 }
 
 /// Aggregate per-sample `Vec<MetricValue>` into one [`MetricSummary`] per
-/// `(name, unit)` pair, computing mean / median / p95 / min / max.
+/// `(section, name, unit)` pair, computing mean / median / p95 / min / max.
 ///
-/// Grouping by `(name, unit)` means a metric reported in two different
+/// Grouping by `(section, name, unit)` means a metric reported in two different
 /// units (e.g. `"time_ms"` and `"time_us"`) is treated as two distinct
 /// summaries, which matches how a reader would scan a metrics table.
 ///
@@ -152,7 +152,7 @@ pub(super) fn benchmark_stats_from_samples(
 /// many samples actually contributed. This handles intermittent metrics
 /// (e.g. CUDA event timing that occasionally fails to record).
 ///
-/// Within a single sample, if the same `(name, unit)` appears multiple
+/// Within a single sample, if the same `(section, name, unit)` appears multiple
 /// times only the last value is kept — the typical case is one value per
 /// metric per sample.
 pub(super) fn aggregate_metrics(per_sample: &[Vec<MetricValue>]) -> Vec<MetricSummary> {
@@ -169,7 +169,7 @@ pub(super) fn aggregate_metrics(per_sample: &[Vec<MetricValue>]) -> Vec<MetricSu
         format: MetricFormat,
     }
 
-    let mut by_key: HashMap<(&'static str, &'static str), Acc> = HashMap::new();
+    let mut by_key: HashMap<(&'static str, &'static str, &'static str), Acc> = HashMap::new();
     let mut next_order = 0usize;
 
     for metrics in per_sample {
@@ -178,9 +178,12 @@ pub(super) fn aggregate_metrics(per_sample: &[Vec<MetricValue>]) -> Vec<MetricSu
         // lexicographically, which breaks the first-seen ordering
         // contract — a bench pushing `tflops` before `cuda_event_ms`
         // would see them reordered alphabetically in the output table.
-        type SampleEntry = ((&'static str, &'static str), (f64, &'static str, MetricFormat));
+        type SampleEntry = (
+            (&'static str, &'static str, &'static str),
+            (f64, &'static str, MetricFormat),
+        );
         let mut seen_in_sample: Vec<SampleEntry> = Vec::new();
-        let mut seen_keys: std::collections::HashSet<(&'static str, &'static str)> =
+        let mut seen_keys: std::collections::HashSet<(&'static str, &'static str, &'static str)> =
             std::collections::HashSet::new();
         for m in metrics {
             // NaN / inf are silently dropped — they would propagate through
@@ -189,7 +192,7 @@ pub(super) fn aggregate_metrics(per_sample: &[Vec<MetricValue>]) -> Vec<MetricSu
             if !m.value.is_finite() {
                 continue;
             }
-            let key = (m.name, m.unit);
+            let key = (m.section, m.name, m.unit);
             if seen_keys.insert(key) {
                 seen_in_sample.push((key, (m.value, m.display_name, m.format)));
             } else {
@@ -216,7 +219,7 @@ pub(super) fn aggregate_metrics(per_sample: &[Vec<MetricValue>]) -> Vec<MetricSu
 
     let mut summaries: Vec<(usize, MetricSummary)> = by_key
         .into_iter()
-        .map(|((name, unit), acc)| {
+        .map(|((section, name, unit), acc)| {
             let mut sorted = acc.values.clone();
             sorted.sort_by(|a, b| a.total_cmp(b));
             let n = sorted.len();
@@ -234,6 +237,7 @@ pub(super) fn aggregate_metrics(per_sample: &[Vec<MetricValue>]) -> Vec<MetricSu
                 MetricSummary {
                     name: name.to_string(),
                     unit: unit.to_string(),
+                    section: section.to_string(),
                     display_name: acc.display_name.to_string(),
                     format: acc.format,
                     mean,
@@ -279,11 +283,10 @@ pub(super) fn render_custom_metrics(stats: &BenchmarkStats) {
     }
 
     println!("  custom metrics:");
-    let mut table = TableFormatter::new(
-        vec!["Metric", "Mean", "Median", "P95", "Min", "Max", "Unit", "N"],
-        vec![22, 12, 12, 12, 12, 12, 10, 5],
-    )
-    .with_alignments(vec![
+    let show_section = stats.metrics.iter().any(|m| !m.section.is_empty());
+    let mut headers = vec!["Metric", "Mean", "Median", "P95", "Min", "Max", "Unit", "N"];
+    let mut widths = vec![22, 12, 12, 12, 12, 12, 10, 5];
+    let mut alignments = vec![
         Alignment::Left,
         Alignment::Right,
         Alignment::Right,
@@ -292,7 +295,13 @@ pub(super) fn render_custom_metrics(stats: &BenchmarkStats) {
         Alignment::Right,
         Alignment::Left,
         Alignment::Right,
-    ]);
+    ];
+    if show_section {
+        headers.insert(0, "Section");
+        widths.insert(0, 18);
+        alignments.insert(0, Alignment::Left);
+    }
+    let mut table = TableFormatter::new(headers, widths).with_alignments(alignments);
 
     for m in &stats.metrics {
         let label = if m.display_name.is_empty() {
@@ -300,16 +309,27 @@ pub(super) fn render_custom_metrics(stats: &BenchmarkStats) {
         } else {
             &m.display_name
         };
-        table.add_row(vec![
-            &colorize_label(label),
-            &colorize_value(&format_metric_value(m.mean, m.format)),
-            &colorize_value(&format_metric_value(m.median, m.format)),
-            &colorize_value(&format_metric_value(m.p95, m.format)),
-            &colorize_value(&format_metric_value(m.min, m.format)),
-            &colorize_value(&format_metric_value(m.max, m.format)),
-            &m.unit,
-            &m.samples.to_string(),
-        ]);
+        let label = colorize_label(label);
+        let mean = colorize_value(&format_metric_value(m.mean, m.format));
+        let median = colorize_value(&format_metric_value(m.median, m.format));
+        let p95 = colorize_value(&format_metric_value(m.p95, m.format));
+        let min = colorize_value(&format_metric_value(m.min, m.format));
+        let max = colorize_value(&format_metric_value(m.max, m.format));
+        let samples = m.samples.to_string();
+        let mut row = vec![
+            label.as_str(),
+            mean.as_str(),
+            median.as_str(),
+            p95.as_str(),
+            min.as_str(),
+            max.as_str(),
+            m.unit.as_str(),
+            samples.as_str(),
+        ];
+        if show_section {
+            row.insert(0, m.section.as_str());
+        }
+        table.add_row(row);
     }
 
     table.print();
@@ -784,7 +804,10 @@ mod tests {
         let summary = aggregate_metrics(&per_sample);
         assert_eq!(summary.len(), 2);
         // Push order: zeta was pushed first, so it appears first.
-        assert_eq!(summary[0].name, "zeta", "expected push-order, not lexicographic");
+        assert_eq!(
+            summary[0].name, "zeta",
+            "expected push-order, not lexicographic"
+        );
         assert_eq!(summary[1].name, "alpha");
     }
 }

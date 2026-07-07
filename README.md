@@ -310,12 +310,23 @@ microbenchmarks. Three features work together to make GPU output less misleading
 
 **Per-sample custom metrics** (`g.bench_sample(name, f)`):
 - The bench function returns a `BenchSampleResult { operations, metrics }` instead of `()`.
-- `MetricValue` carries `name`, `value`, `unit`, an optional `display_name`, and a `format` hint
-  (`Number` or `Integer` for IDs/counts).
-- The runner aggregates per `(name, unit)` across samples into `MetricSummary` (mean, median, p95,
-  min, max, contributing sample count) and renders a `custom metrics:` table.
+- `MetricValue` carries `name`, `value`, `unit`, an optional `section`, an optional
+  `display_name`, and a `format` hint (`Number` or `Integer` for IDs/counts).
+- The runner aggregates per `(section, name, unit)` across samples into `MetricSummary` (mean,
+  median, p95, min, max, contributing sample count) and renders a `custom metrics:` table.
 - Bench-function metrics and backend-pushed metrics are merged into one table.
 - JSON persistence works through the existing `BenchmarkStats` serde derive.
+
+**Diagnostic replay metrics** (`g.diagnostic_pass(f)`):
+- Runs once after the normal timing samples, using the calibrated chunk size.
+- Metrics returned by the diagnostic pass are merged into the same custom metrics table.
+- `DiagnosticResult::new(section)` applies `section` as the default for metrics that do not set
+  their own section.
+- The diagnostic pass does not contribute to latency, throughput, CV, or outlier statistics, so it
+  can collect invasive counters without contaminating normal timing.
+- Use `g.diagnostic_samples(n)` to repeat noisy diagnostic counters.
+- The diagnostic pass is fallible; failures are reported as diagnostic metrics rather than timing
+  failures.
 
 ```rust
 fn my_gpu_bench(ctx: &mut GpuContext, chunk_size: usize, _chunk_num: usize) -> BenchSampleResult {
@@ -331,11 +342,21 @@ fn my_gpu_bench(ctx: &mut GpuContext, chunk_size: usize, _chunk_num: usize) -> B
         )
 }
 
+fn my_gpu_counter_replay(
+    ctx: &mut GpuContext,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> Result<DiagnosticResult, DiagnosticError> {
+    ctx.run_kernel_under_profiler(chunk_size)
+}
+
 benchmark_main!(|runner| {
     runner.group::<GpuContext>("cuBLASLt FP4", |g| {
         g.throughput(Throughput::bytes(8))
             .measurement_domain(MeasurementDomain::Gpu)
             .backend(|| Box::new(CudaEventBackend::new()))
+            .diagnostic_samples(3)
+            .diagnostic_pass(my_gpu_counter_replay)
             .bench_sample("fp4_gemm", my_gpu_bench);
     });
 });

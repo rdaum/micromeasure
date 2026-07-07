@@ -43,13 +43,14 @@ use std::{
     time::Duration,
 };
 
-#[cfg(target_os = "linux")]
-pub use perf::PerfCounters;
+pub use backend::{
+    DiagnosticError, DiagnosticResult, MeasurementBackend, MeasurementDomain, MetricFormat,
+    MetricValue, WallClockBackend,
+};
 #[cfg(target_os = "linux")]
 pub use perf::LinuxPerfBackend;
-pub use backend::{
-    MeasurementBackend, MeasurementDomain, MetricFormat, MetricValue, WallClockBackend,
-};
+#[cfg(target_os = "linux")]
+pub use perf::PerfCounters;
 
 /// Construct the platform-default [`MeasurementBackend`].
 ///
@@ -81,6 +82,8 @@ const MAX_SAMPLES: usize = 100;
 
 type BenchFunction<T> = fn(&mut T, usize, usize);
 type BenchSampleFunction<T> = fn(&mut T, usize, usize) -> crate::bench::backend::BenchSampleResult;
+type DiagnosticPassFunction<T> =
+    fn(&mut T, usize, usize) -> Result<DiagnosticResult, DiagnosticError>;
 type ConcurrentBenchFunction<T> = fn(&T, &ConcurrentBenchControl) -> ConcurrentWorkerResult;
 
 #[derive(Clone, Copy)]
@@ -693,8 +696,8 @@ fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
     // emit them (e.g. a CUDA event backend) OR the measurement domain is
     // Gpu. Mixed domain keeps diagnostics (with [host] prefix) unless the
     // backend explicitly opts out via emits_cpu_diagnostics.
-    let suppress_cpu_pmu = !stats.emits_cpu_diagnostics
-        || matches!(stats.measurement_domain, MeasurementDomain::Gpu);
+    let suppress_cpu_pmu =
+        !stats.emits_cpu_diagnostics || matches!(stats.measurement_domain, MeasurementDomain::Gpu);
 
     if !suppress_cpu_pmu
         && stats.has_cycles
@@ -1031,6 +1034,47 @@ fn execute_standard_sample_with_metrics<T: BenchContext>(
     (results, metrics)
 }
 
+fn execute_diagnostic_pass<T: BenchContext, F: Fn() -> T + ?Sized>(
+    diagnostic_pass: Option<DiagnosticPassFunction<T>>,
+    factory: &F,
+    chunk_size: usize,
+    diagnostic_samples: usize,
+) -> Vec<Vec<MetricValue>> {
+    let Some(diagnostic_pass) = diagnostic_pass else {
+        return Vec::new();
+    };
+
+    let mut all_metrics = Vec::new();
+    for sample in 0..diagnostic_samples {
+        let mut prepared = factory();
+        match black_box(|| diagnostic_pass(&mut prepared, chunk_size, sample))() {
+            Ok(result) => {
+                let metrics = result
+                    .metrics
+                    .into_iter()
+                    .map(|metric| {
+                        if metric.section.is_empty() && !result.section.is_empty() {
+                            metric.with_section(result.section)
+                        } else {
+                            metric
+                        }
+                    })
+                    .collect();
+                all_metrics.push(metrics);
+            }
+            Err(_) => {
+                all_metrics.push(vec![
+                    MetricValue::integer("diagnostic_pass_failed", 1, "errors")
+                        .with_display_name("Diagnostic pass failed")
+                        .with_section("diagnostic"),
+                ]);
+                break;
+            }
+        }
+    }
+    all_metrics
+}
+
 fn execute_concurrent_timing_only<T: ConcurrentBenchContext + Sync>(
     prepared: &T,
     sample_duration: Duration,
@@ -1248,6 +1292,8 @@ impl BenchmarkRunner {
             throughput: Throughput::ops(),
             measurement_domain: MeasurementDomain::default(),
             backend_factory: None,
+            diagnostic_pass: None,
+            diagnostic_samples: 1,
             _marker: std::marker::PhantomData,
         };
         f(&group);
@@ -1292,6 +1338,8 @@ impl BenchmarkRunner {
             Throughput::ops(),
             MeasurementDomain::default(),
             default_backend(),
+            None,
+            1,
         );
     }
 
@@ -1310,6 +1358,8 @@ impl BenchmarkRunner {
             Throughput::ops(),
             MeasurementDomain::default(),
             default_backend(),
+            None,
+            1,
         );
     }
 
@@ -1323,6 +1373,8 @@ impl BenchmarkRunner {
         throughput: Throughput,
         measurement_domain: MeasurementDomain,
         mut backend: Box<dyn MeasurementBackend>,
+        diagnostic_pass: Option<DiagnosticPassFunction<T>>,
+        diagnostic_samples: usize,
     ) {
         if !self.should_run(name, group) {
             return;
@@ -1346,6 +1398,7 @@ impl BenchmarkRunner {
         let mut all_results = Vec::with_capacity(config.target_samples);
         let mut summed_results = Results::default();
         let mut running_throughput = config.estimated_throughput_per_sec;
+        let mut all_metrics: Vec<Vec<MetricValue>> = Vec::new();
 
         for sample in 0..config.target_samples {
             let mut prepared = factory();
@@ -1376,6 +1429,14 @@ impl BenchmarkRunner {
         clear_line();
         println!("  samples complete: {}", config.target_samples);
 
+        let diagnostic_metrics = execute_diagnostic_pass(
+            diagnostic_pass,
+            factory,
+            config.chunk_size,
+            diagnostic_samples,
+        );
+        all_metrics.extend(diagnostic_metrics);
+
         let stats = benchmark_stats_from_samples(
             &summed_results,
             &all_results,
@@ -1384,7 +1445,7 @@ impl BenchmarkRunner {
             measurement_domain,
             backend.measurement_label(),
             backend.emits_cpu_diagnostics(),
-            &[],
+            &all_metrics,
         );
         render_standard_results(name, &stats);
 
@@ -1415,10 +1476,7 @@ impl BenchmarkRunner {
     /// richer path is intended for GPU work and other cases where the
     /// measured closure knows facts only available after execution.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_sample_with_factory_and_throughput<
-        T: BenchContext,
-        F: Fn() -> T + ?Sized,
-    >(
+    pub fn run_sample_with_factory_and_throughput<T: BenchContext, F: Fn() -> T + ?Sized>(
         &self,
         name: &str,
         group: &str,
@@ -1427,6 +1485,8 @@ impl BenchmarkRunner {
         throughput: Throughput,
         measurement_domain: MeasurementDomain,
         mut backend: Box<dyn MeasurementBackend>,
+        diagnostic_pass: Option<DiagnosticPassFunction<T>>,
+        diagnostic_samples: usize,
     ) {
         if !self.should_run(name, group) {
             return;
@@ -1489,6 +1549,14 @@ impl BenchmarkRunner {
 
         clear_line();
         println!("  samples complete: {}", config.target_samples);
+
+        let diagnostic_metrics = execute_diagnostic_pass(
+            diagnostic_pass,
+            factory,
+            config.chunk_size,
+            diagnostic_samples,
+        );
+        all_metrics.extend(diagnostic_metrics);
 
         let stats = benchmark_stats_from_samples(
             &summed_results,
@@ -1708,6 +1776,8 @@ pub struct BenchmarkGroup<'a, T: BenchContext> {
     throughput: Throughput,
     measurement_domain: MeasurementDomain,
     backend_factory: Option<Rc<dyn Fn() -> Box<dyn MeasurementBackend>>>,
+    diagnostic_pass: Option<DiagnosticPassFunction<T>>,
+    diagnostic_samples: usize,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -1717,6 +1787,8 @@ pub struct BenchmarkGroupWithFactory<'a, 'f, T: BenchContext, F: Fn() -> T + ?Si
     throughput: Throughput,
     measurement_domain: MeasurementDomain,
     backend_factory: Option<Rc<dyn Fn() -> Box<dyn MeasurementBackend>>>,
+    diagnostic_pass: Option<DiagnosticPassFunction<T>>,
+    diagnostic_samples: usize,
     factory: &'f F,
 }
 
@@ -1728,6 +1800,8 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             throughput,
             measurement_domain: self.measurement_domain,
             backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
             _marker: std::marker::PhantomData,
         }
     }
@@ -1744,6 +1818,8 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             throughput: self.throughput.clone(),
             measurement_domain,
             backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
             _marker: std::marker::PhantomData,
         }
     }
@@ -1789,6 +1865,41 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             throughput: self.throughput.clone(),
             measurement_domain: self.measurement_domain,
             backend_factory: Some(Rc::new(backend_factory)),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Supply a diagnostic replay pass for this group.
+    ///
+    /// The runner executes this once after the normal timing samples finish,
+    /// using the calibrated chunk size. Metrics returned by this pass are
+    /// aggregated and rendered with the normal custom metrics, but they do not
+    /// contribute to latency, throughput, or sample stability statistics.
+    pub fn diagnostic_pass(&self, diagnostic_pass: DiagnosticPassFunction<T>) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: Some(diagnostic_pass),
+            diagnostic_samples: self.diagnostic_samples,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn diagnostic_samples(&self, diagnostic_samples: usize) -> Self {
+        assert!(diagnostic_samples > 0, "diagnostic_samples must be > 0");
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples,
             _marker: std::marker::PhantomData,
         }
     }
@@ -1803,6 +1914,8 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             throughput: self.throughput.clone(),
             measurement_domain: self.measurement_domain,
             backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
             factory,
         }
     }
@@ -1830,6 +1943,8 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             self.throughput.clone(),
             self.measurement_domain,
             self.make_backend(),
+            self.diagnostic_pass,
+            self.diagnostic_samples,
         );
     }
 
@@ -1854,6 +1969,8 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
             self.throughput.clone(),
             self.measurement_domain,
             self.make_backend(),
+            self.diagnostic_pass,
+            self.diagnostic_samples,
         );
     }
 
@@ -1892,6 +2009,8 @@ impl<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> BenchmarkGroupWithFactory<'
             throughput,
             measurement_domain: self.measurement_domain,
             backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
             factory: self.factory,
         }
     }
@@ -1905,6 +2024,8 @@ impl<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> BenchmarkGroupWithFactory<'
             throughput: self.throughput.clone(),
             measurement_domain,
             backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
             factory: self.factory,
         }
     }
@@ -1921,6 +2042,41 @@ impl<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> BenchmarkGroupWithFactory<'
             throughput: self.throughput.clone(),
             measurement_domain: self.measurement_domain,
             backend_factory: Some(Rc::new(backend_factory)),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
+            factory: self.factory,
+        }
+    }
+
+    /// Supply a diagnostic replay pass for this group.
+    ///
+    /// The runner executes this once after the normal timing samples finish,
+    /// using the calibrated chunk size. Metrics returned by this pass are
+    /// aggregated and rendered with the normal custom metrics, but they do not
+    /// contribute to latency, throughput, or sample stability statistics.
+    pub fn diagnostic_pass(&self, diagnostic_pass: DiagnosticPassFunction<T>) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: Some(diagnostic_pass),
+            diagnostic_samples: self.diagnostic_samples,
+            factory: self.factory,
+        }
+    }
+
+    pub fn diagnostic_samples(&self, diagnostic_samples: usize) -> Self {
+        assert!(diagnostic_samples > 0, "diagnostic_samples must be > 0");
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples,
             factory: self.factory,
         }
     }
@@ -1941,6 +2097,8 @@ impl<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> BenchmarkGroupWithFactory<'
             self.throughput.clone(),
             self.measurement_domain,
             self.make_backend(),
+            self.diagnostic_pass,
+            self.diagnostic_samples,
         );
     }
 
@@ -1957,6 +2115,8 @@ impl<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> BenchmarkGroupWithFactory<'
             self.throughput.clone(),
             self.measurement_domain,
             self.make_backend(),
+            self.diagnostic_pass,
+            self.diagnostic_samples,
         );
     }
 }
@@ -2235,8 +2395,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MeasurementDomain, Throughput};
     use super::stats::{median, median_absolute_deviation, percentile, tukey_outlier_count};
+    use super::{DiagnosticError, DiagnosticResult, MeasurementDomain, MetricValue, Throughput};
 
     use crate::BenchmarkStats;
 
@@ -2299,12 +2459,10 @@ mod tests {
         // On CPU domain, at least one CPU-PMU bottleneck (memory latency,
         // branch/predictor, iCache pressure, low IPC) should fire.
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.contains("memory latency")
-                    || d.contains("branch predictor")
-                    || d.contains("instruction-cache")
-                    || d.contains("Low IPC")),
+            diagnostics.iter().any(|d| d.contains("memory latency")
+                || d.contains("branch predictor")
+                || d.contains("instruction-cache")
+                || d.contains("Low IPC")),
             "expected CPU-PMU bottleneck diagnostic for Cpu domain, got: {diagnostics:?}"
         );
     }
@@ -2334,12 +2492,13 @@ mod tests {
         let diagnostics = super::diagnose_stats(&stats);
         // Mixed domain emits CPU-PMU diagnostics but tags them as host-side
         // context so a reader does not read them as the primary bottleneck.
-        let any_cpu_pmu_prefixed = diagnostics
-            .iter()
-            .any(|d| d.starts_with("[host] ") && (d.contains("memory latency")
-                || d.contains("branch predictor")
-                || d.contains("instruction-cache")
-                || d.contains("Low IPC")));
+        let any_cpu_pmu_prefixed = diagnostics.iter().any(|d| {
+            d.starts_with("[host] ")
+                && (d.contains("memory latency")
+                    || d.contains("branch predictor")
+                    || d.contains("instruction-cache")
+                    || d.contains("Low IPC"))
+        });
         assert!(
             any_cpu_pmu_prefixed,
             "expected at least one [host]-prefixed CPU-PMU diagnostic for Mixed domain, got: {diagnostics:?}"
@@ -2434,6 +2593,8 @@ mod tests {
             Throughput::ops(),
             MeasurementDomain::Cpu,
             Box::new(crate::WallClockBackend::new()),
+            None,
+            1,
         );
 
         let results = runner.results();
@@ -2449,9 +2610,70 @@ mod tests {
             names.contains(&"cuda_event_ms"),
             "expected cuda_event_ms in {names:?}"
         );
-        assert!(
-            names.contains(&"tflops"),
-            "expected tflops in {names:?}"
+        assert!(names.contains(&"tflops"), "expected tflops in {names:?}");
+    }
+
+    #[test]
+    fn diagnostic_pass_populates_metrics_without_timing_samples() {
+        use std::time::Duration;
+
+        struct DummyCtx;
+        impl crate::BenchContext for DummyCtx {
+            fn prepare(_num_chunks: usize) -> Self {
+                DummyCtx
+            }
+            fn chunk_size() -> Option<usize> {
+                Some(1_000)
+            }
+        }
+
+        fn timed_bench(_ctx: &mut DummyCtx, chunk_size: usize, _chunk_num: usize) {
+            let mut value = 0usize;
+            for i in 0..chunk_size {
+                value = value.wrapping_add(i);
+            }
+            std::hint::black_box(value);
+        }
+
+        fn diagnostic_bench(
+            _ctx: &mut DummyCtx,
+            chunk_size: usize,
+            _chunk_num: usize,
+        ) -> Result<DiagnosticResult, DiagnosticError> {
+            timed_bench(_ctx, chunk_size, _chunk_num);
+            Ok(DiagnosticResult::new("gpu counters")
+                .push_metric(MetricValue::new("dram_pct", 72.0, "%").with_display_name("DRAM %")))
+        }
+
+        let runner = crate::BenchmarkRunner::new().with_runtime(crate::BenchmarkRuntimeOptions {
+            warm_up_duration: Duration::from_millis(10),
+            benchmark_duration: Duration::from_millis(50),
+            min_samples: 3,
+            max_samples: 5,
+        });
+
+        runner.group::<DummyCtx>("test", |g| {
+            g.diagnostic_pass(diagnostic_bench)
+                .bench("timed_then_diagnostic", timed_bench);
+        });
+
+        let results = runner.results();
+        assert_eq!(results.len(), 1, "expected exactly one result");
+        let stats = &results[0].stats;
+        assert_eq!(
+            stats.samples, 3,
+            "diagnostic pass must not add timing samples"
         );
+
+        let metric = stats
+            .metrics
+            .iter()
+            .find(|m| m.name == "dram_pct")
+            .expect("expected diagnostic metric");
+        assert_eq!(
+            metric.samples, 1,
+            "diagnostic metric should come from one replay pass"
+        );
+        assert_eq!(metric.median, 72.0);
     }
 }

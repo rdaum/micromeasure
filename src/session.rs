@@ -155,6 +155,8 @@ pub struct WorkerCounterSummary {
 pub struct MetricSummary {
     pub name: String,
     pub unit: String,
+    #[serde(default)]
+    pub section: String,
     /// Human-readable label for table rendering, or empty to use `name`.
     #[serde(default)]
     pub display_name: String,
@@ -387,9 +389,7 @@ impl BenchmarkReport {
             // Key custom metrics table: shows median of each custom metric
             // for benchmarks that use bench_sample(). Compact format so it
             // fits alongside the main throughput/latency table.
-            let has_metrics = group_results
-                .iter()
-                .any(|r| !r.stats.metrics.is_empty());
+            let has_metrics = group_results.iter().any(|r| !r.stats.metrics.is_empty());
             if has_metrics {
                 let mut metric_table = TableFormatter::new(
                     vec!["Benchmark", "Metric", "Median", "Unit"],
@@ -404,13 +404,18 @@ impl BenchmarkReport {
                 for result in &group_results {
                     for m in &result.stats.metrics {
                         let label = if m.display_name.is_empty() {
-                            &m.name
+                            m.name.clone()
                         } else {
-                            &m.display_name
+                            m.display_name.clone()
+                        };
+                        let label = if m.section.is_empty() {
+                            label
+                        } else {
+                            format!("{} / {}", m.section, label)
                         };
                         metric_table.add_row(vec![
                             &colorize_label(&result.name),
-                            &colorize_value(label),
+                            &colorize_value(&label),
                             &colorize_value(&format_summary_metric(m)),
                             &m.unit,
                         ]);

@@ -37,6 +37,8 @@ pub use bench::{
     CounterValue, DiagnosticError, DiagnosticResult, MeasurementBackend, MeasurementDomain,
     MetricFormat, MetricValue, NoContext, Throughput, WallClockBackend,
 };
+#[cfg(feature = "cuda")]
+pub use bench::{CudaError, CudaEvent, CudaEventBackend, CudaResult};
 pub use launcher::{
     BenchmarkMainOptions, benchmark_filter_from_args, benchmark_filter_from_env, run_benchmark_main,
 };

@@ -32,9 +32,9 @@
 //!
 //! The [`MeasurementBackend`] trait lets a benchmark plug in a backend that
 //! owns the measurement window without forcing CUDA (or any other device
-//! API) to become a dependency of `micromeasure` itself. The crate ships a
-//! wall-clock fallback; a CUDA adapter lives in consuming code or behind a
-//! feature.
+//! API) to become a dependency of normal `micromeasure` builds. The crate
+//! ships a wall-clock fallback and an optional
+//! [`CudaEventBackend`](crate::CudaEventBackend) behind the `cuda` feature.
 //!
 //! # Trait shape
 //!
@@ -407,9 +407,9 @@ pub enum MeasurementDomain {
 ///
 /// ## Example: a CUDA event backend
 ///
-/// This is sketch code showing how a consuming crate would implement the
-/// trait without CUDA becoming a dependency of `micromeasure`. The actual
-/// adapter would live behind a `cuda` feature in the consuming crate.
+/// This is sketch code showing the shape of a CUDA event backend. For CUDA
+/// default-stream benchmarks, enable `micromeasure`'s `cuda` feature and use
+/// [`crate::CudaEventBackend`] instead of writing this adapter by hand.
 ///
 /// ```ignore
 /// use micromeasure::bench::backend::{MeasurementBackend, MetricValue, Results};

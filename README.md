@@ -72,6 +72,7 @@ am sharing it.
 - persisted benchmark reports with per-sample throughput and latency series
 - side-by-side comparison against the latest compatible saved report
 - GPU benchmarking with pluggable measurement backends (CUDA event timing, custom metrics)
+- optional built-in CUDA event backend behind the `cuda` feature
 - per-sample custom metrics (e.g. `cuda_event_ms`, `tflops`, `host_overhead_ms`) with aggregation and JSON persistence
 - measurement domain tagging (`Cpu`, `Gpu`, `Mixed`) that suppresses or relabels CPU-PMU diagnostics for GPU work
 
@@ -135,6 +136,7 @@ For GPU benchmarking examples, run:
 cargo run --example gpu_domain --release        # measurement domain: suppress CPU-PMU diagnostics
 cargo run --example custom_metrics --release     # per-sample custom metrics with bench_sample()
 cargo run --example custom_backend --release     # pluggable MeasurementBackend (simulated CUDA events)
+cargo run --example cuda_event_backend --features cuda --release
 ```
 
 In a consuming crate, you would usually run your benchmark with:
@@ -302,9 +304,10 @@ microbenchmarks. Three features work together to make GPU output less misleading
   `collect()` per sample.
 - Default on Linux is `LinuxPerfBackend` (perf-event group + individual-counter fallback). On other
   platforms it falls back to `WallClockBackend` (timing-only).
-- A CUDA event adapter (implemented in consuming code) records `cudaEventRecord` in `begin()` /
-  `end()`, computes elapsed in `collect()`, and pushes `cuda_event_ms` and `host_overhead_ms` as
-  custom metrics. No CUDA dependency in `micromeasure` itself.
+- `CudaEventBackend` is available behind the `cuda` feature. It records `cudaEventRecord` in
+  `begin()` / `end()`, computes elapsed in `collect()`, uses device elapsed time as the benchmark
+  sample duration, and pushes `cuda_event_ms`, `host_overhead_ms`, `gpu_gib_s`, and `gpu_tflops`
+  as custom metrics. Normal builds do not link CUDA; enabling `cuda` links against `cudart`.
 - The backend's `measurement_label()` (e.g. `"timing + CUDA events"`) is shown in the
   `Measurement` row.
 
@@ -354,7 +357,7 @@ benchmark_main!(|runner| {
     runner.group::<GpuContext>("cuBLASLt FP4", |g| {
         g.throughput(Throughput::bytes(8))
             .measurement_domain(MeasurementDomain::Gpu)
-            .backend(|| Box::new(CudaEventBackend::new()))
+            .backend(|| Box::new(CudaEventBackend::new(8, 16).unwrap()))
             .diagnostic_samples(3)
             .diagnostic_pass(my_gpu_counter_replay)
             .bench_sample("fp4_gemm", my_gpu_bench);

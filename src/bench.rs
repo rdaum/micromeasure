@@ -14,6 +14,8 @@
 
 mod affinity;
 pub(crate) mod backend;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod perf;
 mod stats;
 
@@ -47,6 +49,8 @@ pub use backend::{
     DiagnosticError, DiagnosticResult, MeasurementBackend, MeasurementDomain, MetricFormat,
     MetricValue, WallClockBackend,
 };
+#[cfg(feature = "cuda")]
+pub use cuda::{CudaError, CudaEvent, CudaEventBackend, CudaResult};
 #[cfg(target_os = "linux")]
 pub use perf::LinuxPerfBackend;
 #[cfg(target_os = "linux")]

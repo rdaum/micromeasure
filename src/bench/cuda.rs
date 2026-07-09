@@ -155,8 +155,8 @@ impl CudaEventBackend {
     /// Creates a CUDA event backend.
     ///
     /// `bytes_per_op` and `flops_per_op` describe one operation reported by
-    /// the benchmark closure. They are used to derive `gpu_gib_s` and
-    /// `gpu_tflops` from CUDA event elapsed time.
+    /// the benchmark closure. Non-zero values are used to derive `gpu_gib_s`
+    /// and `gpu_tflops` from CUDA event elapsed time.
     pub fn new(bytes_per_op: u64, flops_per_op: u64) -> CudaResult<Self> {
         Ok(Self {
             start: CudaEvent::new()?,
@@ -250,14 +250,18 @@ impl MeasurementBackend for CudaEventBackend {
             MetricValue::duration_ms("host_overhead_ms", host_overhead)
                 .with_display_name("Host overhead"),
         );
-        metrics.push(
-            MetricValue::bandwidth_gib_s("gpu_gib_s", total_bytes, device_seconds)
-                .with_display_name("GPU bandwidth"),
-        );
-        metrics.push(
-            MetricValue::throughput_tflops("gpu_tflops", total_flops, device_seconds)
-                .with_display_name("GPU throughput"),
-        );
+        if total_bytes > 0 {
+            metrics.push(
+                MetricValue::bandwidth_gib_s("gpu_gib_s", total_bytes, device_seconds)
+                    .with_display_name("GPU bandwidth"),
+            );
+        }
+        if total_flops > 0 {
+            metrics.push(
+                MetricValue::throughput_tflops("gpu_tflops", total_flops, device_seconds)
+                    .with_display_name("GPU throughput"),
+            );
+        }
     }
 
     fn measurement_label(&self) -> &'static str {

@@ -306,8 +306,9 @@ microbenchmarks. Three features work together to make GPU output less misleading
   platforms it falls back to `WallClockBackend` (timing-only).
 - `CudaEventBackend` is available behind the `cuda` feature. It records `cudaEventRecord` in
   `begin()` / `end()`, computes elapsed in `collect()`, uses device elapsed time as the benchmark
-  sample duration, and pushes `cuda_event_ms`, `host_overhead_ms`, `gpu_gib_s`, and `gpu_tflops`
-  as custom metrics. Normal builds do not link CUDA; enabling `cuda` links against `cudart`.
+  sample duration, and pushes `cuda_event_ms`, `host_overhead_ms`, plus derived `gpu_gib_s` and
+  `gpu_tflops` metrics when bytes/FLOPs per operation are configured. Normal builds do not link
+  CUDA; enabling `cuda` links against `cudart`.
 - The backend's `measurement_label()` (e.g. `"timing + CUDA events"`) is shown in the
   `Measurement` row.
 

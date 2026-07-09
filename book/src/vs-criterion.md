@@ -9,7 +9,7 @@
 - you are working on internal value operations, cache lookups, symbol tables, allocators, or similar hot paths
 - you want a small custom benchmark binary that you control directly
 - you want immediate "last run vs this run" output from persisted sample data, without a separate baseline workflow
-- you are benchmarking GPU work and want device-event timing, host/device latency split, and domain-specific metrics in the same report
+- you are benchmarking GPU work and want device-event timing, host/device latency split, optional NVIDIA counter diagnostics, and domain-specific metrics in the same report
 
 ## Use Criterion when
 
@@ -27,7 +27,7 @@ That simultaneous view is the whole point for the kind of work `micromeasure` wa
 
 ## The GPU difference
 
-Criterion does not have first-class support for device-event timing, host/device latency split, measurement-domain tagging, or per-sample custom metrics. `micromeasure`'s `MeasurementBackend` trait, `MeasurementDomain`, `bench_sample`/`BenchSampleResult`, and `CudaEventBackend` were designed together for this. See [GPU Benchmarks](./gpu.md) and [GPU Benchmarking Sharp Edges](./gpu-sharp-edges.md).
+Criterion does not have first-class support for device-event timing, host/device latency split, measurement-domain tagging, diagnostic replay counters, or per-sample custom metrics. `micromeasure`'s `MeasurementBackend` trait, `MeasurementDomain`, `bench_sample`/`BenchSampleResult`, `CudaEventBackend`, and `GpuCounterCollector` were designed together for this. See [GPU Benchmarks](./gpu.md) and [GPU Benchmarking Sharp Edges](./gpu-sharp-edges.md).
 
 If GPU benchmarking is not relevant to you, this difference doesn't matter.
 

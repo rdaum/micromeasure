@@ -26,6 +26,7 @@ unicode-width = "0.2"
 [features]
 default = []
 cuda = []
+gpu-counters = ["cuda"]
 
 [target.'cfg(all(target_os = "linux"))'.dependencies]
 perf-event2 = "0.7"
@@ -33,3 +34,7 @@ perf-event2 = "0.7"
 [[example]]
 name = "cuda_event_backend"
 required-features = ["cuda"]
+
+[[example]]
+name = "gpu_counters"
+required-features = ["gpu-counters"]

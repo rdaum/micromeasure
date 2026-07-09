@@ -162,6 +162,40 @@ g.diagnostic_samples(3)
 
 See `src/bench.rs` around `execute_diagnostic_sample` for the exact wiring. The pass runs on the same measuring thread as the timing samples, with the same backend — the backend's `begin`/`end` are called around it, but the resulting `Results` are not fed into the stats aggregation.
 
+When the `gpu-counters` feature is enabled, `GpuCounterCollector` provides a CUPTI/NVPerf range-profiler wrapper designed for this path. It may need multiple user replay passes:
+
+```rust,ignore
+loop {
+    collector.begin()?;
+    run_workload();
+    if collector.end()? {
+        break;
+    }
+}
+```
+
+The collector evaluates the configured range after all passes complete and maps the default NVIDIA metric set into stable micromeasure names such as `gpu_memory_peak_pct`, `gpu_l2_peak_pct`, `gpu_sm_peak_pct`, and `gpu_tensor_active_pct`.
+
+## NVIDIA counter permissions are environment-dependent
+
+### The problem
+
+NVIDIA performance counters are often restricted by driver policy. On locked-down systems, CUPTI/NVPerf setup can fail with errors such as `ERR_NVGPUCTRPERM` or `CUPTI_ERROR_INSUFFICIENT_PRIVILEGES`. Metric availability can also vary by GPU architecture and driver.
+
+This is different from a benchmark failure: the workload may be perfectly runnable, while the optional diagnostic counters are unavailable.
+
+### The mitigation
+
+`GpuCounterError` categorizes common failures, and `GpuCounterError::into_diagnostic_result()` converts them into integer diagnostic metrics:
+
+- `gpu_counter_permission_error`
+- `gpu_counter_metric_error`
+- `gpu_counter_profiler_error`
+- `gpu_counter_collection_error`
+- `gpu_counter_invalid_name`
+
+Use that conversion inside `diagnostic_pass` when you want timing to remain usable even if counters are unavailable. See [gpu_counters](./examples/gpu-counters.md).
+
 ## `MeasurementBackend` is not wired into the concurrent path
 
 ### The problem (current limitation)
@@ -209,6 +243,7 @@ For most metrics this is fine. For categorical or count-valued metrics (algorith
 | Host wall-clock != device time | `MeasurementBackend` duration contract; `CudaEventBackend` | `src/bench/backend.rs`, `src/bench/cuda.rs` |
 | No per-sample custom metrics | `bench_sample` + `BenchSampleResult` + `MetricValue` | `src/bench/backend.rs` |
 | Invasive counters contaminate timing | `diagnostic_pass` + `diagnostic_samples` | `src/bench.rs` |
+| NVIDIA counter permissions vary | `GpuCounterError::into_diagnostic_result()` | `src/bench/gpu_counters.rs` |
 | `MeasurementBackend` not on concurrent path | (none yet — use single-threaded `bench_sample`) | `src/bench/backend.rs` trait docs |
 | `CudaEventBackend` default stream only | (none yet — write a custom backend for multi-stream) | `src/bench/cuda.rs` |
 | `MetricValue` is `f64`-only | `MetricFormat::Integer` for rendering; avoid > 2^53 raw counts | `src/bench/backend.rs` |

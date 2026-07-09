@@ -84,6 +84,9 @@ Throughput::per_operation(amount, unit)    // arbitrary unit
 | `PerfCounters` | Low-level perf counter handle. Linux only. | `src/bench/perf.rs` |
 | `CudaEventBackend` | CUDA event timing on default stream. `cuda` feature. | `src/bench/cuda.rs` |
 | `CudaEvent` / `CudaError` / `CudaResult` | CUDA runtime helpers. `cuda` feature. | `src/bench/cuda.rs` |
+| `GpuCounterCollector` | CUPTI/NVPerf range-profiler collector for diagnostic passes. `gpu-counters` feature. | `src/bench/gpu_counters.rs` |
+| `GpuCounterMetric` / `GpuCounterError` / `GpuCounterResult` | Evaluated GPU counter values and errors. `gpu-counters` feature. | `src/bench/gpu_counters.rs` |
+| `DEFAULT_NVIDIA_GPU_COUNTERS` | Default NVIDIA metric set mapped to stable micromeasure names. `gpu-counters` feature. | `src/bench/gpu_counters.rs` |
 
 ## Per-sample custom metrics
 

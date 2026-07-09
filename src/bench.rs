@@ -16,6 +16,8 @@ mod affinity;
 pub(crate) mod backend;
 #[cfg(feature = "cuda")]
 mod cuda;
+#[cfg(feature = "gpu-counters")]
+mod gpu_counters;
 mod perf;
 mod stats;
 
@@ -51,6 +53,11 @@ pub use backend::{
 };
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaError, CudaEvent, CudaEventBackend, CudaResult};
+#[cfg(feature = "gpu-counters")]
+pub use gpu_counters::{
+    DEFAULT_NVIDIA_GPU_COUNTERS, GpuCounterCollector, GpuCounterError, GpuCounterMetric,
+    GpuCounterResult,
+};
 #[cfg(target_os = "linux")]
 pub use perf::LinuxPerfBackend;
 #[cfg(target_os = "linux")]

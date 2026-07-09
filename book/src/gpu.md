@@ -6,7 +6,7 @@
 2. **`MeasurementBackend`** — pluggable measurement window around the bench closure. The built-in `CudaEventBackend` records CUDA events on the default stream and uses device elapsed time as the sample duration.
 3. **Per-sample custom metrics** — `bench_sample(...)` lets the bench return a `BenchSampleResult` carrying `operations` plus named metrics (`cuda_event_ms`, `tflops`, ...). The runner aggregates them across samples and renders a `custom metrics:` table.
 
-There is also a **diagnostic replay pass** for collecting invasive counters without contaminating timing.
+There is also a **diagnostic replay pass** for collecting invasive counters without contaminating timing. With the `gpu-counters` feature, that pass can use CUPTI/NVPerf range-profiler counters.
 
 These features are independent: you can use `MeasurementDomain::Gpu` with the default backend, or a custom backend with `MeasurementDomain::Cpu`, etc. But they are designed to compose for GPU work.
 
@@ -103,6 +103,38 @@ On a CUDA error it records `cuda_error_code` as a metric instead of crashing the
 
 See [cuda_event_backend](./examples/cuda-event-backend.md) for a runnable example using real `cudaMemsetAsync` on the default stream.
 
+### Built-in GPU counter collector
+
+Available behind the `gpu-counters` feature. `GpuCounterCollector` wraps NVIDIA CUPTI/NVPerf range profiling for diagnostic replay passes:
+
+```rust,ignore
+let mut collector =
+    GpuCounterCollector::new(DEFAULT_NVIDIA_GPU_COUNTERS, "my_range")?;
+loop {
+    collector.begin()?;
+    run_workload();
+    if collector.end()? {
+        break;
+    }
+}
+for metric in collector.decode()? {
+    result = result.push_metric(metric.to_metric_value());
+}
+```
+
+The default metric set maps NVIDIA profiler metric names into stable micromeasure metric names:
+
+| NVIDIA metric | micromeasure metric |
+|---|---|
+| `gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed` | `gpu_memory_peak_pct` |
+| `lts__throughput.avg.pct_of_peak_sustained_elapsed` | `gpu_l2_peak_pct` |
+| `sm__throughput.avg.pct_of_peak_sustained_elapsed` | `gpu_sm_peak_pct` |
+| `sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_active` | `gpu_tensor_active_pct` |
+
+`GpuCounterError::into_diagnostic_result()` converts counter setup, permission, metric, and collection failures into integer diagnostic metrics so a locked-down system can still run the timing benchmark.
+
+See [gpu_counters](./examples/gpu-counters.md) for a runnable example.
+
 ### Writing a custom backend
 
 The trait is object-safe; a runner can hold `Box<dyn MeasurementBackend>`. See [custom_backend](./examples/custom-backend.md) for a simulated CUDA event backend that needs no CUDA dependency — it records a fake device elapsed time and pushes `cuda_event_ms` / `host_overhead_ms` from `collect`.
@@ -176,7 +208,7 @@ See [custom_metrics](./examples/custom-metrics.md) for a complete runnable examp
 
 ## Diagnostic replay pass
 
-Some counters are too invasive to collect in the timing loop (e.g. enabling CUPTI profiling changes kernel launch latency). The diagnostic pass lets you collect them in a separate run that does not contaminate the timing statistics.
+Some counters are too invasive to collect in the timing loop (e.g. enabling CUPTI/NVPerf profiling changes kernel launch latency and may require replay passes). The diagnostic pass lets you collect them in a separate run that does not contaminate the timing statistics.
 
 ```rust,ignore
 g.diagnostic_samples(3)
@@ -235,8 +267,10 @@ The pieces compose:
 - `CudaEventBackend` provides device-side timing, sets `results.duration` to the device event time, and pushes `cuda_event_ms` / `host_overhead_ms` / `gpu_gib_s` / `gpu_tflops`.
 - `bench_sample` lets the bench add its own metrics (e.g. `selected_algo_id`, bench-specific TFLOP/s).
 - `diagnostic_pass` collects invasive counters in a separate run.
+- `GpuCounterCollector` can be used inside that diagnostic pass to report CUPTI/NVPerf counters when the `gpu-counters` feature is enabled.
 
 ## Limitations
 
 - The `MeasurementBackend` trait is wired into the **single-threaded** path only. The concurrent path does not yet use it. See [GPU Benchmarking Sharp Edges](./gpu-sharp-edges.md#measurementbackend-is-not-wired-into-the-concurrent-path).
 - `CudaEventBackend` uses the **default stream** only. Multi-stream work would need a custom backend or an extension.
+- `GpuCounterCollector` is NVIDIA-only and uses CUPTI/NVPerf. It may require driver counter permissions; permission failures should be treated as diagnostic availability failures, not benchmark timing failures.

@@ -39,6 +39,11 @@ pub use bench::{
 };
 #[cfg(feature = "cuda")]
 pub use bench::{CudaError, CudaEvent, CudaEventBackend, CudaResult};
+#[cfg(feature = "gpu-counters")]
+pub use bench::{
+    DEFAULT_NVIDIA_GPU_COUNTERS, GpuCounterCollector, GpuCounterError, GpuCounterMetric,
+    GpuCounterResult,
+};
 pub use launcher::{
     BenchmarkMainOptions, benchmark_filter_from_args, benchmark_filter_from_env, run_benchmark_main,
 };

@@ -25,7 +25,7 @@ That means:
 - output that emphasizes instruction count, branch behaviour, cache misses, and timing together
 - benchmark binaries that can be filtered and run directly during systems work
 - persisted raw samples so you can compare a current run against the last compatible run immediately
-- GPU benchmarking with pluggable measurement backends, per-sample custom metrics, and measurement domain tagging
+- GPU benchmarking with pluggable measurement backends, per-sample custom metrics, measurement domain tagging, and optional NVIDIA GPU counter diagnostics
 
 ## Documentation
 
@@ -42,7 +42,7 @@ Quick orientation:
 - [Concepts](./book/src/concepts.md) — `BenchContext`, groups, throughput, runtime options, `black_box`
 - [Single-Threaded Benchmarks](./book/src/single-threaded.md)
 - [Concurrent Benchmarks](./book/src/concurrent.md)
-- [GPU Benchmarks](./book/src/gpu.md) — measurement domain, pluggable backend, custom metrics, diagnostic replay
+- [GPU Benchmarks](./book/src/gpu.md) — measurement domain, pluggable backend, custom metrics, GPU counters, diagnostic replay
 - [Linux PMU Setup](./book/src/linux-pmu.md) — `perf_event_paranoid`, capabilities, fallback
 - [Persisted Reports & Comparison](./book/src/reports.md)
 - [Examples](./book/src/examples.md) — one annotated walkthrough per runnable example
@@ -62,7 +62,7 @@ Use this crate when:
 - you are working on internal value operations, cache lookups, symbol tables, allocators, or similar hot paths
 - you want a small custom benchmark binary that you control directly
 - you want immediate "last run vs this run" output from persisted sample data
-- you are benchmarking GPU work and want device-event timing and host/device latency split
+- you are benchmarking GPU work and want device-event timing, host/device latency split, and optional NVIDIA counter diagnostics
 
 Use Criterion when:
 
@@ -130,8 +130,7 @@ Example output:
 
 ![micromeasure example output](screenshot.png)
 
-For more examples (concurrent, throughput units, GPU domain, custom metrics, custom backend, CUDA event backend),
-see [Examples](./book/src/examples.md).
+For more examples (concurrent, throughput units, GPU domain, custom metrics, custom backend, CUDA event backend, GPU counters), see [Examples](./book/src/examples.md).
 
 ## Linux-first, and why
 

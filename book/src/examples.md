@@ -1,6 +1,6 @@
 # Examples
 
-`micromeasure` ships ten runnable examples in [`examples/`](https://github.com/rdaum/micromeasure/tree/main/examples). Each demonstrates one feature in isolation so you can copy the shape that matches your workload.
+`micromeasure` ships eleven runnable examples in [`examples/`](https://github.com/rdaum/micromeasure/tree/main/examples). Each demonstrates one feature in isolation so you can copy the shape that matches your workload.
 
 Run any of them from the repo root. Add `--release` for realistic numbers.
 
@@ -16,6 +16,7 @@ Run any of them from the repo root. Add `--release` for realistic numbers.
 | [custom_metrics](./examples/custom-metrics.md) | `bench_sample` returning `BenchSampleResult` with `MetricValue`s |
 | [custom_backend](./examples/custom-backend.md) | Pluggable `MeasurementBackend` (simulated CUDA events, no CUDA link) |
 | [cuda_event_backend](./examples/cuda-event-backend.md) | Real `CudaEventBackend` with `cudaMemsetAsync` (needs `cuda` feature) |
+| [gpu_counters](./examples/gpu-counters.md) | CUPTI/NVPerf diagnostic counters (needs `gpu-counters` feature) |
 
 Each page below shows what the example demonstrates, the run command, a key code excerpt, and what to look for in the output.
 

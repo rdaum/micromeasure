@@ -147,7 +147,7 @@ pub struct WorkerCounterSummary {
 /// benchmark.
 ///
 /// This is the Phase 2 extension point for
-/// `docs/gpu-benchmarking-sharp-edges.md` ("No Per-Sample Custom Metrics"):
+/// `book/src/gpu-sharp-edges.md` ("No Per-Sample Custom Metrics"):
 /// benchmarks that report `cuda_event_ms`, `tflops`, `host_overhead_ms`,
 /// selected algorithm ID, etc. via [`crate::BenchSampleResult`] get them
 /// aggregated here and persisted in [`BenchmarkStats::metrics`].

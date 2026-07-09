@@ -670,7 +670,7 @@ fn colorize_problem(text: &str) -> String {
 
 /// Emit CPU-PMU-derived bottleneck diagnostics for a benchmark.
 ///
-/// Domain rules (see `docs/gpu-benchmarking-sharp-edges.md`):
+/// Domain rules (see `book/src/gpu-sharp-edges.md`):
 /// - `Cpu`: full historic diagnostics, unchanged.
 /// - `Gpu`: skip all CPU-PMU bottleneck diagnostics. The host thread's
 ///   counters describe launch/sync orchestration, not the measured GPU
@@ -1468,7 +1468,7 @@ impl BenchmarkRunner {
     /// `cuda_event_ms`, `tflops`, `host_overhead_ms`).
     ///
     /// This is the Phase 2 entry point of
-    /// `docs/gpu-benchmarking-sharp-edges.md` ("No Per-Sample Custom
+    /// `book/src/gpu-sharp-edges.md` ("No Per-Sample Custom
     /// Metrics"). It accepts a `BenchSampleFunction<T>` rather than the
     /// plain `BenchFunction<T>`, threads each sample's returned metrics
     /// through the same PMU/timing pipeline, aggregates them into
@@ -1812,7 +1812,7 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
 
     /// Declare what this group measures. The runner consults this to
     /// suppress or relabel CPU-PMU bottleneck diagnostics when the measured
-    /// operation is not CPU work (see `docs/gpu-benchmarking-sharp-edges.md`).
+    /// operation is not CPU work (see `book/src/gpu-sharp-edges.md`).
     /// Defaults to [`MeasurementDomain::Cpu`], preserving historical
     /// behavior.
     pub fn measurement_domain(&self, measurement_domain: MeasurementDomain) -> Self {

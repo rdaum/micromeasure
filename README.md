@@ -8,7 +8,7 @@
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink)](https://github.com/sponsors/rdaum)
 
 It is aimed at very focused operations where you care about instruction count, branch predictor behaviour, cache misses,
-and operation latency. It now also supports GPU benchmarks via pluggable measurement backends and per-sample custom metrics.
+and operation latency. It also supports GPU benchmarks via pluggable measurement backends and per-sample custom metrics.
 
 It grew out of the needs of my [`mooR`](https://codeberg.org/timbran/moor) project, where many of the interesting
 questions were about tiny operations and internal data-structure mechanics. The goal was to measure things like:
@@ -25,16 +25,35 @@ That means:
 - output that emphasizes instruction count, branch behaviour, cache misses, and timing together
 - benchmark binaries that can be filtered and run directly during systems work
 - persisted raw samples so you can compare a current run against the last compatible run immediately
+- GPU benchmarking with pluggable measurement backends, per-sample custom metrics, and measurement domain tagging
 
-> If `micromeasure` is useful in your work, consider sponsoring development on GitHub Sponsors.
-> I am also available for consulting in systems engineering, profiling and performance tuning, and
-> Rust development (10 years at Google, 25+ years in software development). 
-> If this project is useful or interesting for your team, feel free to reach out.
+## Documentation
+
+The full documentation lives in **[the mdbook](./book/src/SUMMARY.md)**. Build it locally with:
+
+```sh
+mdbook serve book --open
+```
+
+Quick orientation:
+
+- [Introduction](./book/src/introduction.md) — what this crate is, what it isn't
+- [Getting Started](./book/src/getting-started.md) — wire it up, write a bench, run it
+- [Concepts](./book/src/concepts.md) — `BenchContext`, groups, throughput, runtime options, `black_box`
+- [Single-Threaded Benchmarks](./book/src/single-threaded.md)
+- [Concurrent Benchmarks](./book/src/concurrent.md)
+- [GPU Benchmarks](./book/src/gpu.md) — measurement domain, pluggable backend, custom metrics, diagnostic replay
+- [Linux PMU Setup](./book/src/linux-pmu.md) — `perf_event_paranoid`, capabilities, fallback
+- [Persisted Reports & Comparison](./book/src/reports.md)
+- [Examples](./book/src/examples.md) — one annotated walkthrough per runnable example
+- [GPU Benchmarking Sharp Edges](./book/src/gpu-sharp-edges.md) — the failure modes that motivated the GPU design
+- [micromeasure vs Criterion](./book/src/vs-criterion.md)
+
+API reference is at [docs.rs/micromeasure](https://docs.rs/micromeasure).
 
 ## ... but why not Criterion?
 
-Criterion is a strong general-purpose Rust benchmarking library. It has the bulk of ecosystem mindshare, better polished
-statistical analysis, and a mature presentation story. This crate is narrower.
+Criterion is a strong general-purpose Rust benchmarking library. This crate is narrower.
 
 Use this crate when:
 
@@ -43,6 +62,7 @@ Use this crate when:
 - you are working on internal value operations, cache lookups, symbol tables, allocators, or similar hot paths
 - you want a small custom benchmark binary that you control directly
 - you want immediate "last run vs this run" output from persisted sample data
+- you are benchmarking GPU work and want device-event timing and host/device latency split
 
 Use Criterion when:
 
@@ -51,38 +71,16 @@ Use Criterion when:
 - you want HTML reports and the broader Criterion workflow
 - PMU metrics are not the main reason you are benchmarking
 
-One concrete difference is Linux perf integration. Criterion perf integrations are generally measurement plugins, which
-means a given run tends to be centred on one selected perf event. The use case here is different: collect timing,
-throughput, and multiple PMU-derived metrics together in one run so you can see whether a tiny operation changed
-latency, instruction count, branch misses, and cache-miss behaviour at the same time.
+See [micromeasure vs Criterion](./book/src/vs-criterion.md) for the full comparison, including the concrete PMU and
+GPU differences.
 
-It's possible I missed the right knobs to make criterion do what I need, but this has suited me well-ish, so far, so I
-am sharing it.
-
-## Current focus
-
-`micromeasure` currently emphasizes:
-
-- timing and throughput
-- explicit throughput units per measured operation, so reports can say `lines/s`, `bytes/s`, `rows/s`, not just generic ops
-- median, p95, MAD, coefficient of variation, and outlier counts
-- coordinated concurrent microbenchmarks with the same sample/report pipeline
-- Linux perf counters when available
-- graceful fallback to timing-only runs when PMU access is unavailable
-- persisted benchmark reports with per-sample throughput and latency series
-- side-by-side comparison against the latest compatible saved report
-- GPU benchmarking with pluggable measurement backends (CUDA event timing, custom metrics)
-- optional built-in CUDA event backend behind the `cuda` feature
-- per-sample custom metrics (e.g. `cuda_event_ms`, `tflops`, `host_overhead_ms`) with aggregation and JSON persistence
-- measurement domain tagging (`Cpu`, `Gpu`, `Mixed`) that suppresses or relabels CPU-PMU diagnostics for GPU work
-
-## Wiring It Up
+## Quick start
 
 Add `micromeasure` as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-micromeasure = "0.7"
+micromeasure = "0.8"
 ```
 
 Then add a custom bench target in your `Cargo.toml`:
@@ -93,61 +91,8 @@ name = "basic"
 harness = false
 ```
 
-That bench target usually lives at `benches/basic.rs`.
-
-For the bench entrypoint itself, prefer the shared launcher instead of hand-rolling argument
-parsing, report printing, and result persistence in every benchmark binary.
-
-## Example
-
-For a standalone example in this repository, run:
-
-```sh
-cargo run --example basic --release
-```
-
-For a concurrent workload example, run:
-
-```sh
-cargo run --example concurrent_scenario --release
-```
-
-For a concurrent workload example with bench-defined event counters, run:
-
-```sh
-cargo run --example concurrent_counters --release
-```
-
-For an example that reports domain throughput like `lines/s`, run:
-
-```sh
-cargo run --example throughput_units --release
-```
-
-For an example that combines fluent `factory(...)` and throughput configuration, run:
-
-```sh
-cargo run --example factory_builder --release
-```
-
-For GPU benchmarking examples, run:
-
-```sh
-cargo run --example gpu_domain --release        # measurement domain: suppress CPU-PMU diagnostics
-cargo run --example custom_metrics --release     # per-sample custom metrics with bench_sample()
-cargo run --example custom_backend --release     # pluggable MeasurementBackend (simulated CUDA events)
-cargo run --example cuda_event_backend --features cuda --release
-```
-
-In a consuming crate, you would usually run your benchmark with:
-
-```sh
-cargo bench --bench basic
-```
-
-Example output:
-
-![micromeasure example output](screenshot.png)
+That bench target usually lives at `benches/basic.rs`. For the bench entrypoint, use the shared `benchmark_main!`
+launcher instead of hand-rolling argument parsing, report printing, and result persistence.
 
 ```rust
 use micromeasure::{NoContext, Throughput, benchmark_main, black_box};
@@ -169,205 +114,24 @@ benchmark_main!(|runner| {
 });
 ```
 
-If one measured operation represents something other than a single logical op, declare it on the
-group or benchmark. For example, if each measured operation compiles 1000 lines of code, use
-`g.throughput(Throughput::per_operation(1000, "lines"))` and the report will render throughput as
-`lines/s`.
+In a consuming crate, run it with:
 
-Group configuration is fluent. That means you can apply shared benchmark setup once and then run
-multiple benches beneath it, for example:
-
-```rust
-runner.group::<MyContext>("Parser", |g| {
-    g.throughput(Throughput::per_operation(4096, "bytes"))
-        .factory(&|| MyContext::prepare_input())
-        .bench("parse_config", parse_config);
-});
+```sh
+cargo bench --bench basic
 ```
 
-Concurrent groups can also set sample duration fluently:
+In this repo, the same code lives as an example:
 
-```rust
-runner.concurrent_group::<SharedState>("Contention", |g| {
-    g.sample_duration(Duration::from_millis(50))
-        .throughput(Throughput::per_operation(1000, "lines"))
-        .bench("compile_under_lock", &workers);
-});
+```sh
+cargo run --example basic --release
 ```
 
-`benchmark_main!` handles:
+Example output:
 
-- parsing an optional benchmark filter from the command line
-- constructing `BenchmarkRunner` with that filter
-- printing the session summary
-- saving the report to the default location
+![micromeasure example output](screenshot.png)
 
-If you want a custom suite name, custom filter help text, or custom runtime options, use
-`run_benchmark_main(BenchmarkMainOptions { ... }, |runner| { ... })` instead.
-
-## Runtime Configuration
-
-You can configure the benchmark runtime behavior (warm-up duration, target benchmark duration, and
-sample counts) either on the `BenchmarkRunner` or via `BenchmarkMainOptions`.
-
-```rust
-benchmark_main!(|runner| {
-    let runtime = BenchmarkRuntimeOptions {
-        warm_up_duration: Duration::from_millis(500),
-        benchmark_duration: Duration::from_secs(2),
-        ..BenchmarkRuntimeOptions::default()
-    };
-
-    runner
-        .set_runtime(runtime)
-        .group::<NoContext>("Arithmetic", |g| {
-            g.bench("add_loop", add_bench);
-        });
-});
-```
-
-Default values are:
-- `warm_up_duration`: 1 second
-- `benchmark_duration`: 5 seconds
-- `min_samples`: 20
-- `max_samples`: 100
-
-## Concurrent Benchmarks
-
-`micromeasure` can also benchmark coordinated concurrent workloads while still using the same
-sample-driven measurement pipeline as the single-threaded path.
-
-That means concurrent benchmarks still get:
-
-- the usual sample count and calibration flow
-- the usual timing statistics
-- Linux PMU counters when available
-- persisted `BenchmarkResult` data and normal session summaries
-
-The difference is the shape of one sample: instead of one function running on one thread, a sample
-runs multiple worker roles against shared state for a fixed sample window.
-
-Use this when the thing you care about only shows up under contention, for example:
-
-- cache misses caused by reader/writer interference
-- branch miss behaviour in optimistic retry loops
-- lock or latch implementations under mixed access patterns
-
-The concurrent API is centered on:
-
-- `ConcurrentBenchContext`
-- `ConcurrentWorker`
-- `ConcurrentBenchControl`
-- `ConcurrentWorkerResult`
-- `BenchmarkRunner::concurrent_group(...)`
-
-See [examples/concurrent_scenario.rs](./examples/concurrent_scenario.rs) for a complete
-reader/writer contention benchmark using `ConcurrentBenchContext` and
-`BenchmarkRunner::concurrent_group(...)`.
-
-If a concurrent benchmark needs to report scenario-specific events such as retries, failed
-try-locks, dropped work, or backoffs, workers can return `ConcurrentWorkerResult` instead of
-just an operation count. These event counters are intended to be:
-
-- worker-local plain integers in the hot loop
-- packaged once at the end of the sample
-- aggregated by worker role after join
-
-That keeps event reporting out of the measured hot path. The framework reports them under each
-worker role as `bench event counters`, including total count, per-operation rate, and per-second
-rate.
-
-See [examples/concurrent_counters.rs](./examples/concurrent_counters.rs) for a complete
-concurrent benchmark that reports bench-defined event counters.
-
-In concurrent output, worker-role tables are the primary view. Each worker role gets the same
-stats table shape as the normal benchmark path, including throughput, latency, and PMU-derived
-metrics like instructions/op, branch misses, and cache misses.
-
-The `workers combined` section at the bottom is a whole-scenario aggregate. It is mainly useful as
-the PMU view of the entire interacting workload; the worker-role tables are usually the more
-meaningful place to interpret throughput and latency.
-
-## GPU Benchmarks
-
-`micromeasure` can benchmark GPU work (e.g. cuBLASLt GEMM, CUDA streams) alongside CPU
-microbenchmarks. Three features work together to make GPU output less misleading:
-
-**MeasurementDomain** (`g.measurement_domain(MeasurementDomain::Gpu)`):
-- `Gpu`: suppresses CPU-PMU bottleneck diagnostics (the host thread's counters describe launch/sync
-  orchestration, not the GPU kernel) and relabels the PMU coverage line as `host PMU (orchestration)`.
-- `Mixed`: emits CPU-PMU diagnostics with a `[host]` prefix.
-- `Cpu`: unchanged historic behaviour (the default).
-
-**MeasurementBackend** (`g.backend(|| Box::new(MyCudaBackend::new()))`):
-- Pluggable measurement window around the bench closure. The runner calls `begin()` / `end()` /
-  `collect()` per sample.
-- Default on Linux is `LinuxPerfBackend` (perf-event group + individual-counter fallback). On other
-  platforms it falls back to `WallClockBackend` (timing-only).
-- `CudaEventBackend` is available behind the `cuda` feature. It records `cudaEventRecord` in
-  `begin()` / `end()`, computes elapsed in `collect()`, uses device elapsed time as the benchmark
-  sample duration, and pushes `cuda_event_ms`, `host_overhead_ms`, plus derived `gpu_gib_s` and
-  `gpu_tflops` metrics when bytes/FLOPs per operation are configured. Normal builds do not link
-  CUDA; enabling `cuda` links against `cudart`.
-- The backend's `measurement_label()` (e.g. `"timing + CUDA events"`) is shown in the
-  `Measurement` row.
-
-**Per-sample custom metrics** (`g.bench_sample(name, f)`):
-- The bench function returns a `BenchSampleResult { operations, metrics }` instead of `()`.
-- `MetricValue` carries `name`, `value`, `unit`, an optional `section`, an optional
-  `display_name`, and a `format` hint (`Number` or `Integer` for IDs/counts).
-- The runner aggregates per `(section, name, unit)` across samples into `MetricSummary` (mean,
-  median, p95, min, max, contributing sample count) and renders a `custom metrics:` table.
-- Bench-function metrics and backend-pushed metrics are merged into one table.
-- JSON persistence works through the existing `BenchmarkStats` serde derive.
-
-**Diagnostic replay metrics** (`g.diagnostic_pass(f)`):
-- Runs once after the normal timing samples, using the calibrated chunk size.
-- Metrics returned by the diagnostic pass are merged into the same custom metrics table.
-- `DiagnosticResult::new(section)` applies `section` as the default for metrics that do not set
-  their own section.
-- The diagnostic pass does not contribute to latency, throughput, CV, or outlier statistics, so it
-  can collect invasive counters without contaminating normal timing.
-- Use `g.diagnostic_samples(n)` to repeat noisy diagnostic counters.
-- The diagnostic pass is fallible; failures are reported as diagnostic metrics rather than timing
-  failures.
-
-```rust
-fn my_gpu_bench(ctx: &mut GpuContext, chunk_size: usize, _chunk_num: usize) -> BenchSampleResult {
-    let device_s = ctx.run_kernel(chunk_size);
-    BenchSampleResult::operations(chunk_size as u64)
-        .push_metric(
-            MetricValue::duration_ms("cuda_event_ms", Duration::from_secs_f64(device_s))
-                .with_display_name("CUDA event time"),
-        )
-        .push_metric(
-            MetricValue::throughput_tflops("tflops", 12345, device_s)
-                .with_display_name("TFLOP/s"),
-        )
-}
-
-fn my_gpu_counter_replay(
-    ctx: &mut GpuContext,
-    chunk_size: usize,
-    _chunk_num: usize,
-) -> Result<DiagnosticResult, DiagnosticError> {
-    ctx.run_kernel_under_profiler(chunk_size)
-}
-
-benchmark_main!(|runner| {
-    runner.group::<GpuContext>("cuBLASLt FP4", |g| {
-        g.throughput(Throughput::bytes(8))
-            .measurement_domain(MeasurementDomain::Gpu)
-            .backend(|| Box::new(CudaEventBackend::new(8, 16).unwrap()))
-            .diagnostic_samples(3)
-            .diagnostic_pass(my_gpu_counter_replay)
-            .bench_sample("fp4_gemm", my_gpu_bench);
-    });
-});
-```
-
-See `examples/gpu_domain.rs`, `examples/custom_metrics.rs`, and `examples/custom_backend.rs` for
-complete runnable examples.
+For more examples (concurrent, throughput units, GPU domain, custom metrics, custom backend, CUDA event backend),
+see [Examples](./book/src/examples.md).
 
 ## Linux-first, and why
 
@@ -380,53 +144,10 @@ counters. The timing side of the crate is portable enough, but the most importan
 - cache misses
 
 If those counters are not available, the crate still runs and still reports timing data, but you are only getting part
-of what it is designed for.
+of what it is designed for. When PMU access is unavailable, the crate falls back to timing-only measurement and tells
+you that it has done so.
 
-If your primary goal is portable benchmarking across platforms, Criterion is usually the better fit.
-
-It is probably feasible to add similar support for other platforms over time, including Darwin/macOS, but that work has
-not been done here. I do not have a Mac to develop and validate that path myself, so the crate is currently designed
-and tested with Linux as the primary target.
-
-### Enabling perf counters on Linux
-
-On many Linux systems, unprivileged access to perf events is restricted by `kernel.perf_event_paranoid`.
-
-The common cases are:
-
-- `-1` or `0`: broad access
-- `1` or `2`: common developer-friendly settings
-- `3` or `4`: often too restrictive for useful PMU access in normal user sessions
-
-You can inspect the current setting with:
-
-```sh
-cat /proc/sys/kernel/perf_event_paranoid
-```
-
-To lower it temporarily until reboot:
-
-```sh
-sudo sysctl kernel.perf_event_paranoid=2
-```
-
-To make it persistent:
-
-```sh
-echo 'kernel.perf_event_paranoid=2' | sudo tee /etc/sysctl.d/99-micromeasure.conf
-sudo sysctl --system
-```
-
-Depending on your environment, you may also need one of:
-
-- `CAP_PERFMON`
-- `CAP_SYS_ADMIN`
-- a container/runtime configuration that allows `perf_event_open`
-
-This matters in containers, CI environments, and some locked-down distributions where the kernel setting alone is not
-enough.
-
-When PMU access is unavailable, the crate will fall back to timing-only measurement and tell you that it has done so.
+See [Linux PMU Setup](./book/src/linux-pmu.md) for `perf_event_paranoid` settings, capabilities, and the fallback chain.
 
 ## What this crate is not
 
@@ -463,7 +184,13 @@ Contributions are welcome, especially around:
 - better statistical analysis and comparison reporting
 - improved presentation and terminal output
 - additional platform backends for non-Linux systems
+- the mdbook (typos, clarifications, missing examples)
 
 If you find defects, I am very interested in hearing about them.
+
+> If `micromeasure` is useful in your work, consider sponsoring development on GitHub Sponsors.
+> I am also available for consulting in systems engineering, profiling and performance tuning, and
+> Rust development (10 years at Google, 25+ years in software development). 
+> If this project is useful or interesting for your team, feel free to reach out.
 
 *I am not a professional statistician. It's possible my code is lying to you. If so, please tell me.*

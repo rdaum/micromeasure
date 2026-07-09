@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Demonstrates Phase 2 of the GPU benchmarking work
-// (docs/gpu-benchmarking-sharp-edges.md): per-sample custom metrics via
+// (book/src/gpu-sharp-edges.md): per-sample custom metrics via
 // `bench_sample(...)` returning a `BenchSampleResult`.
 //
 // The bench function here is a stand-in for one synchronized GPU operation.

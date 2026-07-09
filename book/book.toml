@@ -1,0 +1,24 @@
+[book]
+title = "micromeasure"
+authors = ["Ryan Daum"]
+language = "en"
+multilingual = false
+src = "src"
+description = "Microbenchmark harness for tiny operations and PMU-aware measurement"
+
+[build]
+build-dir = "build"
+
+[output.html]
+git-repository-url = "https://github.com/rdaum/micromeasure"
+edit-url-template = "https://github.com/rdaum/micromeasure/edit/main/book/src/{path}"
+no-section-label = false
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
+
+[output.html.fold]
+enable = true
+level = 0

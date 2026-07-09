@@ -25,7 +25,7 @@
 //! 2. Off Linux: a wall-clock span with no counters.
 //!
 //! That works well for CPU microbenchmarks but is misleading for GPU work,
-//! as documented in `docs/gpu-benchmarking-sharp-edges.md`. A GPU benchmark
+//! as documented in `book/src/gpu-sharp-edges.md`. A GPU benchmark
 //! needs CUDA event elapsed time recorded on the device, host-vs-device
 //! latency split, and domain-specific metrics (`cuda_event_ms`, `tflops`,
 //! `tensor_tflops`, ...) that do not fit the fixed `Results` shape.
@@ -92,7 +92,7 @@ pub enum MetricFormat {
 /// What a measured operation reports in addition to the standard `Results`.
 ///
 /// This is the per-sample extension point called for by Phase 2 of
-/// `docs/gpu-benchmarking-sharp-edges.md` ("No Per-Sample Custom Metrics").
+/// `book/src/gpu-sharp-edges.md` ("No Per-Sample Custom Metrics").
 /// Backends push names and values here as they collect them; the runner
 /// aggregates them across samples (mean, median, p95, min, max) once the
 /// `MetricValue` aggregation path is wired up.
@@ -238,7 +238,7 @@ impl From<&str> for DiagnosticError {
 /// custom metrics in addition to the standard timing/throughput/PMU pipeline.
 ///
 /// This is the Phase 2 extension point called for by
-/// `docs/gpu-benchmarking-sharp-edges.md` ("Fixed `fn(&mut T, usize, usize)`
+/// `book/src/gpu-sharp-edges.md` ("Fixed `fn(&mut T, usize, usize)`
 /// Shape Is Awkward For Rich Results" and "No Per-Sample Custom Metrics").
 ///
 /// A bench function with the richer signature

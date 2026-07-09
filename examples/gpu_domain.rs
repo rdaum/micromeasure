@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Demonstrates Phase 1 of the GPU benchmarking work
-// (docs/gpu-benchmarking-sharp-edges.md): declaring a benchmark group as
+// (book/src/gpu-sharp-edges.md): declaring a benchmark group as
 // `MeasurementDomain::Gpu` so the runner suppresses CPU-PMU bottleneck
 // diagnostics and relabels the PMU coverage byline as
 // "host PMU (orchestration)".

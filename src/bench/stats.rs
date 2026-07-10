@@ -1,6 +1,6 @@
 use super::{Results, Throughput, safe_ratio_f64, throughput_ops_per_sec};
 use crate::bench::backend::{MetricFormat, MetricValue};
-use crate::session::MetricSummary;
+use crate::session::{MetricSummary, SampleMetric, SampleMetricSet};
 use crate::{Alignment, BenchmarkStats, BorderColor, MeasurementDomain, TableFormatter};
 use std::io::IsTerminal;
 
@@ -83,15 +83,17 @@ pub(super) fn benchmark_stats_from_samples(
     let backend_stall_percent =
         safe_ratio_f64(results.stalled_cycles_backend as f64, results.cycles as f64) * 100.0;
     let cv_percent = coefficient_of_variation_percent(all_results);
-    let mut throughput_samples = sample_throughput_per_sec(all_results, throughput);
-    throughput_samples.sort_by(|a, b| a.total_cmp(b));
-    let median_throughput_per_sec = median(&throughput_samples);
-    let mut latency_samples = sample_ns_per_op(all_results);
-    latency_samples.sort_by(|a, b| a.total_cmp(b));
-    let median_ns_per_op = median(&latency_samples);
-    let p95_ns_per_op = percentile(&latency_samples, 0.95);
-    let mad_ns_per_op = median_absolute_deviation(&latency_samples, median_ns_per_op);
-    let outlier_count = tukey_outlier_count(&latency_samples);
+    let throughput_samples = sample_throughput_per_sec(all_results, throughput);
+    let mut sorted_throughput_samples = throughput_samples.clone();
+    sorted_throughput_samples.sort_by(|a, b| a.total_cmp(b));
+    let median_throughput_per_sec = median(&sorted_throughput_samples);
+    let latency_samples = sample_ns_per_op(all_results);
+    let mut sorted_latency_samples = latency_samples.clone();
+    sorted_latency_samples.sort_by(|a, b| a.total_cmp(b));
+    let median_ns_per_op = median(&sorted_latency_samples);
+    let p95_ns_per_op = percentile(&sorted_latency_samples, 0.95);
+    let mad_ns_per_op = median_absolute_deviation(&sorted_latency_samples, median_ns_per_op);
+    let outlier_count = tukey_outlier_count(&sorted_latency_samples);
 
     BenchmarkStats {
         throughput: throughput.clone(),
@@ -137,6 +139,26 @@ pub(super) fn benchmark_stats_from_samples(
         measurement_label: measurement_label.to_string(),
         emits_cpu_diagnostics,
         metrics: aggregate_metrics(per_sample_metrics),
+        sample_metrics: per_sample_metrics
+            .iter()
+            .take(sample_count)
+            .enumerate()
+            .map(|(sample_index, metrics)| SampleMetricSet {
+                sample_index,
+                metrics: metrics
+                    .iter()
+                    .filter(|metric| metric.value.is_finite())
+                    .map(|metric| SampleMetric {
+                        name: metric.name.to_string(),
+                        value: metric.value,
+                        unit: metric.unit.to_string(),
+                        section: metric.section.to_string(),
+                        display_name: metric.display_name.to_string(),
+                        format: metric.format,
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -583,6 +605,7 @@ fn pmu_byline(stats: &BenchmarkStats) -> Option<String> {
     let label = match stats.measurement_domain {
         MeasurementDomain::Cpu => "PMU",
         MeasurementDomain::Gpu => "host PMU (orchestration)",
+        MeasurementDomain::Io => "host PMU (I/O orchestration)",
         MeasurementDomain::Mixed => "host PMU (mixed workload)",
     };
 
@@ -809,5 +832,58 @@ mod tests {
             "expected push-order, not lexicographic"
         );
         assert_eq!(summary[1].name, "alpha");
+    }
+
+    #[test]
+    fn benchmark_stats_preserve_sample_execution_order() {
+        let all_results = vec![
+            Results {
+                duration: std::time::Duration::from_secs(1),
+                iterations: 10,
+                chunks_executed: 1,
+                ..Results::default()
+            },
+            Results {
+                duration: std::time::Duration::from_secs(1),
+                iterations: 30,
+                chunks_executed: 1,
+                ..Results::default()
+            },
+            Results {
+                duration: std::time::Duration::from_secs(1),
+                iterations: 20,
+                chunks_executed: 1,
+                ..Results::default()
+            },
+        ];
+        let mut summed = Results::default();
+        for result in &all_results {
+            summed.add(result);
+        }
+
+        let stats = benchmark_stats_from_samples(
+            &summed,
+            &all_results,
+            all_results.len(),
+            &Throughput::ops(),
+            MeasurementDomain::Cpu,
+            "",
+            true,
+            &[
+                vec![MetricValue::new("depth", 3.0, "requests")],
+                vec![MetricValue::new("depth", 1.0, "requests")],
+                vec![MetricValue::new("depth", 2.0, "requests")],
+            ],
+        );
+
+        assert_eq!(stats.sample_throughput_per_sec, vec![10.0, 30.0, 20.0]);
+        assert_eq!(stats.sample_latency_ns_per_op[0], 100_000_000.0);
+        assert!((stats.sample_latency_ns_per_op[1] - 33_333_333.333).abs() < 0.001);
+        assert_eq!(stats.sample_latency_ns_per_op[2], 50_000_000.0);
+        assert_eq!(stats.median_throughput_per_sec, 20.0);
+        assert_eq!(stats.sample_metrics.len(), 3);
+        assert_eq!(stats.sample_metrics[0].metrics[0].value, 3.0);
+        assert_eq!(stats.sample_metrics[1].metrics[0].value, 1.0);
+        assert_eq!(stats.sample_metrics[2].metrics[0].value, 2.0);
     }
 }

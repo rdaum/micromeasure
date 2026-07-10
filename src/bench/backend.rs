@@ -57,11 +57,10 @@
 //! on Linux (preserving the historic perf-event group + individual-counter
 //! fallback chain) and [`WallClockBackend`] elsewhere.
 //!
-//! Custom backends are supplied via
-//! [`crate::BenchmarkGroup::backend`] and take precedence over the platform
-//! default. The concurrent benchmark path does not yet use the trait —
-//! it still calls `execute_standard` directly via
-//! `execute_concurrent_worker`.
+//! Custom backends are supplied via a benchmark group's `backend` method and
+//! take precedence over the platform default. Concurrent groups may opt into
+//! a backend whose window spans the coordinated worker start through all
+//! worker joins.
 
 use crate::bench::Results;
 use serde::{Deserialize, Serialize};
@@ -354,6 +353,10 @@ pub enum MeasurementDomain {
     /// context, not as the primary bottleneck, and bottleneck diagnostics
     /// derived from CPU PMU counters are suppressed or relabelled.
     Gpu,
+    /// Storage- or network-I/O-bound work. CPU PMU data describes host
+    /// orchestration and is retained as context, but CPU bottleneck
+    /// conclusions are suppressed.
+    Io,
     /// Mix of host and device work; diagnostics are emitted but caveated.
     Mixed,
 }
@@ -480,10 +483,9 @@ pub enum MeasurementDomain {
 ///
 /// # Integration status
 ///
-/// The trait is wired into the standard (single-threaded) benchmark path.
-/// The runner calls `begin` / `end` / `collect` per sample. The concurrent
-/// path does not yet use the trait — it still calls `execute_standard`
-/// directly via `execute_concurrent_worker`.
+/// The trait is wired into the standard path and, when explicitly configured
+/// on a concurrent group, the whole concurrent sample. Concurrent worker PMU
+/// measurements remain available separately in worker summaries.
 #[allow(dead_code)]
 pub trait MeasurementBackend {
     /// Begin the measurement window. Called on the measuring thread

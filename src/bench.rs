@@ -30,7 +30,7 @@ use crate::{
 use affinity::concurrent_worker_pin_cores;
 use affinity::{BenchAffinityGuard, warn_affinity_once};
 #[cfg(target_os = "linux")]
-use perf::{clear_perf_issues, execute_concurrent_worker};
+use perf::{clear_perf_issues, execute_concurrent_worker, prepare_concurrent_worker_measurement};
 use perf::{enforce_pmu_quality, measurement_label, warn_perf_status};
 use serde::{Deserialize, Serialize};
 use stats::{
@@ -39,10 +39,14 @@ use stats::{
 };
 use std::time::Instant;
 use std::{
+    collections::BTreeMap,
     hint::black_box,
     io::{self, IsTerminal, Write},
     rc::Rc,
-    sync::Barrier,
+    sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -96,6 +100,7 @@ type BenchSampleFunction<T> = fn(&mut T, usize, usize) -> crate::bench::backend:
 type DiagnosticPassFunction<T> =
     fn(&mut T, usize, usize) -> Result<DiagnosticResult, DiagnosticError>;
 type ConcurrentBenchFunction<T> = fn(&T, &ConcurrentBenchControl) -> ConcurrentWorkerResult;
+type ConcurrentLifecycleFactory<T> = Rc<dyn Fn() -> Box<dyn ConcurrentSampleLifecycle<T>>>;
 
 #[derive(Clone, Copy)]
 pub struct ConcurrentBenchControl {
@@ -120,6 +125,39 @@ impl ConcurrentBenchControl {
 
 pub trait ConcurrentBenchContext {
     fn prepare(num_threads: usize) -> Self;
+}
+
+/// Identifies whether a concurrent lifecycle callback surrounds warm-up or a
+/// persisted measurement sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConcurrentSamplePhase {
+    WarmUp,
+    Measurement,
+}
+
+/// Stable identity passed to concurrent sample lifecycle callbacks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConcurrentSampleInfo {
+    pub phase: ConcurrentSamplePhase,
+    pub sample_index: usize,
+}
+
+/// Setup, quiescence, and shared telemetry around a concurrent sample.
+///
+/// Both callbacks run on the coordinator thread outside the backend's
+/// measurement window. `after_sample` runs only after every worker has joined.
+/// Metrics returned for warm-up samples are discarded; measurement metrics are
+/// persisted under scenario scope and aggregated normally.
+pub trait ConcurrentSampleLifecycle<T> {
+    fn before_sample(&mut self, _context: &mut T, _sample: ConcurrentSampleInfo) {}
+
+    fn after_sample(
+        &mut self,
+        _context: &mut T,
+        _sample: ConcurrentSampleInfo,
+    ) -> Vec<MetricValue> {
+        Vec::new()
+    }
 }
 
 pub struct ConcurrentWorker<T> {
@@ -175,6 +213,26 @@ struct WorkerSampleSummary {
 struct ConcurrentSampleResult {
     results: Results,
     worker_summaries: Vec<WorkerSampleSummary>,
+}
+
+struct ConcurrentGroupOptions<T> {
+    throughput: Throughput,
+    measurement_domain: MeasurementDomain,
+    backend_factory: Option<Rc<dyn Fn() -> Box<dyn MeasurementBackend>>>,
+    lifecycle_factory: Option<ConcurrentLifecycleFactory<T>>,
+    metadata: BTreeMap<String, String>,
+}
+
+impl<T> Clone for ConcurrentGroupOptions<T> {
+    fn clone(&self) -> Self {
+        Self {
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            lifecycle_factory: self.lifecycle_factory.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
 }
 
 pub(super) struct ConcurrentWorkerMeasurement {
@@ -276,6 +334,38 @@ pub struct BenchmarkRuntimeOptions {
     pub benchmark_duration: Duration,
     pub min_samples: usize,
     pub max_samples: usize,
+}
+
+/// Deterministic ordering policy for a caller-owned list of benchmark cases.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkCaseOrder {
+    #[default]
+    Declared,
+    Randomized {
+        seed: u64,
+    },
+}
+
+impl BenchmarkCaseOrder {
+    /// Return indices in the order cases should be executed. Randomization is
+    /// deterministic and dependency-free so a seed can be retained as report
+    /// metadata and replayed exactly.
+    pub fn indices(self, case_count: usize) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..case_count).collect();
+        let Self::Randomized { mut seed } = self else {
+            return indices;
+        };
+        for index in (1..indices.len()).rev() {
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut value = seed;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            value ^= value >> 31;
+            indices.swap(index, value as usize % (index + 1));
+        }
+        indices
+    }
 }
 
 impl Default for BenchmarkRuntimeOptions {
@@ -700,6 +790,7 @@ fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
     let host_prefix = match stats.measurement_domain {
         MeasurementDomain::Cpu => "",
         MeasurementDomain::Gpu => "",
+        MeasurementDomain::Io => "[host] ",
         MeasurementDomain::Mixed => "[host] ",
     };
 
@@ -707,8 +798,11 @@ fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
     // emit them (e.g. a CUDA event backend) OR the measurement domain is
     // Gpu. Mixed domain keeps diagnostics (with [host] prefix) unless the
     // backend explicitly opts out via emits_cpu_diagnostics.
-    let suppress_cpu_pmu =
-        !stats.emits_cpu_diagnostics || matches!(stats.measurement_domain, MeasurementDomain::Gpu);
+    let suppress_cpu_pmu = !stats.emits_cpu_diagnostics
+        || matches!(
+            stats.measurement_domain,
+            MeasurementDomain::Gpu | MeasurementDomain::Io
+        );
 
     if !suppress_cpu_pmu
         && stats.has_cycles
@@ -907,6 +1001,7 @@ fn warm_up_concurrent_engine<T: ConcurrentBenchContext + Sync, F: Fn(usize) -> T
     factory: &F,
     throughput: &Throughput,
     runtime: &BenchmarkRuntimeOptions,
+    lifecycle: &mut Option<Box<dyn ConcurrentSampleLifecycle<T>>>,
 ) -> ConcurrentBenchmarkConfig {
     rewrite_line("🔥 calibrating benchmark");
 
@@ -914,9 +1009,21 @@ fn warm_up_concurrent_engine<T: ConcurrentBenchContext + Sync, F: Fn(usize) -> T
     let warm_up_end = Instant::now() + runtime.warm_up_duration;
     let mut estimated_throughput_per_sec = 0.0;
 
+    let mut warm_up_index = 0usize;
     while Instant::now() < warm_up_end {
-        let prepared = factory(total_threads);
+        let mut prepared = factory(total_threads);
+        let sample = ConcurrentSampleInfo {
+            phase: ConcurrentSamplePhase::WarmUp,
+            sample_index: warm_up_index,
+        };
+        if let Some(lifecycle) = lifecycle.as_deref_mut() {
+            lifecycle.before_sample(&mut prepared, sample);
+        }
         let result = execute_concurrent_timing_only(&prepared, sample_duration, workers);
+        if let Some(lifecycle) = lifecycle.as_deref_mut() {
+            let _ = lifecycle.after_sample(&mut prepared, sample);
+        }
+        warm_up_index += 1;
         let sample_throughput = throughput.rate_for_operations(
             result.results.iterations,
             result.results.duration.as_secs_f64(),
@@ -1091,6 +1198,7 @@ fn execute_concurrent_timing_only<T: ConcurrentBenchContext + Sync>(
     sample_duration: Duration,
     workers: &[ConcurrentWorker<T>],
 ) -> ConcurrentSampleResult {
+    let mut backend = None;
     execute_concurrent_sample_inner(
         prepared,
         sample_duration,
@@ -1098,6 +1206,7 @@ fn execute_concurrent_timing_only<T: ConcurrentBenchContext + Sync>(
         #[cfg(target_os = "linux")]
         &[],
         false,
+        &mut backend,
     )
 }
 
@@ -1106,6 +1215,7 @@ fn execute_concurrent_sample<T: ConcurrentBenchContext + Sync>(
     sample_duration: Duration,
     workers: &[ConcurrentWorker<T>],
     #[cfg(target_os = "linux")] pin_cores: &[usize],
+    backend: &mut Option<Box<dyn MeasurementBackend>>,
 ) -> ConcurrentSampleResult {
     execute_concurrent_sample_inner(
         prepared,
@@ -1114,6 +1224,7 @@ fn execute_concurrent_sample<T: ConcurrentBenchContext + Sync>(
         #[cfg(target_os = "linux")]
         pin_cores,
         true,
+        backend,
     )
 }
 
@@ -1123,15 +1234,18 @@ fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
     workers: &[ConcurrentWorker<T>],
     #[cfg(target_os = "linux")] pin_cores: &[usize],
     use_perf_counters: bool,
+    backend: &mut Option<Box<dyn MeasurementBackend>>,
 ) -> ConcurrentSampleResult {
     let total_threads = total_worker_threads(workers);
     let ready_barrier = Barrier::new(total_threads + 1);
+    let measurement_ready_barrier = Barrier::new(total_threads + 1);
     let start_barrier = Barrier::new(total_threads + 1);
     let start_instant = std::sync::OnceLock::new();
 
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(total_threads);
         let ready_barrier = &ready_barrier;
+        let measurement_ready_barrier = &measurement_ready_barrier;
         let start_barrier = &start_barrier;
         let start_instant = &start_instant;
 
@@ -1143,7 +1257,26 @@ fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
                 next_thread_index += 1;
 
                 handles.push(scope.spawn(move || {
+                    #[cfg(target_os = "linux")]
+                    if use_perf_counters
+                        && let Some(core_id) = pin_cores.get(thread_index).copied()
+                        && let Err(error) = crate::threading::pin_current_thread_to_core(core_id)
+                    {
+                        warn_affinity_once(format!(
+                            "Could not pin concurrent benchmark worker {thread_index} to core {core_id}: {error}. Continuing without worker pinning"
+                        ));
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    let mut perf_measurement =
+                        use_perf_counters.then(prepare_concurrent_worker_measurement);
+
                     ready_barrier.wait();
+                    #[cfg(target_os = "linux")]
+                    if let Some(perf_measurement) = perf_measurement.as_mut() {
+                        perf_measurement.begin_prepared();
+                    }
+                    measurement_ready_barrier.wait();
                     start_barrier.wait();
 
                     let benchmark_start = *start_instant.get().expect("missing benchmark start");
@@ -1153,21 +1286,17 @@ fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
                         role_thread_index,
                     };
 
-                    #[cfg(target_os = "linux")]
-                    if use_perf_counters {
-                        if let Some(core_id) = pin_cores.get(thread_index).copied() {
-                            if let Err(error) = crate::threading::pin_current_thread_to_core(core_id) {
-                                warn_affinity_once(format!(
-                                    "Could not pin concurrent benchmark worker {thread_index} to core {core_id}: {error}. Continuing without worker pinning"
-                                ));
-                            }
-                        }
-                    }
-
                     let worker_result = if use_perf_counters {
                         #[cfg(target_os = "linux")]
                         {
-                            execute_concurrent_worker(prepared, &control, run)
+                            execute_concurrent_worker(
+                                perf_measurement
+                                    .as_mut()
+                                    .expect("missing prepared perf measurement"),
+                                prepared,
+                                &control,
+                                run,
+                            )
                         }
                         #[cfg(not(target_os = "linux"))]
                         {
@@ -1187,6 +1316,10 @@ fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
         }
 
         ready_barrier.wait();
+        measurement_ready_barrier.wait();
+        if let Some(backend) = backend.as_deref_mut() {
+            backend.begin();
+        }
         let benchmark_start = Instant::now();
         let _ = start_instant.set(benchmark_start);
         start_barrier.wait();
@@ -1201,8 +1334,11 @@ fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
             merge_counter_values(&mut worker_counters[worker_index], &worker_result.counters);
             aggregate.add(&worker_result.results);
         }
-
         let wall_duration = benchmark_start.elapsed();
+        if let Some(backend) = backend.as_deref_mut() {
+            backend.end();
+        }
+
         aggregate.duration = wall_duration;
         aggregate.chunks_executed = 1;
         for worker_result in &mut worker_results {
@@ -1219,6 +1355,45 @@ fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
                 .collect(),
         }
     })
+}
+
+/// A concurrent backend owns the scenario timing window while worker-local
+/// PMU measurements remain the source of host-orchestration counters. Replace
+/// only fields the backend explicitly populated.
+fn apply_concurrent_backend_results(results: &mut Results, backend: Results) {
+    if backend.duration > Duration::ZERO {
+        results.duration = backend.duration;
+    }
+    if backend.iterations > 0 {
+        results.iterations = backend.iterations;
+    }
+    if backend.chunks_executed > 0 {
+        results.chunks_executed = backend.chunks_executed;
+    }
+
+    macro_rules! replace_counter {
+        ($has:ident, $value:ident) => {
+            if backend.$has {
+                results.$has = true;
+                results.$value = backend.$value;
+            }
+        };
+    }
+    replace_counter!(has_cycles, cycles);
+    replace_counter!(has_instructions, instructions);
+    replace_counter!(has_cache_references, cache_references);
+    replace_counter!(has_l1i_misses, l1i_misses);
+    replace_counter!(has_branches, branches);
+    replace_counter!(has_branch_misses, branch_misses);
+    replace_counter!(has_cache_misses, cache_misses);
+    replace_counter!(has_stalled_cycles_frontend, stalled_cycles_frontend);
+    replace_counter!(has_stalled_cycles_backend, stalled_cycles_backend);
+    if backend.pmu_time_enabled_ns > 0 {
+        results.pmu_time_enabled_ns = backend.pmu_time_enabled_ns;
+    }
+    if backend.pmu_time_running_ns > 0 {
+        results.pmu_time_running_ns = backend.pmu_time_running_ns;
+    }
 }
 
 fn update_progress_bar(
@@ -1258,6 +1433,8 @@ pub struct BenchmarkRunner {
     session: std::sync::Arc<BenchmarkSession>,
     filter: Option<String>,
     runtime: BenchmarkRuntimeOptions,
+    case_cooldown: Duration,
+    cases_started: AtomicUsize,
 }
 
 impl Default for BenchmarkRunner {
@@ -1272,6 +1449,8 @@ impl BenchmarkRunner {
             session: std::sync::Arc::new(BenchmarkSession::new()),
             filter: None,
             runtime: BenchmarkRuntimeOptions::default(),
+            case_cooldown: Duration::ZERO,
+            cases_started: AtomicUsize::new(0),
         }
     }
 
@@ -1288,6 +1467,33 @@ impl BenchmarkRunner {
     pub fn with_runtime(mut self, runtime: BenchmarkRuntimeOptions) -> Self {
         self.set_runtime(runtime);
         self
+    }
+
+    /// Wait between benchmark cases, outside all warm-up and measurement
+    /// windows. Useful for device quiescence or thermal cooldown.
+    pub fn with_case_cooldown(mut self, cooldown: Duration) -> Self {
+        self.set_case_cooldown(cooldown);
+        self
+    }
+
+    /// Mutable counterpart to [`Self::with_case_cooldown`], suitable for the
+    /// `&mut BenchmarkRunner` supplied by [`crate::benchmark_main!`].
+    pub fn set_case_cooldown(&mut self, cooldown: Duration) -> &mut Self {
+        self.case_cooldown = cooldown;
+        self
+    }
+
+    /// Apply a deterministic ordering policy to a caller-owned case list.
+    pub fn ordered_case_indices(&self, case_count: usize, order: BenchmarkCaseOrder) -> Vec<usize> {
+        order.indices(case_count)
+    }
+
+    fn begin_case(&self) {
+        if self.cases_started.fetch_add(1, Ordering::Relaxed) > 0
+            && self.case_cooldown > Duration::ZERO
+        {
+            thread::sleep(self.case_cooldown);
+        }
     }
 
     pub fn set_runtime(&mut self, runtime: BenchmarkRuntimeOptions) -> &mut Self {
@@ -1318,9 +1524,13 @@ impl BenchmarkRunner {
         let group = ConcurrentBenchmarkGroup {
             runner: self,
             name,
-            throughput: Throughput::ops(),
-            measurement_domain: MeasurementDomain::default(),
-            _marker: std::marker::PhantomData,
+            options: ConcurrentGroupOptions {
+                throughput: Throughput::ops(),
+                measurement_domain: MeasurementDomain::default(),
+                backend_factory: None,
+                lifecycle_factory: None,
+                metadata: BTreeMap::new(),
+            },
         };
         f(&group);
     }
@@ -1390,6 +1600,7 @@ impl BenchmarkRunner {
         if !self.should_run(name, group) {
             return;
         }
+        self.begin_case();
 
         #[cfg(target_os = "linux")]
         clear_perf_issues();
@@ -1409,7 +1620,7 @@ impl BenchmarkRunner {
         let mut all_results = Vec::with_capacity(config.target_samples);
         let mut summed_results = Results::default();
         let mut running_throughput = config.estimated_throughput_per_sec;
-        let mut all_metrics: Vec<Vec<MetricValue>> = Vec::new();
+        let mut all_metrics: Vec<Vec<MetricValue>> = vec![Vec::new(); config.target_samples];
 
         for sample in 0..config.target_samples {
             let mut prepared = factory();
@@ -1464,8 +1675,10 @@ impl BenchmarkRunner {
             name: name.to_string(),
             group: group.to_string(),
             kind: BenchmarkKind::Standard,
+            execution_index: 0,
             stats,
             worker_summaries: Vec::new(),
+            metadata: BTreeMap::new(),
         });
     }
 
@@ -1502,6 +1715,7 @@ impl BenchmarkRunner {
         if !self.should_run(name, group) {
             return;
         }
+        self.begin_case();
 
         #[cfg(target_os = "linux")]
         clear_perf_issues();
@@ -1585,8 +1799,10 @@ impl BenchmarkRunner {
             name: name.to_string(),
             group: group.to_string(),
             kind: BenchmarkKind::Standard,
+            execution_index: 0,
             stats,
             worker_summaries: Vec::new(),
+            metadata: BTreeMap::new(),
         });
     }
 
@@ -1644,9 +1860,41 @@ impl BenchmarkRunner {
         throughput: Throughput,
         measurement_domain: MeasurementDomain,
     ) {
+        self.run_concurrent_with_options(
+            name,
+            group,
+            sample_duration,
+            workers,
+            factory,
+            throughput,
+            measurement_domain,
+            None,
+            None,
+            BTreeMap::new(),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_concurrent_with_options<
+        T: ConcurrentBenchContext + Send + Sync,
+        F: Fn(usize) -> T + ?Sized,
+    >(
+        &self,
+        name: &str,
+        group: &str,
+        sample_duration: Duration,
+        workers: &[ConcurrentWorker<T>],
+        factory: &F,
+        throughput: Throughput,
+        measurement_domain: MeasurementDomain,
+        backend_factory: Option<&Rc<dyn Fn() -> Box<dyn MeasurementBackend>>>,
+        lifecycle_factory: Option<&ConcurrentLifecycleFactory<T>>,
+        metadata: BTreeMap<String, String>,
+    ) {
         if !self.should_run(name, group) {
             return;
         }
+        self.begin_case();
         assert!(
             sample_duration > Duration::ZERO,
             "concurrent benchmark sample_duration must be > 0"
@@ -1661,12 +1909,16 @@ impl BenchmarkRunner {
 
         println!("\nBenchmark: {name}");
 
+        let mut lifecycle = lifecycle_factory.map(|factory| factory());
+        let mut backend = backend_factory.map(|factory| factory());
+
         let config = warm_up_concurrent_engine(
             sample_duration,
             workers,
             factory,
             &throughput,
             &self.runtime,
+            &mut lifecycle,
         );
         println!(
             "  calibrated: sample={}ms samples={} estimate={}",
@@ -1694,16 +1946,49 @@ impl BenchmarkRunner {
         let mut summed_worker_counters = vec![Vec::<CounterValue>::new(); workers.len()];
         let mut all_worker_results = vec![Vec::with_capacity(config.target_samples); workers.len()];
         let mut running_throughput = config.estimated_throughput_per_sec;
+        let mut all_metrics = Vec::with_capacity(config.target_samples);
 
         for sample in 0..config.target_samples {
-            let prepared = factory(total_threads);
-            let sample_result = execute_concurrent_sample(
+            let mut prepared = factory(total_threads);
+            let sample_info = ConcurrentSampleInfo {
+                phase: ConcurrentSamplePhase::Measurement,
+                sample_index: sample,
+            };
+            if let Some(lifecycle) = lifecycle.as_deref_mut() {
+                lifecycle.before_sample(&mut prepared, sample_info);
+            }
+            let mut sample_result = execute_concurrent_sample(
                 &prepared,
                 config.sample_duration,
                 workers,
                 #[cfg(target_os = "linux")]
                 &pin_cores,
+                &mut backend,
             );
+
+            let mut sample_metrics = Vec::new();
+            if let Some(backend) = backend.as_deref_mut() {
+                let host_elapsed = sample_result.results.duration;
+                let operations = sample_result.results.iterations;
+                let mut backend_results = Results::default();
+                backend.collect(
+                    host_elapsed,
+                    operations,
+                    sample,
+                    &mut backend_results,
+                    &mut sample_metrics,
+                );
+                apply_concurrent_backend_results(&mut sample_result.results, backend_results);
+            }
+            if let Some(lifecycle) = lifecycle.as_deref_mut() {
+                sample_metrics.extend(lifecycle.after_sample(&mut prepared, sample_info));
+            }
+            for metric in &mut sample_metrics {
+                if metric.section.is_empty() {
+                    metric.section = "scenario";
+                }
+            }
+            all_metrics.push(sample_metrics);
 
             update_running_throughput(&mut running_throughput, &sample_result.results, &throughput);
             for (index, worker_summary) in sample_result.worker_summaries.iter().enumerate() {
@@ -1734,9 +2019,15 @@ impl BenchmarkRunner {
             config.target_samples,
             &throughput,
             measurement_domain,
-            "",
-            true,
-            &[],
+            backend
+                .as_deref()
+                .map(MeasurementBackend::measurement_label)
+                .unwrap_or(""),
+            backend
+                .as_deref()
+                .map(MeasurementBackend::emits_cpu_diagnostics)
+                .unwrap_or(true),
+            &all_metrics,
         );
         let worker_summaries: Vec<WorkerSummary> = workers
             .iter()
@@ -1760,7 +2051,7 @@ impl BenchmarkRunner {
                         threads: worker.threads,
                         counters: summarize_worker_counters(
                             worker_counters,
-                            stats.operations,
+                            worker_results.iterations,
                             stats.total_duration_sec,
                         ),
                         stats,
@@ -1775,8 +2066,10 @@ impl BenchmarkRunner {
             name: name.to_string(),
             group: group.to_string(),
             kind: BenchmarkKind::Concurrent,
+            execution_index: 0,
             stats,
             worker_summaries,
+            metadata,
         });
     }
 }
@@ -2135,18 +2428,14 @@ impl<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> BenchmarkGroupWithFactory<'
 pub struct ConcurrentBenchmarkGroup<'a, T: ConcurrentBenchContext> {
     runner: &'a BenchmarkRunner,
     name: &'static str,
-    throughput: Throughput,
-    measurement_domain: MeasurementDomain,
-    _marker: std::marker::PhantomData<T>,
+    options: ConcurrentGroupOptions<T>,
 }
 
 pub struct ConcurrentBenchmarkGroupWithDuration<'a, T: ConcurrentBenchContext> {
     runner: &'a BenchmarkRunner,
     name: &'static str,
-    throughput: Throughput,
-    measurement_domain: MeasurementDomain,
+    options: ConcurrentGroupOptions<T>,
     sample_duration: Duration,
-    _marker: std::marker::PhantomData<T>,
 }
 
 pub struct ConcurrentBenchmarkGroupWithFactory<
@@ -2157,35 +2446,98 @@ pub struct ConcurrentBenchmarkGroupWithFactory<
 > {
     runner: &'a BenchmarkRunner,
     name: &'static str,
-    throughput: Throughput,
-    measurement_domain: MeasurementDomain,
+    options: ConcurrentGroupOptions<T>,
     sample_duration: Duration,
     factory: &'f F,
 }
 
-impl<'a, T: ConcurrentBenchContext> ConcurrentBenchmarkGroup<'a, T>
-where
-    T: Send + Sync,
-{
+impl<T> ConcurrentGroupOptions<T> {
+    fn with_throughput(&self, throughput: Throughput) -> Self {
+        let mut options = self.clone();
+        options.throughput = throughput;
+        options
+    }
+
+    fn with_domain(&self, measurement_domain: MeasurementDomain) -> Self {
+        let mut options = self.clone();
+        options.measurement_domain = measurement_domain;
+        options
+    }
+
+    fn with_backend<B>(&self, backend_factory: B) -> Self
+    where
+        B: Fn() -> Box<dyn MeasurementBackend> + 'static,
+    {
+        let mut options = self.clone();
+        options.backend_factory = Some(Rc::new(backend_factory));
+        options
+    }
+
+    fn with_lifecycle<L, P>(&self, lifecycle_factory: P) -> Self
+    where
+        L: ConcurrentSampleLifecycle<T> + 'static,
+        P: Fn() -> L + 'static,
+    {
+        let mut options = self.clone();
+        options.lifecycle_factory = Some(Rc::new(move || Box::new(lifecycle_factory())));
+        options
+    }
+
+    fn with_metadata(&self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        let mut options = self.clone();
+        options.metadata.insert(key.into(), value.into());
+        options
+    }
+}
+
+impl<'a, T: ConcurrentBenchContext + Send + Sync> ConcurrentBenchmarkGroup<'a, T> {
     pub fn throughput(&self, throughput: Throughput) -> Self {
         Self {
             runner: self.runner,
             name: self.name,
-            throughput,
-            measurement_domain: self.measurement_domain,
-            _marker: std::marker::PhantomData,
+            options: self.options.with_throughput(throughput),
         }
     }
 
-    /// Declare what this group measures. See
-    /// [`BenchmarkGroup::measurement_domain`].
     pub fn measurement_domain(&self, measurement_domain: MeasurementDomain) -> Self {
         Self {
             runner: self.runner,
             name: self.name,
-            throughput: self.throughput.clone(),
-            measurement_domain,
-            _marker: std::marker::PhantomData,
+            options: self.options.with_domain(measurement_domain),
+        }
+    }
+
+    /// Measure the coordinated worker window with a custom backend.
+    pub fn backend<B>(&self, backend_factory: B) -> Self
+    where
+        B: Fn() -> Box<dyn MeasurementBackend> + 'static,
+    {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            options: self.options.with_backend(backend_factory),
+        }
+    }
+
+    /// Install setup/quiescence callbacks and scenario-scoped metrics.
+    pub fn lifecycle<L, P>(&self, lifecycle_factory: P) -> Self
+    where
+        L: ConcurrentSampleLifecycle<T> + 'static,
+        P: Fn() -> L + 'static,
+    {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            options: self.options.with_lifecycle(lifecycle_factory),
+        }
+    }
+
+    /// Attach benchmark-defined environment or execution context to JSON.
+    pub fn metadata(&self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            options: self.options.with_metadata(key, value),
         }
     }
 
@@ -2200,23 +2552,13 @@ where
         ConcurrentBenchmarkGroupWithDuration {
             runner: self.runner,
             name: self.name,
-            throughput: self.throughput.clone(),
-            measurement_domain: self.measurement_domain,
+            options: self.options.clone(),
             sample_duration,
-            _marker: std::marker::PhantomData,
         }
     }
 
     pub fn bench(&self, name: &str, sample_duration: Duration, workers: &[ConcurrentWorker<T>]) {
-        self.runner.run_concurrent_with_factory_and_throughput(
-            name,
-            self.name,
-            sample_duration,
-            workers,
-            &|num_threads| T::prepare(num_threads),
-            self.throughput.clone(),
-            self.measurement_domain,
-        );
+        self.sample_duration(sample_duration).bench(name, workers);
     }
 
     #[deprecated(note = "use g.sample_duration(...).throughput(...).bench(...) instead")]
@@ -2239,8 +2581,7 @@ where
         ConcurrentBenchmarkGroupWithFactory {
             runner: self.runner,
             name: self.name,
-            throughput: self.throughput.clone(),
-            measurement_domain: self.measurement_domain,
+            options: self.options.clone(),
             sample_duration: DEFAULT_CONCURRENT_SAMPLE_DURATION,
             factory,
         }
@@ -2262,7 +2603,6 @@ where
         factory: &F,
     ) {
         self.sample_duration(sample_duration)
-            .throughput(self.throughput.clone())
             .factory(factory)
             .bench(name, workers);
     }
@@ -2285,31 +2625,56 @@ where
     }
 }
 
-impl<'a, T: ConcurrentBenchContext> ConcurrentBenchmarkGroupWithDuration<'a, T>
-where
-    T: Send + Sync,
-{
+impl<'a, T: ConcurrentBenchContext + Send + Sync> ConcurrentBenchmarkGroupWithDuration<'a, T> {
     pub fn throughput(&self, throughput: Throughput) -> Self {
         Self {
             runner: self.runner,
             name: self.name,
-            throughput,
-            measurement_domain: self.measurement_domain,
+            options: self.options.with_throughput(throughput),
             sample_duration: self.sample_duration,
-            _marker: std::marker::PhantomData,
         }
     }
 
-    /// Declare what this group measures. See
-    /// [`BenchmarkGroup::measurement_domain`].
     pub fn measurement_domain(&self, measurement_domain: MeasurementDomain) -> Self {
         Self {
             runner: self.runner,
             name: self.name,
-            throughput: self.throughput.clone(),
-            measurement_domain,
+            options: self.options.with_domain(measurement_domain),
             sample_duration: self.sample_duration,
-            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn backend<B>(&self, backend_factory: B) -> Self
+    where
+        B: Fn() -> Box<dyn MeasurementBackend> + 'static,
+    {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            options: self.options.with_backend(backend_factory),
+            sample_duration: self.sample_duration,
+        }
+    }
+
+    pub fn lifecycle<L, P>(&self, lifecycle_factory: P) -> Self
+    where
+        L: ConcurrentSampleLifecycle<T> + 'static,
+        P: Fn() -> L + 'static,
+    {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            options: self.options.with_lifecycle(lifecycle_factory),
+            sample_duration: self.sample_duration,
+        }
+    }
+
+    pub fn metadata(&self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            options: self.options.with_metadata(key, value),
+            sample_duration: self.sample_duration,
         }
     }
 
@@ -2320,8 +2685,7 @@ where
         ConcurrentBenchmarkGroupWithFactory {
             runner: self.runner,
             name: self.name,
-            throughput: self.throughput.clone(),
-            measurement_domain: self.measurement_domain,
+            options: self.options.clone(),
             sample_duration: self.sample_duration,
             factory,
         }
@@ -2335,42 +2699,78 @@ where
     }
 
     pub fn bench(&self, name: &str, workers: &[ConcurrentWorker<T>]) {
-        self.runner.run_concurrent_with_factory_and_throughput(
+        self.runner.run_concurrent_with_options(
             name,
             self.name,
             self.sample_duration,
             workers,
             &|num_threads| T::prepare(num_threads),
-            self.throughput.clone(),
-            self.measurement_domain,
+            self.options.throughput.clone(),
+            self.options.measurement_domain,
+            self.options.backend_factory.as_ref(),
+            self.options.lifecycle_factory.as_ref(),
+            self.options.metadata.clone(),
         );
     }
 }
 
-impl<'a, 'f, T: ConcurrentBenchContext, F: Fn(usize) -> T + ?Sized>
-    ConcurrentBenchmarkGroupWithFactory<'a, 'f, T, F>
+impl<'a, 'f, T, F> ConcurrentBenchmarkGroupWithFactory<'a, 'f, T, F>
 where
-    T: Send + Sync,
+    T: ConcurrentBenchContext + Send + Sync,
+    F: Fn(usize) -> T + ?Sized,
 {
     pub fn throughput(&self, throughput: Throughput) -> Self {
         Self {
             runner: self.runner,
             name: self.name,
-            throughput,
-            measurement_domain: self.measurement_domain,
+            options: self.options.with_throughput(throughput),
             sample_duration: self.sample_duration,
             factory: self.factory,
         }
     }
 
-    /// Declare what this group measures. See
-    /// [`BenchmarkGroup::measurement_domain`].
     pub fn measurement_domain(&self, measurement_domain: MeasurementDomain) -> Self {
         Self {
             runner: self.runner,
             name: self.name,
-            throughput: self.throughput.clone(),
-            measurement_domain,
+            options: self.options.with_domain(measurement_domain),
+            sample_duration: self.sample_duration,
+            factory: self.factory,
+        }
+    }
+
+    pub fn backend<B>(&self, backend_factory: B) -> Self
+    where
+        B: Fn() -> Box<dyn MeasurementBackend> + 'static,
+    {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            options: self.options.with_backend(backend_factory),
+            sample_duration: self.sample_duration,
+            factory: self.factory,
+        }
+    }
+
+    pub fn lifecycle<L, P>(&self, lifecycle_factory: P) -> Self
+    where
+        L: ConcurrentSampleLifecycle<T> + 'static,
+        P: Fn() -> L + 'static,
+    {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            options: self.options.with_lifecycle(lifecycle_factory),
+            sample_duration: self.sample_duration,
+            factory: self.factory,
+        }
+    }
+
+    pub fn metadata(&self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            options: self.options.with_metadata(key, value),
             sample_duration: self.sample_duration,
             factory: self.factory,
         }
@@ -2384,22 +2784,24 @@ where
         Self {
             runner: self.runner,
             name: self.name,
-            throughput: self.throughput.clone(),
-            measurement_domain: self.measurement_domain,
+            options: self.options.clone(),
             sample_duration,
             factory: self.factory,
         }
     }
 
     pub fn bench(&self, name: &str, workers: &[ConcurrentWorker<T>]) {
-        self.runner.run_concurrent_with_factory_and_throughput(
+        self.runner.run_concurrent_with_options(
             name,
             self.name,
             self.sample_duration,
             workers,
             self.factory,
-            self.throughput.clone(),
-            self.measurement_domain,
+            self.options.throughput.clone(),
+            self.options.measurement_domain,
+            self.options.backend_factory.as_ref(),
+            self.options.lifecycle_factory.as_ref(),
+            self.options.metadata.clone(),
         );
     }
 }
@@ -2460,6 +2862,7 @@ mod tests {
             measurement_label: String::new(),
             emits_cpu_diagnostics: true,
             metrics: Vec::new(),
+            sample_metrics: Vec::new(),
         }
     }
 
@@ -2495,6 +2898,201 @@ mod tests {
                 "GPU domain should suppress CPU-PMU diagnostic: {diagnostic}"
             );
         }
+    }
+
+    #[test]
+    fn diagnose_stats_suppresses_cpu_pmu_bottlenecks_for_io_domain() {
+        let stats = stats_with_domain(MeasurementDomain::Io);
+        let diagnostics = super::diagnose_stats(&stats);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            !diagnostic.contains("memory latency")
+                && !diagnostic.contains("branch predictor")
+                && !diagnostic.contains("instruction-cache")
+                && !diagnostic.contains("Low IPC")
+        }));
+    }
+
+    #[test]
+    fn concurrent_counter_per_op_uses_total_operations() {
+        let counters = vec![super::CounterValue::new("retries", 30)];
+        let summaries = super::summarize_worker_counters(&counters, 6, 2.0);
+        assert_eq!(summaries[0].total, 30);
+        assert_eq!(summaries[0].per_op, 5.0);
+        assert_eq!(summaries[0].per_sec, 15.0);
+    }
+
+    #[test]
+    fn concurrent_lifecycle_backend_metrics_and_metadata_are_persisted() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+
+        struct Context;
+        impl crate::ConcurrentBenchContext for Context {
+            fn prepare(_num_threads: usize) -> Self {
+                Self
+            }
+        }
+
+        fn worker(
+            _context: &Context,
+            control: &crate::ConcurrentBenchControl,
+        ) -> crate::ConcurrentWorkerResult {
+            let mut operations = 0;
+            while !control.should_stop() {
+                operations += 1;
+                std::hint::spin_loop();
+            }
+            crate::ConcurrentWorkerResult::operations(operations)
+        }
+
+        #[derive(Default)]
+        struct Counts {
+            measured_before: AtomicUsize,
+            measured_after: AtomicUsize,
+            backend_begin: AtomicUsize,
+            backend_end: AtomicUsize,
+            backend_collect: AtomicUsize,
+        }
+
+        struct Lifecycle {
+            counts: Arc<Counts>,
+        }
+        impl crate::ConcurrentSampleLifecycle<Context> for Lifecycle {
+            fn before_sample(
+                &mut self,
+                _context: &mut Context,
+                sample: crate::ConcurrentSampleInfo,
+            ) {
+                if sample.phase == crate::ConcurrentSamplePhase::Measurement {
+                    self.counts.measured_before.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            fn after_sample(
+                &mut self,
+                _context: &mut Context,
+                sample: crate::ConcurrentSampleInfo,
+            ) -> Vec<MetricValue> {
+                if sample.phase == crate::ConcurrentSamplePhase::Measurement {
+                    self.counts.measured_after.fetch_add(1, Ordering::SeqCst);
+                    vec![MetricValue::new(
+                        "queue_depth",
+                        sample.sample_index as f64,
+                        "requests",
+                    )]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        struct Backend {
+            counts: Arc<Counts>,
+        }
+        impl crate::MeasurementBackend for Backend {
+            fn begin(&mut self) {
+                self.counts.backend_begin.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn end(&mut self) {
+                self.counts.backend_end.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            fn collect(
+                &mut self,
+                host_elapsed: Duration,
+                operations: u64,
+                sample_index: usize,
+                results: &mut super::Results,
+                metrics: &mut Vec<MetricValue>,
+            ) {
+                self.counts.backend_collect.fetch_add(1, Ordering::SeqCst);
+                results.duration = host_elapsed;
+                results.iterations = operations;
+                results.chunks_executed = 1;
+                metrics.push(MetricValue::new(
+                    "service_window",
+                    sample_index as f64,
+                    "samples",
+                ));
+            }
+
+            fn measurement_label(&self) -> &'static str {
+                "service window"
+            }
+        }
+
+        let counts = Arc::new(Counts::default());
+        let lifecycle_counts = counts.clone();
+        let backend_counts = counts.clone();
+        let runner = crate::BenchmarkRunner::new().with_runtime(crate::BenchmarkRuntimeOptions {
+            warm_up_duration: Duration::from_millis(2),
+            benchmark_duration: Duration::from_millis(2),
+            min_samples: 2,
+            max_samples: 2,
+        });
+        let workers = [crate::ConcurrentWorker {
+            name: "writer",
+            threads: 1,
+            run: worker,
+        }];
+
+        let run_started = std::time::Instant::now();
+        runner.concurrent_group::<Context>("io", |g| {
+            g.measurement_domain(MeasurementDomain::Io)
+                .lifecycle(move || Lifecycle {
+                    counts: lifecycle_counts.clone(),
+                })
+                .backend(move || {
+                    Box::new(Backend {
+                        counts: backend_counts.clone(),
+                    })
+                })
+                .metadata("filesystem", "ext4")
+                .sample_duration(Duration::from_millis(1))
+                .bench("wal", &workers);
+        });
+
+        assert_eq!(counts.measured_before.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.measured_after.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.backend_begin.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.backend_end.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.backend_collect.load(Ordering::SeqCst), 2);
+
+        let results = runner.results();
+        let run_elapsed = run_started.elapsed();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].metadata.get("filesystem"), Some(&"ext4".into()));
+        assert_eq!(results[0].stats.measurement_domain, MeasurementDomain::Io);
+        assert_eq!(results[0].stats.measurement_label, "service window");
+        assert_eq!(results[0].stats.sample_metrics.len(), 2);
+        let measured_duration = Duration::from_secs_f64(results[0].stats.total_duration_sec);
+        assert!(
+            run_elapsed.saturating_sub(measured_duration) >= Duration::from_millis(15),
+            "backend end overhead leaked into measured duration: run={run_elapsed:?} measured={measured_duration:?}"
+        );
+        for (index, sample) in results[0].stats.sample_metrics.iter().enumerate() {
+            assert_eq!(sample.sample_index, index);
+            assert_eq!(sample.metrics.len(), 2);
+            let lifecycle_metric = sample
+                .metrics
+                .iter()
+                .find(|metric| metric.name == "queue_depth")
+                .unwrap();
+            assert_eq!(lifecycle_metric.section, "scenario");
+            assert_eq!(lifecycle_metric.value, index as f64);
+        }
+    }
+
+    #[test]
+    fn case_cooldown_has_a_mutable_setter() {
+        let mut runner = crate::BenchmarkRunner::new();
+        runner.set_case_cooldown(std::time::Duration::from_millis(25));
+        assert_eq!(runner.case_cooldown, std::time::Duration::from_millis(25));
     }
 
     #[test]

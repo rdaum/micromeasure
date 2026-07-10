@@ -32,8 +32,9 @@ mod threading;
 pub use bench::LinuxPerfBackend;
 pub use bench::backend::BenchSampleResult;
 pub use bench::{
-    BenchContext, BenchmarkRunner, BenchmarkRuntimeOptions, ConcurrentBenchContext,
-    ConcurrentBenchControl, ConcurrentBenchmarkGroup, ConcurrentWorker, ConcurrentWorkerResult,
+    BenchContext, BenchmarkCaseOrder, BenchmarkRunner, BenchmarkRuntimeOptions,
+    ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentBenchmarkGroup, ConcurrentSampleInfo,
+    ConcurrentSampleLifecycle, ConcurrentSamplePhase, ConcurrentWorker, ConcurrentWorkerResult,
     CounterValue, DiagnosticError, DiagnosticResult, MeasurementBackend, MeasurementDomain,
     MetricFormat, MetricValue, NoContext, Throughput, WallClockBackend,
 };
@@ -53,7 +54,7 @@ pub use table::{Alignment, BorderColor, TableFormatter};
 pub use bench::PerfCounters;
 pub use session::{
     BenchmarkKind, BenchmarkReport, BenchmarkResult, BenchmarkStats, ComparisonPolicy,
-    WorkerCounterSummary, WorkerSummary,
+    SampleMetric, SampleMetricSet, WorkerCounterSummary, WorkerSummary,
 };
 
 // Re-export key types for convenience

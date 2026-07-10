@@ -377,308 +377,36 @@ fn timing_window(timing_candidates: &[(u64, u64)]) -> (u64, u64) {
 }
 
 #[cfg(target_os = "linux")]
-fn run_with_individual_counters(run: &mut impl FnMut() -> u64) -> Results {
-    let mut cycles_counter = try_build_individual_counter(Hardware::CPU_CYCLES, "cycles");
-    let mut instructions_counter =
-        try_build_individual_counter(Hardware::INSTRUCTIONS, "instructions");
-    let mut cache_references_counter =
-        try_build_individual_counter(Hardware::CACHE_REFERENCES, "cache-references");
-    let mut l1i_misses_counter = try_build_l1i_counter();
-    let mut branches_counter =
-        try_build_individual_counter(Hardware::BRANCH_INSTRUCTIONS, "branches");
-    let mut branch_misses_counter =
-        try_build_individual_counter(Hardware::BRANCH_MISSES, "branch-misses");
-    let mut cache_misses_counter =
-        try_build_individual_counter(Hardware::CACHE_MISSES, "cache-misses");
-    let mut stalled_cycles_frontend_counter =
-        try_build_individual_counter(Hardware::STALLED_CYCLES_FRONTEND, "stalled-cycles-frontend");
-    let mut stalled_cycles_backend_counter =
-        try_build_individual_counter(Hardware::STALLED_CYCLES_BACKEND, "stalled-cycles-backend");
-
-    if cycles_counter.is_none()
-        && instructions_counter.is_none()
-        && cache_references_counter.is_none()
-        && l1i_misses_counter.is_none()
-        && branches_counter.is_none()
-        && branch_misses_counter.is_none()
-        && cache_misses_counter.is_none()
-        && stalled_cycles_frontend_counter.is_none()
-        && stalled_cycles_backend_counter.is_none()
-    {
-        let start_time = Instant::now();
-        let iterations = run();
-        return Results {
-            duration: start_time.elapsed(),
-            iterations,
-            chunks_executed: 1,
-            ..Results::default()
-        };
-    }
-
-    record_perf_issue("using ungrouped perf counters fallback".to_string());
-
-    enable_counter(&mut cycles_counter, "cycles");
-    enable_counter(&mut instructions_counter, "instructions");
-    enable_counter(&mut cache_references_counter, "cache-references");
-    enable_counter(&mut l1i_misses_counter, "l1i-misses");
-    enable_counter(&mut branches_counter, "branches");
-    enable_counter(&mut branch_misses_counter, "branch-misses");
-    enable_counter(&mut cache_misses_counter, "cache-misses");
-    enable_counter(
-        &mut stalled_cycles_frontend_counter,
-        "stalled-cycles-frontend",
-    );
-    enable_counter(
-        &mut stalled_cycles_backend_counter,
-        "stalled-cycles-backend",
-    );
-
-    let start_time = Instant::now();
-    let iterations = run();
-    let duration = start_time.elapsed();
-
-    disable_counter(&mut cycles_counter, "cycles");
-    disable_counter(&mut instructions_counter, "instructions");
-    disable_counter(&mut cache_references_counter, "cache-references");
-    disable_counter(&mut l1i_misses_counter, "l1i-misses");
-    disable_counter(&mut branches_counter, "branches");
-    disable_counter(&mut branch_misses_counter, "branch-misses");
-    disable_counter(&mut cache_misses_counter, "cache-misses");
-    disable_counter(
-        &mut stalled_cycles_frontend_counter,
-        "stalled-cycles-frontend",
-    );
-    disable_counter(
-        &mut stalled_cycles_backend_counter,
-        "stalled-cycles-backend",
-    );
-
-    let (cycles, cycles_enabled, cycles_running) =
-        read_scaled_counter(&mut cycles_counter, "cycles");
-    let (instructions, instructions_enabled, instructions_running) =
-        read_scaled_counter(&mut instructions_counter, "instructions");
-    let (cache_references, cache_references_enabled, cache_references_running) =
-        read_scaled_counter(&mut cache_references_counter, "cache-references");
-    let (l1i_misses, l1i_misses_enabled, l1i_misses_running) =
-        read_scaled_counter(&mut l1i_misses_counter, "l1i-misses");
-    let (branches, branches_enabled, branches_running) =
-        read_scaled_counter(&mut branches_counter, "branches");
-    let (branch_misses, branch_misses_enabled, branch_misses_running) =
-        read_scaled_counter(&mut branch_misses_counter, "branch-misses");
-    let (cache_misses, cache_misses_enabled, cache_misses_running) =
-        read_scaled_counter(&mut cache_misses_counter, "cache-misses");
-    let (stalled_cycles_frontend, stalled_cycles_frontend_enabled, stalled_cycles_frontend_running) =
-        read_scaled_counter(
-            &mut stalled_cycles_frontend_counter,
-            "stalled-cycles-frontend",
-        );
-    let (stalled_cycles_backend, stalled_cycles_backend_enabled, stalled_cycles_backend_running) =
-        read_scaled_counter(
-            &mut stalled_cycles_backend_counter,
-            "stalled-cycles-backend",
-        );
-
-    let (pmu_time_enabled_ns, pmu_time_running_ns) = timing_window(&[
-        (cycles_enabled, cycles_running),
-        (instructions_enabled, instructions_running),
-        (cache_references_enabled, cache_references_running),
-        (l1i_misses_enabled, l1i_misses_running),
-        (branches_enabled, branches_running),
-        (branch_misses_enabled, branch_misses_running),
-        (cache_misses_enabled, cache_misses_running),
-        (
-            stalled_cycles_frontend_enabled,
-            stalled_cycles_frontend_running,
-        ),
-        (
-            stalled_cycles_backend_enabled,
-            stalled_cycles_backend_running,
-        ),
-    ]);
-
-    Results {
-        cycles,
-        instructions,
-        cache_references,
-        l1i_misses,
-        branches,
-        branch_misses,
-        cache_misses,
-        stalled_cycles_frontend,
-        stalled_cycles_backend,
-        has_cycles: cycles_counter.is_some(),
-        has_instructions: instructions_counter.is_some(),
-        has_cache_references: cache_references_counter.is_some(),
-        has_l1i_misses: l1i_misses_counter.is_some(),
-        has_branches: branches_counter.is_some(),
-        has_branch_misses: branch_misses_counter.is_some(),
-        has_cache_misses: cache_misses_counter.is_some(),
-        has_stalled_cycles_frontend: stalled_cycles_frontend_counter.is_some(),
-        has_stalled_cycles_backend: stalled_cycles_backend_counter.is_some(),
-        pmu_time_enabled_ns,
-        pmu_time_running_ns,
-        duration,
-        iterations,
-        chunks_executed: 1,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn run_with_perf_group(run: &mut impl FnMut() -> u64) -> Option<Results> {
-    let mut perf = build_perf_counter_group()?;
-    if let Err(error) = perf.group.enable() {
-        record_perf_issue(format!("perf group enable failed: {error}"));
-        return None;
-    }
-
-    let start_time = Instant::now();
-    let iterations = run();
-    let duration = start_time.elapsed();
-    if let Err(error) = perf.group.disable() {
-        record_perf_issue(format!("perf group disable failed: {error}"));
-    }
-
-    let counts = match perf.group.read() {
-        Ok(counts) => counts,
-        Err(error) => {
-            record_perf_issue(format!("perf group read failed: {error}"));
-            return None;
-        }
-    };
-
-    let enabled_ns = counts
-        .time_enabled()
-        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
-        .unwrap_or(0);
-    let running_ns = counts
-        .time_running()
-        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
-        .unwrap_or(0);
-
-    let cycles_raw = perf
-        .cycles
-        .as_ref()
-        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
-        .unwrap_or(0);
-    let instructions_raw = perf
-        .instructions
-        .as_ref()
-        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
-        .unwrap_or(0);
-    let cache_references_raw = perf
-        .cache_references
-        .as_ref()
-        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
-        .unwrap_or(0);
-    let l1i_misses_raw = perf
-        .l1i_misses
-        .as_ref()
-        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
-        .unwrap_or(0);
-    let branches_raw = perf
-        .branches
-        .as_ref()
-        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
-        .unwrap_or(0);
-    let branch_misses_raw = perf
-        .branch_misses
-        .as_ref()
-        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
-        .unwrap_or(0);
-    let cache_misses_raw = perf
-        .cache_misses
-        .as_ref()
-        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
-        .unwrap_or(0);
-    let stalled_cycles_frontend_raw = perf
-        .stalled_cycles_frontend
-        .as_ref()
-        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
-        .unwrap_or(0);
-    let stalled_cycles_backend_raw = perf
-        .stalled_cycles_backend
-        .as_ref()
-        .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
-        .unwrap_or(0);
-
-    if (enabled_ns == 0 || running_ns == 0)
-        && cycles_raw == 0
-        && instructions_raw == 0
-        && cache_references_raw == 0
-        && l1i_misses_raw == 0
-        && branches_raw == 0
-        && branch_misses_raw == 0
-        && cache_misses_raw == 0
-        && stalled_cycles_frontend_raw == 0
-        && stalled_cycles_backend_raw == 0
-    {
-        record_perf_issue(
-            "perf counters reported unusable timing window (enabled/running)".to_string(),
-        );
-        return None;
-    }
-
-    if enabled_ns == 0 || running_ns == 0 {
-        record_perf_issue(
-            "perf counters reported unusable timing window (enabled/running)".to_string(),
-        );
-    }
-
-    Some(Results {
-        cycles: scale_multiplexed_count(cycles_raw, enabled_ns, running_ns),
-        instructions: scale_multiplexed_count(instructions_raw, enabled_ns, running_ns),
-        cache_references: scale_multiplexed_count(cache_references_raw, enabled_ns, running_ns),
-        l1i_misses: scale_multiplexed_count(l1i_misses_raw, enabled_ns, running_ns),
-        branches: scale_multiplexed_count(branches_raw, enabled_ns, running_ns),
-        branch_misses: scale_multiplexed_count(branch_misses_raw, enabled_ns, running_ns),
-        cache_misses: scale_multiplexed_count(cache_misses_raw, enabled_ns, running_ns),
-        stalled_cycles_frontend: scale_multiplexed_count(
-            stalled_cycles_frontend_raw,
-            enabled_ns,
-            running_ns,
-        ),
-        stalled_cycles_backend: scale_multiplexed_count(
-            stalled_cycles_backend_raw,
-            enabled_ns,
-            running_ns,
-        ),
-        has_cycles: perf.cycles.is_some(),
-        has_instructions: perf.instructions.is_some(),
-        has_cache_references: perf.cache_references.is_some(),
-        has_l1i_misses: perf.l1i_misses.is_some(),
-        has_branches: perf.branches.is_some(),
-        has_branch_misses: perf.branch_misses.is_some(),
-        has_cache_misses: perf.cache_misses.is_some(),
-        has_stalled_cycles_frontend: perf.stalled_cycles_frontend.is_some(),
-        has_stalled_cycles_backend: perf.stalled_cycles_backend.is_some(),
-        pmu_time_enabled_ns: enabled_ns,
-        pmu_time_running_ns: running_ns,
-        duration,
-        iterations,
-        chunks_executed: 1,
-    })
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn execute_standard(mut run: impl FnMut() -> u64) -> Results {
-    run_with_perf_group(&mut run).unwrap_or_else(|| run_with_individual_counters(&mut run))
+pub(super) fn prepare_concurrent_worker_measurement() -> LinuxPerfBackend {
+    let mut backend = LinuxPerfBackend::new();
+    backend.prepare();
+    backend
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn execute_concurrent_worker<T: ConcurrentBenchContext>(
+    backend: &mut LinuxPerfBackend,
     prepared: &T,
     control: &ConcurrentBenchControl,
     run: fn(&T, &ConcurrentBenchControl) -> ConcurrentWorkerResult,
 ) -> ConcurrentWorkerMeasurement {
-    let mut maybe_counters = None;
-    let results = execute_standard(|| {
-        let worker_result = run(prepared, control);
-        maybe_counters = Some(worker_result.counters);
-        worker_result.operations
-    });
+    let started = Instant::now();
+    let worker_result = run(prepared, control);
+    let host_elapsed = started.elapsed();
+    backend.end();
+
+    let mut results = Results::default();
+    let mut metrics = Vec::new();
+    backend.collect(
+        host_elapsed,
+        worker_result.operations,
+        0,
+        &mut results,
+        &mut metrics,
+    );
     ConcurrentWorkerMeasurement {
         results,
-        counters: maybe_counters.unwrap_or_default(),
+        counters: worker_result.counters,
     }
 }
 
@@ -782,21 +510,19 @@ impl PerfCounters {
 
 /// Active perf measurement strategy for the current sample window.
 ///
-/// Selected in [`LinuxPerfBackend::begin`] by trying the perf group first
-/// and falling back to individual counters, mirroring the historic
-/// `execute_standard` → `run_with_perf_group` → `run_with_individual_counters`
-/// chain.
+/// Prepared before a measurement window by trying the perf group first and
+/// falling back to individual counters. Activation happens separately so
+/// concurrent workers can open counters before their ready barrier.
 #[cfg(target_os = "linux")]
 enum PerfMode {
     /// Not yet initialised for the current sample; no measurement is
     /// active. Also the state after [`LinuxPerfBackend::collect`] resets
     /// for the next sample.
     Idle,
-    /// Perf event group is open and was enabled in `begin`.
+    /// Perf event group is open; it may be prepared or active.
     Group(PerfGroupCounters),
-    /// Individual (ungrouped) counters are open and were enabled in
-    /// `begin`. This is the fallback when the perf group cannot be
-    /// created or enabled.
+    /// Individual (ungrouped) counters are open; they may be prepared or
+    /// active. This is the fallback when the perf group cannot be created.
     Individual(IndividualCounters),
     /// No perf counters could be opened at all — timing-only mode for
     /// this sample. `collect` will leave all `has_*` flags false.
@@ -823,11 +549,11 @@ struct IndividualCounters {
 /// Performance counter measurement backend for Linux.
 ///
 /// Implements [`MeasurementBackend`] by wrapping the existing perf-event
-/// group + individual-counter fallback chain. Each call to
-/// [`begin`](MeasurementBackend::begin) opens a fresh perf group (or
-/// individual counters as fallback), [`end`](MeasurementBackend::end)
-/// disables them, and [`collect`](MeasurementBackend::collect) reads and
-/// scales the counters into [`Results`].
+/// group + individual-counter fallback chain. For ordinary samples,
+/// [`begin`](MeasurementBackend::begin) opens and enables fresh counters,
+/// [`end`](MeasurementBackend::end) disables them, and
+/// [`collect`](MeasurementBackend::collect) reads and scales them into
+/// [`Results`]. Concurrent workers use the internal prepare/activate split.
 ///
 /// This backend is the default on Linux; on other platforms
 /// [`WallClockBackend`] is the default.
@@ -861,24 +587,18 @@ impl LinuxPerfBackend {
         }
     }
 
-    /// Try to build the grouped perf counters. Returns `None` and records
-    /// perf issues on failure — same as the historic `build_perf_counter_group`.
-    fn try_begin_group(&mut self) -> bool {
-        let Some(mut perf) = build_perf_counter_group() else {
+    /// Try to build grouped perf counters without activating them.
+    fn try_prepare_group(&mut self) -> bool {
+        let Some(perf) = build_perf_counter_group() else {
             return false;
         };
-        if let Err(error) = perf.group.enable() {
-            record_perf_issue(format!("perf group enable failed: {error}"));
-            return false;
-        }
         self.mode = PerfMode::Group(perf);
         true
     }
 
-    /// Build and enable individual counters as a fallback when the group
-    /// path is unavailable.
-    fn begin_individual(&mut self) {
-        let mut ind = IndividualCounters {
+    /// Build individual counters without activating them.
+    fn prepare_individual(&mut self) {
+        let ind = IndividualCounters {
             cycles: try_build_individual_counter(Hardware::CPU_CYCLES, "cycles"),
             instructions: try_build_individual_counter(Hardware::INSTRUCTIONS, "instructions"),
             cache_references: try_build_individual_counter(
@@ -911,25 +631,63 @@ impl LinuxPerfBackend {
 
         if all_none {
             // No counters at all — fall through to timing-only mode.
-            // `run_with_individual_counters` records this issue; we do
-            // the same for parity.
+            // Preserve the historical timing-only fallback when no event can
+            // be opened.
             self.mode = PerfMode::None;
             return;
         }
 
         record_perf_issue("using ungrouped perf counters fallback".to_string());
-
-        enable_counter(&mut ind.cycles, "cycles");
-        enable_counter(&mut ind.instructions, "instructions");
-        enable_counter(&mut ind.cache_references, "cache-references");
-        enable_counter(&mut ind.l1i_misses, "l1i-misses");
-        enable_counter(&mut ind.branches, "branches");
-        enable_counter(&mut ind.branch_misses, "branch-misses");
-        enable_counter(&mut ind.cache_misses, "cache-misses");
-        enable_counter(&mut ind.stalled_cycles_frontend, "stalled-cycles-frontend");
-        enable_counter(&mut ind.stalled_cycles_backend, "stalled-cycles-backend");
-
         self.mode = PerfMode::Individual(ind);
+    }
+
+    /// Open all perf-event handles for a future sample without enabling them.
+    pub(super) fn prepare(&mut self) {
+        self.mode = PerfMode::Idle;
+        if !self.try_prepare_group() {
+            self.prepare_individual();
+        }
+    }
+
+    /// Activate handles previously opened by [`Self::prepare`]. Returns false
+    /// only when a prepared group cannot be enabled or no state was prepared.
+    fn enable_prepared(&mut self) -> bool {
+        match &mut self.mode {
+            PerfMode::Group(perf) => {
+                if let Err(error) = perf.group.enable() {
+                    record_perf_issue(format!("perf group enable failed: {error}"));
+                    self.mode = PerfMode::Idle;
+                    false
+                } else {
+                    true
+                }
+            }
+            PerfMode::Individual(ind) => {
+                enable_counter(&mut ind.cycles, "cycles");
+                enable_counter(&mut ind.instructions, "instructions");
+                enable_counter(&mut ind.cache_references, "cache-references");
+                enable_counter(&mut ind.l1i_misses, "l1i-misses");
+                enable_counter(&mut ind.branches, "branches");
+                enable_counter(&mut ind.branch_misses, "branch-misses");
+                enable_counter(&mut ind.cache_misses, "cache-misses");
+                enable_counter(&mut ind.stalled_cycles_frontend, "stalled-cycles-frontend");
+                enable_counter(&mut ind.stalled_cycles_backend, "stalled-cycles-backend");
+                true
+            }
+            PerfMode::None => true,
+            PerfMode::Idle => false,
+        }
+    }
+
+    /// Activate prepared counters, constructing the individual-counter
+    /// fallback if a grouped handle cannot be enabled. Concurrent workers call
+    /// this before their measurement-ready barrier, so the fallback remains
+    /// outside the workload deadline.
+    pub(super) fn begin_prepared(&mut self) {
+        if !self.enable_prepared() {
+            self.prepare_individual();
+            let _ = self.enable_prepared();
+        }
     }
 
     fn disable_group(perf: &mut PerfGroupCounters) {
@@ -1150,14 +908,8 @@ impl LinuxPerfBackend {
 #[cfg(target_os = "linux")]
 impl MeasurementBackend for LinuxPerfBackend {
     fn begin(&mut self) {
-        // Reset state for the new sample window.
-        self.mode = PerfMode::Idle;
-
-        // Try the grouped path first; on failure fall back to individual
-        // counters, matching the historic execute_standard chain.
-        if !self.try_begin_group() {
-            self.begin_individual();
-        }
+        self.prepare();
+        self.begin_prepared();
     }
 
     fn end(&mut self) {
@@ -1197,5 +949,25 @@ impl MeasurementBackend for LinuxPerfBackend {
 
     fn emits_cpu_diagnostics(&self) -> bool {
         true
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{LinuxPerfBackend, PerfMode};
+    use crate::MeasurementBackend;
+
+    #[test]
+    fn prepared_activation_failure_attempts_individual_fallback() {
+        let mut backend = LinuxPerfBackend::new();
+        assert!(matches!(backend.mode, PerfMode::Idle));
+
+        // Idle is the state left by a grouped-counter activation failure.
+        backend.begin_prepared();
+        assert!(matches!(
+            backend.mode,
+            PerfMode::Individual(_) | PerfMode::None
+        ));
+        backend.end();
     }
 }

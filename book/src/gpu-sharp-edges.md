@@ -24,7 +24,7 @@ That reads like a memory-latency problem in the measured work. It isn't — the 
 
 ### The mitigation
 
-`MeasurementDomain` (`src/bench/backend.rs`) tags a group as `Cpu`, `Gpu`, or `Mixed`. The diagnostics path (`diagnose_stats` in `src/bench.rs`) consults it:
+`MeasurementDomain` (`src/bench/backend.rs`) tags a group as `Cpu`, `Gpu`, `Io`, or `Mixed`. The diagnostics path (`diagnose_stats` in `src/bench.rs`) consults it:
 
 - `Gpu`: CPU-PMU bottleneck diagnostics are suppressed entirely. The PMU coverage byline is relabelled to `host PMU (orchestration): coverage=...`.
 - `Mixed`: diagnostics are emitted but prefixed with `[host] `, so the reader knows the signal is host-side context. The byline reads `host PMU (mixed workload)`.
@@ -196,25 +196,18 @@ This is different from a benchmark failure: the workload may be perfectly runnab
 
 Use that conversion inside `diagnostic_pass` when you want timing to remain usable even if counters are unavailable. See [gpu_counters](./examples/gpu-counters.md).
 
-## `MeasurementBackend` is not wired into the concurrent path
+## Concurrent backends use a scenario-wide window
 
-### The problem (current limitation)
+Concurrent groups can opt into `backend(...)`. The coordinator calls `begin`
+after every worker is ready, releases them together, joins them all, then calls
+`end` and `collect`. Backend custom metrics are scenario-scoped. Worker PMU
+summaries are retained separately, so a GPU backend can own combined device
+timing without discarding host-thread context.
 
-The pluggable `MeasurementBackend` trait is wired into the **standard (single-threaded) benchmark path only**. The concurrent path still calls `execute_concurrent_worker` directly and does not invoke `begin`/`end`/`collect` on a backend.
-
-This is called out in the trait's own doc comment in `src/bench/backend.rs`:
-
-> The concurrent path does not yet use the trait — it still calls `execute_standard` directly via `execute_concurrent_worker`.
-
-### What this means for GPU work
-
-- A concurrent GPU benchmark (multiple host threads each launching device work) will not get CUDA-event timing from a `MeasurementBackend`. It will get host wall-clock and CPU PMU per worker.
-- If you need device-side timing for concurrent GPU work today, you have to record CUDA events manually inside the worker functions and report them as `ConcurrentWorkerResult` counters — but those counters are integers, not floats, so this is awkward for ms/TFLOP/s.
-- The clean path today is to use the single-threaded `bench_sample` + `CudaEventBackend` combination per workload, and run multiple such benchmarks rather than one concurrent benchmark with multiple GPU-launching roles.
-
-### When it might change
-
-Wiring the trait into the concurrent path is a real piece of work: the per-worker `Results` aggregation, the join semantics, and the `ConcurrentWorkerMeasurement` shape all assume the built-in measurement path. A future version may extend the trait or introduce a concurrent-specific variant. Until then, treat concurrent + custom backend as unsupported.
+This does not make the built-in `CudaEventBackend` multi-stream aware: it still
+records on the CUDA default stream. A concurrent GPU benchmark using other
+streams needs a custom backend that records the correct device-wide or
+multi-stream boundary.
 
 ## `CudaEventBackend` uses the default stream only
 
@@ -244,6 +237,6 @@ For most metrics this is fine. For categorical or count-valued metrics (algorith
 | No per-sample custom metrics | `bench_sample` + `BenchSampleResult` + `MetricValue` | `src/bench/backend.rs` |
 | Invasive counters contaminate timing | `diagnostic_pass` + `diagnostic_samples` | `src/bench.rs` |
 | NVIDIA counter permissions vary | `GpuCounterError::into_diagnostic_result()` | `src/bench/gpu_counters.rs` |
-| `MeasurementBackend` not on concurrent path | (none yet — use single-threaded `bench_sample`) | `src/bench/backend.rs` trait docs |
+| Concurrent scenario timing | concurrent group `backend(...)` | `src/bench.rs` |
 | `CudaEventBackend` default stream only | (none yet — write a custom backend for multi-stream) | `src/bench/cuda.rs` |
 | `MetricValue` is `f64`-only | `MetricFormat::Integer` for rendering; avoid > 2^53 raw counts | `src/bench/backend.rs` |

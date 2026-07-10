@@ -15,7 +15,7 @@
 use crate::{Alignment, MeasurementDomain, MetricFormat, TableFormatter, Throughput};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs::{self, File},
     io::IsTerminal,
     path::PathBuf,
@@ -34,10 +34,18 @@ pub struct BenchmarkResult {
     pub name: String,
     pub group: String,
     pub kind: BenchmarkKind,
+    /// Zero-based execution order within the persisted session.
+    #[serde(default)]
+    pub execution_index: usize,
     #[serde(flatten)]
     pub stats: BenchmarkStats,
     #[serde(default)]
     pub worker_summaries: Vec<WorkerSummary>,
+    /// Benchmark-defined execution and environment context. Concurrent I/O
+    /// benchmarks use this for filesystem, mount, device, direct-I/O, and
+    /// cache/device-state labels.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -126,11 +134,38 @@ pub struct BenchmarkStats {
     /// Aggregated custom per-sample metrics (mean, median, p95, min, max),
     /// one entry per `(name, unit)` pair reported by a
     /// [`crate::BenchSampleResult`]-returning benchmark. Empty for
-    /// benchmarks that use the plain `bench(...)` API; populated only by
-    /// `bench_sample(...)`. Persisted to JSON, rendered as a
+    /// benchmarks that use the plain `bench(...)` API; populated by
+    /// `bench_sample(...)`, concurrent lifecycle hooks/backends, and
+    /// diagnostic passes. Persisted to JSON and rendered as a
     /// `custom metrics:` table beneath the standard stats table.
     #[serde(default)]
     pub metrics: Vec<MetricSummary>,
+    /// Raw custom metrics in execution order. The vector index and the
+    /// explicit `sample_index` both identify the measured sample.
+    #[serde(default)]
+    pub sample_metrics: Vec<SampleMetricSet>,
+}
+
+/// Custom metrics captured for one measured sample, preserved in execution
+/// order for drift and state-transition analysis.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SampleMetricSet {
+    pub sample_index: usize,
+    pub metrics: Vec<SampleMetric>,
+}
+
+/// Owned, serializable form of a per-sample [`crate::MetricValue`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SampleMetric {
+    pub name: String,
+    pub value: f64,
+    pub unit: String,
+    #[serde(default)]
+    pub section: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub format: MetricFormat,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -265,8 +300,9 @@ impl BenchmarkSession {
         }
     }
 
-    pub(crate) fn add_result(&self, result: BenchmarkResult) {
+    pub(crate) fn add_result(&self, mut result: BenchmarkResult) {
         if let Ok(mut results) = self.results.lock() {
+            result.execution_index = results.len();
             results.push(result);
         }
     }
@@ -323,6 +359,10 @@ impl BenchmarkReport {
             }
             println!();
         }
+        let comparison_pairs = previous_session
+            .as_ref()
+            .map(|previous| pair_results_one_to_one(&self.results, &previous.results))
+            .unwrap_or_default();
 
         let mut groups: BTreeMap<String, Vec<&BenchmarkResult>> = BTreeMap::new();
         for result in &self.results {
@@ -355,8 +395,8 @@ impl BenchmarkReport {
             ]);
 
             for result in &group_results {
-                let change_info = if let Some(ref prev) = previous_session {
-                    matching_previous_result(prev, result)
+                let change_info = if previous_session.is_some() {
+                    matching_previous_result(&comparison_pairs, result)
                         .map(|prev_result| {
                             let change = safe_percent_change(
                                 comparable_throughput_per_sec(result, prev_result),
@@ -426,11 +466,12 @@ impl BenchmarkReport {
                 println!();
             }
 
-            if let Some(ref prev) = previous_session {
+            if previous_session.is_some() {
                 let comparable_results: Vec<_> = group_results
                     .iter()
                     .filter_map(|result| {
-                        matching_previous_result(prev, result).map(|previous| (*result, previous))
+                        matching_previous_result(&comparison_pairs, result)
+                            .map(|previous| (*result, previous))
                     })
                     .collect();
 
@@ -608,14 +649,14 @@ impl BenchmarkReport {
             );
         }
 
-        if let Some(ref prev) = previous_session {
+        if previous_session.is_some() {
             let mut improvements = 0;
             let mut regressions = 0;
             let mut total_change = 0.0;
             let mut comparable_count = 0;
 
             for result in &self.results {
-                if let Some(prev_result) = matching_previous_result(prev, result)
+                if let Some(prev_result) = matching_previous_result(&comparison_pairs, result)
                     && let Some(change) = safe_percent_change(
                         comparable_throughput_per_sec(result, prev_result),
                         comparable_throughput_per_sec(prev_result, result),
@@ -765,14 +806,45 @@ fn colorize_problem(text: &str) -> String {
     format!("\x1b[31m{text}\x1b[0m")
 }
 
-fn matching_previous_result<'a>(
-    previous_report: &'a BenchmarkReport,
+fn matching_previous_result<'previous>(
+    pairs: &[(&BenchmarkResult, &'previous BenchmarkResult)],
     result: &BenchmarkResult,
-) -> Option<&'a BenchmarkResult> {
-    previous_report
-        .results
+) -> Option<&'previous BenchmarkResult> {
+    pairs
         .iter()
-        .find(|previous| previous.name == result.name && previous.kind == result.kind)
+        .find_map(|(current, previous)| std::ptr::eq(*current, result).then_some(*previous))
+}
+
+fn result_identity_matches(current: &BenchmarkResult, previous: &BenchmarkResult) -> bool {
+    current.name == previous.name
+        && current.group == previous.group
+        && current.kind == previous.kind
+        && current.metadata == previous.metadata
+        && current.stats.throughput == previous.stats.throughput
+        && current.stats.measurement_domain == previous.stats.measurement_domain
+}
+
+fn pair_results_one_to_one<'current, 'previous>(
+    current_results: &'current [BenchmarkResult],
+    previous_results: &'previous [BenchmarkResult],
+) -> Vec<(&'current BenchmarkResult, &'previous BenchmarkResult)> {
+    let mut matched_previous = vec![false; previous_results.len()];
+    let mut pairs = Vec::with_capacity(current_results.len().min(previous_results.len()));
+    for current in current_results {
+        let Some((index, previous)) =
+            previous_results
+                .iter()
+                .enumerate()
+                .find(|(index, previous)| {
+                    !matched_previous[*index] && result_identity_matches(current, previous)
+                })
+        else {
+            continue;
+        };
+        matched_previous[index] = true;
+        pairs.push((current, previous));
+    }
+    pairs
 }
 
 fn result_mean_throughput(result: &BenchmarkResult) -> f64 {
@@ -912,10 +984,14 @@ fn comparative_diagnosis(current: &BenchmarkResult, previous: &BenchmarkResult) 
     let host_prefix = match current.stats.measurement_domain {
         MeasurementDomain::Cpu => "",
         MeasurementDomain::Gpu => "",
+        MeasurementDomain::Io => "[host] ",
         MeasurementDomain::Mixed => "[host] ",
     };
     let suppress_cpu_pmu = !current.stats.emits_cpu_diagnostics
-        || matches!(current.stats.measurement_domain, MeasurementDomain::Gpu);
+        || matches!(
+            current.stats.measurement_domain,
+            MeasurementDomain::Gpu | MeasurementDomain::Io
+        );
 
     let mut notes = Vec::new();
     let is_regression = matches!(throughput_change, Some(change) if change <= -2.0);
@@ -1128,16 +1204,11 @@ fn session_is_compatible(
         return false;
     }
 
-    let current_names: BTreeSet<(&str, BenchmarkKind)> = current_results
-        .iter()
-        .map(|result| (result.name.as_str(), result.kind))
-        .collect();
-    let previous_names: BTreeSet<(&str, BenchmarkKind)> = session
-        .results
-        .iter()
-        .map(|result| (result.name.as_str(), result.kind))
-        .collect();
-    current_names == previous_names
+    if current_results.len() != session.results.len() {
+        return false;
+    }
+
+    pair_results_one_to_one(current_results, &session.results).len() == current_results.len()
 }
 
 fn load_latest_session() -> Option<BenchmarkReport> {
@@ -1198,10 +1269,15 @@ mod tests {
     use super::*;
 
     fn make_result(name: &str, throughput_per_sec: f64) -> BenchmarkResult {
+        make_result_in_group("test", name, throughput_per_sec)
+    }
+
+    fn make_result_in_group(group: &str, name: &str, throughput_per_sec: f64) -> BenchmarkResult {
         BenchmarkResult {
             name: name.to_string(),
-            group: "test".to_string(),
+            group: group.to_string(),
             kind: BenchmarkKind::Standard,
+            execution_index: 0,
             stats: BenchmarkStats {
                 throughput: Throughput::ops(),
                 throughput_per_sec,
@@ -1246,8 +1322,10 @@ mod tests {
                 measurement_label: String::new(),
                 emits_cpu_diagnostics: true,
                 metrics: Vec::new(),
+                sample_metrics: Vec::new(),
             },
             worker_summaries: Vec::new(),
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -1339,6 +1417,112 @@ mod tests {
             "host-a",
             "suite-a",
             &current_results
+        ));
+
+        let mut different_storage =
+            make_session("host-a", Some("suite-a"), &["bench_a", "bench_b"]);
+        different_storage.results[0]
+            .metadata
+            .insert("filesystem".to_string(), "xfs".to_string());
+        assert!(!session_is_compatible(
+            &different_storage,
+            "host-a",
+            "suite-a",
+            &current_results
+        ));
+    }
+
+    #[test]
+    fn previous_result_matching_uses_full_identity() {
+        let append = make_result_in_group("append", "1t", 10.0);
+        let strict = make_result_in_group("strict", "1t", 20.0);
+        let report = BenchmarkReport {
+            timestamp: "123".to_string(),
+            hostname: "host-a".to_string(),
+            suite: Some("suite-a".to_string()),
+            git_commit: None,
+            results: vec![append, strict],
+        };
+
+        let current = make_result_in_group("strict", "1t", 30.0);
+        let current_results = vec![current];
+        let pairs = pair_results_one_to_one(&current_results, &report.results);
+        let previous = matching_previous_result(&pairs, &current_results[0]).unwrap();
+        assert_eq!(previous.group, "strict");
+        assert_eq!(previous.stats.throughput_per_sec, 20.0);
+    }
+
+    #[test]
+    fn report_comparison_pairs_exact_duplicates_one_to_one() {
+        let current = vec![
+            make_result_in_group("append", "1t", 100.0),
+            make_result_in_group("append", "1t", 200.0),
+        ];
+        let previous = vec![
+            make_result_in_group("append", "1t", 10.0),
+            make_result_in_group("append", "1t", 20.0),
+        ];
+
+        let pairs = pair_results_one_to_one(&current, &previous);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(
+            matching_previous_result(&pairs, &current[0])
+                .unwrap()
+                .stats
+                .throughput_per_sec,
+            10.0
+        );
+        assert_eq!(
+            matching_previous_result(&pairs, &current[1])
+                .unwrap()
+                .stats
+                .throughput_per_sec,
+            20.0
+        );
+    }
+
+    #[test]
+    fn session_compatibility_matches_duplicate_names_one_to_one() {
+        let current = vec![
+            make_result_in_group("append", "1t", 10.0),
+            make_result_in_group("strict", "1t", 20.0),
+        ];
+        let compatible = BenchmarkReport {
+            timestamp: "123".to_string(),
+            hostname: "host-a".to_string(),
+            suite: Some("suite-a".to_string()),
+            git_commit: None,
+            results: vec![
+                make_result_in_group("strict", "1t", 21.0),
+                make_result_in_group("append", "1t", 11.0),
+            ],
+        };
+        assert!(session_is_compatible(
+            &compatible,
+            "host-a",
+            "suite-a",
+            &current
+        ));
+
+        let reuses_one_previous = BenchmarkReport {
+            timestamp: "123".to_string(),
+            hostname: "host-a".to_string(),
+            suite: Some("suite-a".to_string()),
+            git_commit: None,
+            results: vec![
+                make_result_in_group("append", "1t", 11.0),
+                make_result_in_group("relaxed", "1t", 12.0),
+            ],
+        };
+        let duplicate_current = vec![
+            make_result_in_group("append", "1t", 10.0),
+            make_result_in_group("append", "1t", 20.0),
+        ];
+        assert!(!session_is_compatible(
+            &reuses_one_previous,
+            "host-a",
+            "suite-a",
+            &duplicate_current
         ));
     }
 }

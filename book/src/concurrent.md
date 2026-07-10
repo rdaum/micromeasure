@@ -11,6 +11,7 @@ Use concurrent benchmarks when the thing you care about only shows up under cont
 - cache misses caused by reader/writer interference
 - branch miss behaviour in optimistic retry loops
 - lock or latch implementations under mixed access patterns
+- asynchronous storage, network, or device services shared by worker roles
 
 Do not use it for "run the same CPU bench on N threads and sum the throughput" — that's better expressed as N independent single-threaded benchmarks.
 
@@ -23,6 +24,8 @@ Do not use it for "run the same CPU bench on N threads and sum the throughput" �
 | `ConcurrentBenchControl` | Per-thread control handle passed to the worker fn. `should_stop()`, `thread_index()`, `role_thread_index()`. |
 | `ConcurrentWorkerResult` | What a worker returns: `operations: u64` plus optional named `counters`. |
 | `ConcurrentBenchmarkGroup<C>` | Fluent group builder, registered via `runner.concurrent_group::<C>(...)`. |
+| `ConcurrentSampleLifecycle<C>` | Optional setup/quiescence observer around every warm-up and measurement sample. |
+| `ConcurrentSampleInfo` | Sample phase (`WarmUp` or `Measurement`) and zero-based phase-local index. |
 
 ## The worker function
 
@@ -66,6 +69,69 @@ These event counters are intended to be:
 
 That keeps event reporting out of the measured hot path. The framework reports them under each worker role as `bench event counters`, including total count, per-operation rate, and per-second rate.
 
+`Per Op` uses the total event count divided by total operations across all
+samples. `Per Sec` uses total measured duration over the same samples.
+
+## Shared state and scenario metrics
+
+Worker counters are deliberately integer and role-local. Use a lifecycle
+observer for shared service telemetry, floating-point values, distributions,
+or unit-bearing metrics:
+
+```rust,ignore
+struct WalLifecycle;
+
+impl ConcurrentSampleLifecycle<WalContext> for WalLifecycle {
+    fn before_sample(&mut self, ctx: &mut WalContext, _sample: ConcurrentSampleInfo) {
+        ctx.reset_wal();
+    }
+
+    fn after_sample(
+        &mut self,
+        ctx: &mut WalContext,
+        sample: ConcurrentSampleInfo,
+    ) -> Vec<MetricValue> {
+        ctx.wait_until_quiescent();
+        if sample.phase == ConcurrentSamplePhase::WarmUp {
+            return Vec::new();
+        }
+        let telemetry = ctx.telemetry();
+        vec![
+            MetricValue::new("writes_per_barrier", telemetry.writes_per_barrier, "writes"),
+            MetricValue::new("fsync_service_ms", telemetry.fsync_service_ms, "ms"),
+        ]
+    }
+}
+
+g.lifecycle(|| WalLifecycle)
+    .measurement_domain(MeasurementDomain::Io)
+    .metadata("filesystem", "ext4")
+    .metadata("direct_io", "false")
+    .sample_duration(Duration::from_millis(50))
+    .bench("wal", &workers);
+```
+
+`before_sample` runs after context construction and before timing starts.
+`after_sample` runs after every worker has joined and after timing stops, so it
+can quiesce background services and collect the final sample without relying on
+the next factory call. Warm-up callbacks run too, but their metrics are
+discarded. Measured lifecycle metrics are automatically assigned the
+`scenario` section, aggregated in `stats.metrics`, and retained individually in
+chronological `stats.sample_metrics`.
+
+## Whole-sample measurement backends
+
+Concurrent groups accept the same opt-in `backend(|| Box<dyn
+MeasurementBackend>)` configuration as standard groups. `begin` runs after all
+workers are ready and immediately before their coordinated release; `end` runs
+after all worker joins. `collect` then contributes scenario metrics and may
+replace the combined duration while worker PMU summaries remain available as
+host-orchestration context.
+
+Lifecycle and backend responsibilities stay separate: the backend owns the
+measurement window, while the lifecycle owns reset, quiescence, and telemetry
+outside that window.
+
 ## Wiring it up
 
 ```rust,ignore
@@ -100,6 +166,9 @@ A `bench event counters` table appears under each role when workers return named
 
 The `workers combined` section at the bottom is a whole-scenario aggregate. It is mainly useful as the PMU view of the entire interacting workload; the per-role tables are usually the more meaningful place to interpret throughput and latency.
 
+Raw throughput, latency, and custom metric samples are persisted in execution
+order. Percentiles sort temporary copies rather than changing the report data.
+
 ## Calibration and sample count
 
 Concurrent benchmarks do not run the CPU-style chunk-size calibration (there is no single chunk to size). Instead:
@@ -114,9 +183,22 @@ Because the work window is fixed by `sample_duration`, throughput is `operations
 
 On Linux, the runner pins worker threads to detected performance cores (via `detect_performance_cores`) so concurrent samples are not silently migrated across heterogeneous cores (P/E cores on Intel, etc.). Pinning can be disabled — see the affinity documentation in the source if you need to opt out for a specific scenario.
 
-## What's not supported (yet)
+## I/O runs and case order
 
-- The pluggable `MeasurementBackend` trait is **not** wired into the concurrent path. Concurrent benchmarks still use the built-in `execute_concurrent_worker` directly. If you need a custom backend (e.g. CUDA events) for concurrent GPU work, that path is not yet available; use the single-threaded `bench_sample` path with a backend instead. This is called out in [GPU Benchmarking Sharp Edges](./gpu-sharp-edges.md).
+Use `MeasurementDomain::Io` for I/O-bound scenarios. CPU PMU values remain in
+worker summaries but are labelled as host orchestration and do not produce CPU
+bottleneck conclusions.
+
+Attach storage state with repeated `metadata(key, value)` calls. Metadata and
+execution order are persisted, and a previous report with different metadata,
+throughput, or measurement domain is not considered comparison-compatible.
+
+For caller-owned case arrays, `BenchmarkCaseOrder::Randomized { seed }` and
+`runner.ordered_case_indices(...)` provide deterministic randomization. Record
+the seed as metadata. `runner.set_case_cooldown(duration)` adds an unmeasured
+pause between benchmark cases and works directly with the mutable runner
+supplied by `benchmark_main!`; `with_case_cooldown` is available for owned
+builders. The runner never clears caches or mutates device state itself.
 
 ## Worked examples
 

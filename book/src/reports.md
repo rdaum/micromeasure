@@ -32,9 +32,9 @@ To disable saving, set `BenchmarkMainOptions { save_results: false, ... }` and c
 - `hostname` — used to gate comparison (different host = incompatible)
 - `suite` — optional suite name (defaults to the crate name); comparison requires same suite
 - `git_commit` — short SHA captured at session start (best-effort)
-- `results: Vec<BenchmarkResult>` — one per benchmark, each with `name`, `kind` (`Standard`/`Concurrent`), stats, and (for concurrent) per-worker summaries
+- `results: Vec<BenchmarkResult>` — one per benchmark, each with `name`, `kind` (`Standard`/`Concurrent`), `execution_index`, metadata, stats, and (for concurrent) per-worker summaries
 
-`BenchmarkStats` (the per-benchmark payload) carries the aggregated numbers: throughput median/p95, latency median/p95, MAD, CV, outlier count, sample count, all the PMU-derived per-op counts, the PMU coverage fields, the `measurement_label`, `measurement_domain`, `emits_cpu_diagnostics`, and the custom `metrics: Vec<MetricSummary>` (mean/median/p95/min/max/sample count per `(section, name, unit)`).
+`BenchmarkStats` (the per-benchmark payload) carries the aggregated numbers: throughput median/p95, latency median/p95, MAD, CV, outlier count, sample count, all the PMU-derived per-op counts, the PMU coverage fields, the `measurement_label`, `measurement_domain`, `emits_cpu_diagnostics`, custom `metrics: Vec<MetricSummary>` (mean/median/p95/min/max/sample count per `(section, name, unit)`), and chronological `sample_metrics`.
 
 ## Comparison policy
 
@@ -65,7 +65,8 @@ A previous report is **compatible** with the current run when all of:
 
 - same `hostname`
 - same `suite` (crate name by default)
-- the **same set** of `(name, kind)` benchmark results
+- the same number of results, matched one-to-one by group, name, and kind
+- matching throughput configuration, measurement domain, and per-result metadata
 
 If the previous report has a different set of benchmarks (you added/removed/renamed one), it is not compatible and the runner skips the comparison rather than printing misleading deltas. Rename a benchmark and you lose comparability with the previous run — by design.
 
@@ -96,11 +97,15 @@ diff <(jq '.results[0].stats' target/benchmark_results_<prev>.json) \
      <(jq '.results[0].stats' target/benchmark_results_<curr>.json)
 ```
 
-Because `BenchmarkStats` derives serde, custom metrics from `bench_sample` / `diagnostic_pass` are persisted alongside the standard fields under `metrics: Vec<MetricSummary>`.
+Because `BenchmarkStats` derives serde, custom metrics from `bench_sample`,
+concurrent lifecycle/backend collection, and `diagnostic_pass` are persisted as
+summaries under `metrics`. Timing-sample metrics are also retained under
+`sample_metrics` in execution order. Throughput and latency sample arrays are
+chronological as well; percentile calculation never sorts the stored arrays.
 
 ## Workflow tips
 
 - Run from the same checkout and the same machine for comparable reports. Hostname and suite mismatch intentionally block comparison.
-- If you change `Throughput` units for a benchmark, previous comparisons for that benchmark become meaningless (different rate magnitude). The compatibility check doesn't catch this — it's on you to bump the suite name or accept a noisy diff.
+- Changing `Throughput`, `MeasurementDomain`, or benchmark metadata makes the previous report incompatible, preventing a misleading comparison.
 - The report captures `git_commit` best-effort. If you are benchmarking uncommitted changes, the SHA still points at HEAD, not your working tree.
 - Reports accumulate in `target/`. They are not garbage-collected. Either add a `make clean-reports` target or clean the directory manually when it gets large.

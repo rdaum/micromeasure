@@ -39,9 +39,10 @@ Filter parsing helpers, exposed for custom entry points.
 
 | Type | Purpose | Source |
 |---|---|---|
-| `BenchmarkRunner` | Owns groups, runtime options, filter. `group(...)`, `concurrent_group(...)`, `set_runtime(...)`, `with_filter(...)`, `with_suite(...)`. | `src/bench.rs` |
+| `BenchmarkRunner` | Owns groups, runtime options, filter. Also provides `set_case_cooldown` / `with_case_cooldown` and deterministic case ordering. | `src/bench.rs` |
 | `BenchmarkGroup<C>` | Fluent builder for single-threaded benches. `throughput`, `factory`, `measurement_domain`, `backend`, `bench`, `bench_sample`, `diagnostic_pass`, `diagnostic_samples`. | `src/bench.rs` |
-| `ConcurrentBenchmarkGroup<C>` | Fluent builder for concurrent benches. `sample_duration`, `throughput`, `bench`. | `src/bench.rs` |
+| `ConcurrentBenchmarkGroup<C>` | Fluent concurrent builder: `sample_duration`, `throughput`, `measurement_domain`, `backend`, `lifecycle`, `metadata`, `factory`, `bench`. | `src/bench.rs` |
+| `BenchmarkCaseOrder` | `Declared` or deterministic `Randomized { seed }`; use with `ordered_case_indices`. | `src/bench.rs` |
 | `BenchmarkRuntimeOptions` | `warm_up_duration`, `benchmark_duration`, `min_samples`, `max_samples`. | `src/bench.rs` |
 
 ## Bench context
@@ -60,6 +61,8 @@ Filter parsing helpers, exposed for custom entry points.
 | `ConcurrentBenchControl` | `should_stop()`, `thread_index()`, `role_thread_index()`. | `src/bench.rs` |
 | `ConcurrentWorkerResult` | `operations: u64` + named `counters`. `operations(n)`, `with_counter(name, value)`. | `src/bench.rs` |
 | `CounterValue` | `{ name, value }`. | `src/bench.rs` |
+| `ConcurrentSampleLifecycle<C>` | `before_sample` setup and `after_sample` quiescence/scenario metrics outside timing. | `src/bench.rs` |
+| `ConcurrentSampleInfo` / `ConcurrentSamplePhase` | Phase-local sample identity for lifecycle callbacks. | `src/bench.rs` |
 
 ## Throughput
 
@@ -78,7 +81,7 @@ Throughput::per_operation(amount, unit)    // arbitrary unit
 | Type | Purpose | Source |
 |---|---|---|
 | `MeasurementBackend` | Object-safe trait: `begin`, `end`, `collect`, `measurement_label`, `emits_cpu_diagnostics`. | `src/bench/backend.rs` |
-| `MeasurementDomain` | `Cpu` / `Gpu` / `Mixed`. | `src/bench/backend.rs` |
+| `MeasurementDomain` | `Cpu` / `Gpu` / `Io` / `Mixed`. | `src/bench/backend.rs` |
 | `WallClockBackend` | Timing-only fallback. | `src/bench/backend.rs` |
 | `LinuxPerfBackend` | Linux default (perf-event group + fallback). Linux only. | `src/bench/perf.rs` |
 | `PerfCounters` | Low-level perf counter handle. Linux only. | `src/bench/perf.rs` |
@@ -110,15 +113,16 @@ Register with `g.diagnostic_pass(f)` and `g.diagnostic_samples(n)` on a `Benchma
 | Type | Purpose | Source |
 |---|---|---|
 | `Results` | Per-sample measurement: PMU counters, `has_*` flags, `pmu_time_enabled_ns`/`pmu_time_running_ns`, `duration`, `iterations`, `chunks_executed`. `add`, `divide`. | `src/bench.rs` |
-| `BenchmarkStats` | Aggregated per-benchmark stats: throughput/latency median+p95, MAD, CV, outliers, PMU per-op counts, `metrics: Vec<MetricSummary>`, `measurement_label`, `measurement_domain`, `emits_cpu_diagnostics`. | `src/session.rs` |
+| `BenchmarkStats` | Aggregated stats plus chronological throughput, latency, and `sample_metrics`; also contains `metrics: Vec<MetricSummary>`. | `src/session.rs` |
 | `MetricSummary` | Aggregated custom metric: mean, median, p95, min, max, sample count, `format`. | `src/session.rs` |
+| `SampleMetricSet` / `SampleMetric` | Owned custom metrics for one measured sample, persisted in execution order. | `src/session.rs` |
 
 ## Reports & comparison
 
 | Type | Purpose | Source |
 |---|---|---|
 | `BenchmarkReport` | Persisted report: `timestamp`, `hostname`, `suite`, `git_commit`, `results`. `save_to_default_location()`, `print_summary_with(policy)`. | `src/session.rs` |
-| `BenchmarkResult` | One benchmark's persisted entry: `name`, `kind`, stats, worker summaries. | `src/session.rs` |
+| `BenchmarkResult` | One persisted entry: `name`, `kind`, `execution_index`, metadata, stats, worker summaries. | `src/session.rs` |
 | `BenchmarkKind` | `Standard` / `Concurrent`. | `src/session.rs` |
 | `ComparisonPolicy` | `None` / `LatestCompatible`. | `src/session.rs` |
 | `WorkerSummary` | Per-role summary for concurrent benchmarks: `name`, `threads`, `stats`, `counters`. | `src/session.rs` |

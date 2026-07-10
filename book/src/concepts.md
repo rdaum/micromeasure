@@ -63,7 +63,7 @@ The closure receives a `BenchmarkGroup<C>`, which is a **fluent** builder: each 
 |---|---|
 | `throughput(t)` | What one operation represents, for `X/s` output |
 | `factory(\|\| C)` | Override the default `C::prepare(...)` constructor. Returns a different type (`BenchmarkGroupWithFactory`), not `Self` — it's a type-state transition. The factory is called per sample, same lifecycle as `prepare`. |
-| `measurement_domain(d)` | `Cpu` / `Gpu` / `Mixed` — controls CPU-PMU diagnostics |
+| `measurement_domain(d)` | `Cpu` / `Gpu` / `Io` / `Mixed` — controls CPU-PMU diagnostics |
 | `backend(\|\| Box<dyn MeasurementBackend>)` | Replace the platform default measurement path |
 | `bench(name, f)` | Register a `fn(&mut C, usize, usize)` benchmark |
 | `bench_sample(name, f)` | Register a bench that returns `BenchSampleResult` |
@@ -186,6 +186,6 @@ For every benchmark, the stats table reports:
 - outlier count across `samples`
 - when PMU is available: cycles/op, instructions/op, IPC, branches/op, branch miss %, cache refs/op, cache misses/op, cache miss %, frontend/backend stall %
 
-A `possible bottlenecks:` section may follow, derived from the PMU counters. Domain rules (Cpu/Gpu/Mixed) control whether these appear — see [GPU Benchmarks](./gpu.md#measurement-domain).
+A `possible bottlenecks:` section may follow, derived from the PMU counters. Domain rules (Cpu/Gpu/Io/Mixed) control whether these appear — see [GPU Benchmarks](./gpu.md#measurement-domain).
 
 That's the whole conceptual surface. The remaining chapters specialize it.

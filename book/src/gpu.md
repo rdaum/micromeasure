@@ -2,7 +2,7 @@
 
 `micromeasure` can benchmark GPU work (e.g. cuBLASLt GEMM, CUDA streams) alongside CPU microbenchmarks. Three features work together to make GPU output less misleading than naive "wrap a kernel in `Instant::now`" timing:
 
-1. **`MeasurementDomain`** — tags a group as `Cpu`, `Gpu`, or `Mixed` to control CPU-PMU diagnostics.
+1. **`MeasurementDomain`** — tags a group as `Cpu`, `Gpu`, `Io`, or `Mixed` to control CPU-PMU diagnostics.
 2. **`MeasurementBackend`** — pluggable measurement window around the bench closure. The built-in `CudaEventBackend` records CUDA events on the default stream and uses device elapsed time as the sample duration.
 3. **Per-sample custom metrics** — `bench_sample(...)` lets the bench return a `BenchSampleResult` carrying `operations` plus named metrics (`cuda_event_ms`, `tflops`, ...). The runner aggregates them across samples and renders a `custom metrics:` table.
 
@@ -271,6 +271,6 @@ The pieces compose:
 
 ## Limitations
 
-- The `MeasurementBackend` trait is wired into the **single-threaded** path only. The concurrent path does not yet use it. See [GPU Benchmarking Sharp Edges](./gpu-sharp-edges.md#measurementbackend-is-not-wired-into-the-concurrent-path).
+- Concurrent groups can apply a backend to the coordinated worker window. The built-in `CudaEventBackend` still records only the default stream. See [GPU Benchmarking Sharp Edges](./gpu-sharp-edges.md#concurrent-backends-use-a-scenario-wide-window).
 - `CudaEventBackend` uses the **default stream** only. Multi-stream work would need a custom backend or an extension.
 - `GpuCounterCollector` is NVIDIA-only and uses CUPTI/NVPerf. It may require driver counter permissions; permission failures should be treated as diagnostic availability failures, not benchmark timing failures.

@@ -52,7 +52,7 @@ Letting `calibrate_engine` pick the chunk size for a GPU benchmark produces a nu
 
 ### The mitigation
 
-`BenchContext::chunk_size() -> Option<usize>` lets a benchmark **bypass chunk-size calibration** and declare a fixed chunk size. When it returns `Some(n)`, `calibrate_engine` warms up at that size, uses the observed warm-up duration to select a sample count, and then runs the fixed-size samples.
+`BenchContext::chunk_size() -> Option<usize>` lets a benchmark **bypass chunk-size calibration** and declare a fixed chunk size. When it returns `Some(n)`, `calibrate_engine` warms up at that size, uses the active measurement backend's observed duration to select a sample count, and then runs the fixed-size samples.
 
 Every GPU example in this crate uses a fixed `chunk_size()`:
 
@@ -72,7 +72,7 @@ When `chunk_size()` returns `Some`, the runner estimates chunk throughput and du
 
 - You are responsible for picking a chunk size that matches the workload you care about. The framework will not second-guess you.
 - `benchmark_duration` remains a target rather than a hard limit. The `min_samples` and `max_samples` bounds can still make the actual run shorter or longer.
-- If your per-sample device time is large, consider raising `min_samples` or lowering the chunk size so the run completes in reasonable wall-clock time.
+- If your per-sample device time is large, consider lowering `min_samples` or the chunk size so the run completes in reasonable wall-clock time.
 
 ## Host wall-clock is not device time
 

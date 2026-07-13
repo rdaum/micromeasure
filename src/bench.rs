@@ -879,6 +879,7 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize,
     factory: &F,
     throughput: &Throughput,
     runtime: &BenchmarkRuntimeOptions,
+    backend: &mut dyn MeasurementBackend,
 ) -> BenchmarkConfig {
     rewrite_line("🔥 calibrating benchmark");
 
@@ -890,9 +891,27 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize,
         let mut last_progress = Instant::now();
         while Instant::now() < warm_up_end {
             let mut prepared = factory();
+            backend.begin();
             let started = Instant::now();
             black_box(|| f(&mut prepared, preferred_chunk_size, warm_up_count))();
-            measured_warm_up_duration += started.elapsed();
+            let host_elapsed = started.elapsed();
+            backend.end();
+
+            let mut results = Results::default();
+            let mut metrics = Vec::new();
+            let operations = T::operations_per_chunk().unwrap_or(preferred_chunk_size as u64);
+            backend.collect(
+                host_elapsed,
+                operations,
+                warm_up_count,
+                &mut results,
+                &mut metrics,
+            );
+            measured_warm_up_duration += if results.duration > Duration::ZERO {
+                results.duration
+            } else {
+                host_elapsed
+            };
             warm_up_count += 1;
 
             // Throttle progress updates to avoid spamming the terminal
@@ -1634,7 +1653,7 @@ impl BenchmarkRunner {
         let _affinity_guard = BenchAffinityGuard::acquire();
         println!("\nBenchmark: {name}");
 
-        let config = calibrate_engine(f, factory, &throughput, &self.runtime);
+        let config = calibrate_engine(f, factory, &throughput, &self.runtime, backend.as_mut());
         println!(
             "  calibrated: chunk={} samples={} estimate={}",
             config.chunk_size,
@@ -1758,7 +1777,13 @@ impl BenchmarkRunner {
         let calibrate_fn = |ctx: &mut T, cs: usize, cn: usize| {
             let _ = f(ctx, cs, cn);
         };
-        let config = calibrate_engine(calibrate_fn, factory, &throughput, &self.runtime);
+        let config = calibrate_engine(
+            calibrate_fn,
+            factory,
+            &throughput,
+            &self.runtime,
+            backend.as_mut(),
+        );
         println!(
             "  calibrated: chunk={} samples={} estimate={}",
             config.chunk_size,
@@ -3212,6 +3237,7 @@ mod tests {
             &|| SlowContext,
             &Throughput::ops(),
             &runtime,
+            &mut crate::WallClockBackend::new(),
         );
 
         assert!(
@@ -3224,7 +3250,7 @@ mod tests {
     #[test]
     fn fixed_chunk_sample_count_uses_measured_warm_up_duration() {
         use super::{BenchmarkRuntimeOptions, calibrate_engine};
-        use crate::BenchContext;
+        use crate::{BenchContext, MeasurementBackend, MetricValue, bench::Results};
         use std::time::Duration;
 
         struct FixedContext;
@@ -3239,8 +3265,29 @@ mod tests {
             }
         }
 
+        struct FixedDurationBackend;
+
+        impl MeasurementBackend for FixedDurationBackend {
+            fn begin(&mut self) {}
+
+            fn end(&mut self) {}
+
+            fn collect(
+                &mut self,
+                _host_elapsed: Duration,
+                operations: u64,
+                _chunk_index: usize,
+                results: &mut Results,
+                _metrics: &mut Vec<MetricValue>,
+            ) {
+                results.duration = Duration::from_millis(4);
+                results.iterations = operations;
+                results.chunks_executed = 1;
+            }
+        }
+
         fn fixed_operation(_ctx: &mut FixedContext, _chunk_size: usize, _chunk_num: usize) {
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(Duration::from_millis(1));
         }
 
         let runtime = BenchmarkRuntimeOptions {
@@ -3254,14 +3301,11 @@ mod tests {
             &|| FixedContext,
             &Throughput::ops(),
             &runtime,
+            &mut FixedDurationBackend,
         );
 
         assert_eq!(config.chunk_size, 1);
-        assert!(
-            (5..=15).contains(&config.target_samples),
-            "expected the 20 ms budget to select about ten samples, got {}",
-            config.target_samples
-        );
+        assert_eq!(config.target_samples, 5);
         assert!(config.estimated_throughput_per_sec > 0.0);
     }
 

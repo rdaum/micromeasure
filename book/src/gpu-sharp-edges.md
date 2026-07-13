@@ -40,7 +40,7 @@ See `src/bench.rs` around `diagnose_stats` for the exact thresholds and the `[ho
 
 ### The problem
 
-The single-threaded calibration path (`calibrate_engine` in `src/bench.rs`) finds a `chunk_size` such that one chunk takes roughly 50 ms (`TARGET_CHUNK_DURATION`). It does up to 15 passes, starting at `MIN_CHUNK_SIZE` (100,000) and scaling by the ratio of target-to-observed duration, clamped to `[MIN_CHUNK_SIZE, MAX_CHUNK_SIZE]` (100,000..50,000,000).
+The single-threaded calibration path (`calibrate_engine` in `src/bench.rs`) finds a `chunk_size` such that one chunk takes roughly 50 ms (`TARGET_CHUNK_DURATION`). It does up to 15 passes, starting with one operation and scaling by the ratio of target-to-observed duration, clamped to `1..=50,000,000` operations.
 
 This model assumes the work scales roughly linearly with `chunk_size` and that 50 ms is a meaningful sample window. Both assumptions break for GPU work:
 
@@ -52,7 +52,7 @@ Letting `calibrate_engine` pick the chunk size for a GPU benchmark produces a nu
 
 ### The mitigation
 
-`BenchContext::chunk_size() -> Option<usize>` lets a benchmark **bypass calibration** and declare a fixed chunk size. When it returns `Some(n)`, `calibrate_engine` skips the scaling passes entirely and just warms up at the fixed size for `warm_up_duration`, then runs `min_samples` samples.
+`BenchContext::chunk_size() -> Option<usize>` lets a benchmark **bypass chunk-size calibration** and declare a fixed chunk size. When it returns `Some(n)`, `calibrate_engine` warms up at that size, uses the observed warm-up duration to select a sample count, and then runs the fixed-size samples.
 
 Every GPU example in this crate uses a fixed `chunk_size()`:
 
@@ -66,12 +66,12 @@ impl BenchContext for FakeGpuBench {
 }
 ```
 
-Note that when `chunk_size()` returns `Some`, `estimated_throughput_per_sec` is set to `0.0` (calibration doesn't run the timing passes that would compute it) and `target_samples` is set to `min_samples`. The runner does not try to scale the sample count to fill `benchmark_duration` — it just runs `min_samples` at the fixed size.
+When `chunk_size()` returns `Some`, the runner estimates chunk throughput and duration from the warm-up passes. It uses that duration to choose a sample count that targets `benchmark_duration`, clamped to `min_samples..=max_samples`, just as it does after automatic chunk calibration.
 
 ### What this implies
 
 - You are responsible for picking a chunk size that matches the workload you care about. The framework will not second-guess you.
-- `benchmark_duration` becomes a loose upper bound, not a target. With a fixed chunk size the runner runs `min_samples` samples regardless of how long they take.
+- `benchmark_duration` remains a target rather than a hard limit. The `min_samples` and `max_samples` bounds can still make the actual run shorter or longer.
 - If your per-sample device time is large, consider raising `min_samples` or lowering the chunk size so the run completes in reasonable wall-clock time.
 
 ## Host wall-clock is not device time

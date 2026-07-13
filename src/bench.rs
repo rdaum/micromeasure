@@ -86,7 +86,7 @@ fn default_backend() -> Box<dyn MeasurementBackend> {
     }
 }
 
-const MIN_CHUNK_SIZE: usize = 100_000;
+const MIN_CHUNK_SIZE: usize = 1;
 const MAX_CHUNK_SIZE: usize = 50_000_000;
 const TARGET_CHUNK_DURATION: Duration = Duration::from_millis(50);
 const DEFAULT_CONCURRENT_SAMPLE_DURATION: Duration = Duration::from_millis(50);
@@ -883,12 +883,16 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize,
     rewrite_line("🔥 calibrating benchmark");
 
     if let Some(preferred_chunk_size) = T::chunk_size() {
+        assert!(preferred_chunk_size > 0, "chunk_size must be > 0");
         let warm_up_end = Instant::now() + runtime.warm_up_duration;
         let mut warm_up_count = 0;
+        let mut measured_warm_up_duration = Duration::ZERO;
         let mut last_progress = Instant::now();
         while Instant::now() < warm_up_end {
             let mut prepared = factory();
+            let started = Instant::now();
             black_box(|| f(&mut prepared, preferred_chunk_size, warm_up_count))();
+            measured_warm_up_duration += started.elapsed();
             warm_up_count += 1;
 
             // Throttle progress updates to avoid spamming the terminal
@@ -905,11 +909,17 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize,
             }
         }
 
+        let estimated_chunk_duration_secs =
+            measured_warm_up_duration.as_secs_f64() / warm_up_count as f64;
+        let estimated_throughput_per_sec = throughput
+            .rate_for_operations(preferred_chunk_size as u64, estimated_chunk_duration_secs);
+        let target_samples = target_sample_count(runtime, estimated_chunk_duration_secs);
+
         clear_line();
         return BenchmarkConfig {
             chunk_size: preferred_chunk_size,
-            target_samples: runtime.min_samples,
-            estimated_throughput_per_sec: 0.0,
+            target_samples,
+            estimated_throughput_per_sec,
         };
     }
 
@@ -935,14 +945,22 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize,
             }
 
             let scaling_factor = TARGET_CHUNK_DURATION.as_secs_f64() / duration_secs;
-            chunk_size = ((chunk_size as f64) * scaling_factor)
+            let next_chunk_size = ((chunk_size as f64) * scaling_factor)
                 .round()
                 .clamp(MIN_CHUNK_SIZE as f64, MAX_CHUNK_SIZE as f64)
                 as usize;
-            best_chunk_size = chunk_size;
+            best_chunk_size = next_chunk_size;
+            if next_chunk_size == chunk_size {
+                break;
+            }
+            chunk_size = next_chunk_size;
         } else {
-            chunk_size = (chunk_size * 10).min(MAX_CHUNK_SIZE);
-            best_chunk_size = chunk_size;
+            let next_chunk_size = chunk_size.saturating_mul(10).min(MAX_CHUNK_SIZE);
+            best_chunk_size = next_chunk_size;
+            if next_chunk_size == chunk_size {
+                break;
+            }
+            chunk_size = next_chunk_size;
         }
 
         rewrite_line(&format!(
@@ -979,9 +997,7 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize,
     } else {
         TARGET_CHUNK_DURATION.as_secs_f64()
     };
-    let target_samples =
-        ((runtime.benchmark_duration.as_secs_f64() / estimated_chunk_duration_secs) as usize)
-            .clamp(runtime.min_samples, runtime.max_samples);
+    let target_samples = target_sample_count(runtime, estimated_chunk_duration_secs);
 
     clear_line();
     BenchmarkConfig {
@@ -989,6 +1005,18 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize,
         target_samples,
         estimated_throughput_per_sec,
     }
+}
+
+fn target_sample_count(
+    runtime: &BenchmarkRuntimeOptions,
+    estimated_sample_duration_secs: f64,
+) -> usize {
+    if !estimated_sample_duration_secs.is_finite() || estimated_sample_duration_secs <= 0.0 {
+        return runtime.max_samples;
+    }
+
+    ((runtime.benchmark_duration.as_secs_f64() / estimated_sample_duration_secs) as usize)
+        .clamp(runtime.min_samples, runtime.max_samples)
 }
 
 fn total_worker_threads<T>(workers: &[ConcurrentWorker<T>]) -> usize {
@@ -1046,9 +1074,7 @@ fn warm_up_concurrent_engine<T: ConcurrentBenchContext + Sync, F: Fn(usize) -> T
     }
 
     clear_line();
-    let target_samples =
-        ((runtime.benchmark_duration.as_secs_f64() / sample_duration.as_secs_f64()) as usize)
-            .clamp(runtime.min_samples, runtime.max_samples);
+    let target_samples = target_sample_count(runtime, sample_duration.as_secs_f64());
 
     ConcurrentBenchmarkConfig {
         sample_duration,
@@ -3157,6 +3183,88 @@ mod tests {
         assert_eq!(throughput.format_rate(12_500.0), "12.50 klines/s");
     }
 
+    #[test]
+    fn automatic_calibration_can_select_small_chunks_for_expensive_operations() {
+        use super::{BenchmarkRuntimeOptions, calibrate_engine};
+        use crate::BenchContext;
+        use std::time::Duration;
+
+        struct SlowContext;
+
+        impl BenchContext for SlowContext {
+            fn prepare(_num_chunks: usize) -> Self {
+                Self
+            }
+        }
+
+        fn slow_operation(_ctx: &mut SlowContext, chunk_size: usize, _chunk_num: usize) {
+            std::thread::sleep(Duration::from_millis(chunk_size as u64));
+        }
+
+        let runtime = BenchmarkRuntimeOptions {
+            warm_up_duration: Duration::from_millis(1),
+            benchmark_duration: Duration::from_millis(100),
+            min_samples: 2,
+            max_samples: 10,
+        };
+        let config = calibrate_engine(
+            slow_operation,
+            &|| SlowContext,
+            &Throughput::ops(),
+            &runtime,
+        );
+
+        assert!(
+            (10..=100).contains(&config.chunk_size),
+            "expected a roughly 50 ms chunk, got {}",
+            config.chunk_size
+        );
+    }
+
+    #[test]
+    fn fixed_chunk_sample_count_uses_measured_warm_up_duration() {
+        use super::{BenchmarkRuntimeOptions, calibrate_engine};
+        use crate::BenchContext;
+        use std::time::Duration;
+
+        struct FixedContext;
+
+        impl BenchContext for FixedContext {
+            fn prepare(_num_chunks: usize) -> Self {
+                Self
+            }
+
+            fn chunk_size() -> Option<usize> {
+                Some(1)
+            }
+        }
+
+        fn fixed_operation(_ctx: &mut FixedContext, _chunk_size: usize, _chunk_num: usize) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let runtime = BenchmarkRuntimeOptions {
+            warm_up_duration: Duration::from_millis(5),
+            benchmark_duration: Duration::from_millis(20),
+            min_samples: 2,
+            max_samples: 20,
+        };
+        let config = calibrate_engine(
+            fixed_operation,
+            &|| FixedContext,
+            &Throughput::ops(),
+            &runtime,
+        );
+
+        assert_eq!(config.chunk_size, 1);
+        assert!(
+            (5..=15).contains(&config.target_samples),
+            "expected the 20 ms budget to select about ten samples, got {}",
+            config.target_samples
+        );
+        assert!(config.estimated_throughput_per_sec > 0.0);
+    }
+
     /// End-to-end regression test: `bench_sample(...)` must populate
     /// `BenchmarkStats.metrics` with the metrics returned by the bench
     /// function. This test exists because a previous commit collected
@@ -3258,7 +3366,7 @@ mod tests {
             warm_up_duration: Duration::from_millis(10),
             benchmark_duration: Duration::from_millis(50),
             min_samples: 3,
-            max_samples: 5,
+            max_samples: 3,
         });
 
         runner.group::<DummyCtx>("test", |g| {

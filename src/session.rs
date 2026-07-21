@@ -623,44 +623,39 @@ impl BenchmarkReport {
         }
 
         println!("🔍 KEY INSIGHTS:");
-        if unique_throughput_unit(&self.results).is_some() {
-            let fastest = self
-                .results
-                .iter()
-                .filter_map(|result| finite_throughput(result).map(|rate| (result, rate)))
-                .max_by(|a, b| a.1.total_cmp(&b.1));
-            let slowest = self
-                .results
-                .iter()
-                .filter_map(|result| finite_throughput(result).map(|rate| (result, rate)))
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-
-            if let (Some((fast, fastest_rate)), Some((slow, slowest_rate))) = (fastest, slowest) {
+        let throughput_insights = group_throughput_insights(&self.results);
+        if throughput_insights.is_empty() {
+            println!("   No groups contain at least two benchmarks with comparable throughput.");
+        } else {
+            for insight in throughput_insights {
+                println!("   {}:", insight.group);
                 println!(
-                    "   🏆 Fastest: {} ({})",
-                    fast.name,
-                    fast.stats.throughput.format_rate(fastest_rate)
+                    "     🏆 Fastest: {} ({})",
+                    insight.fastest.name,
+                    insight
+                        .fastest
+                        .stats
+                        .throughput
+                        .format_rate(insight.fastest_rate)
                 );
                 println!(
-                    "   🐌 Slowest: {} ({})",
-                    slow.name,
-                    slow.stats.throughput.format_rate(slowest_rate)
+                    "     🐌 Slowest: {} ({})",
+                    insight.slowest.name,
+                    insight
+                        .slowest
+                        .stats
+                        .throughput
+                        .format_rate(insight.slowest_rate)
                 );
-                if slowest_rate > f64::EPSILON {
+                if insight.slowest_rate > f64::EPSILON {
                     println!(
-                        "   📊 Speed difference: {:.1}x",
-                        fastest_rate / slowest_rate
+                        "     📊 Speed difference: {:.1}x",
+                        insight.fastest_rate / insight.slowest_rate
                     );
                 } else {
-                    println!("   📊 Speed difference: n/a");
+                    println!("     📊 Speed difference: n/a");
                 }
-            } else {
-                println!("   No finite throughput values available for insights.");
             }
-        } else {
-            println!(
-                "   Mixed throughput units across benchmarks; skipping fastest/slowest comparison."
-            );
         }
 
         if previous_session.is_some() {
@@ -1213,12 +1208,61 @@ fn finite_throughput(result: &BenchmarkResult) -> Option<f64> {
     }
 }
 
-fn unique_throughput_unit(results: &[BenchmarkResult]) -> Option<&str> {
+struct GroupThroughputInsight<'a> {
+    group: &'a str,
+    fastest: &'a BenchmarkResult,
+    fastest_rate: f64,
+    slowest: &'a BenchmarkResult,
+    slowest_rate: f64,
+}
+
+fn unique_throughput_unit<'a>(results: &[&'a BenchmarkResult]) -> Option<&'a str> {
     let first = results.first()?.stats.throughput.unit();
     results
         .iter()
         .all(|result| result.stats.throughput.unit() == first)
         .then_some(first)
+}
+
+fn group_throughput_insights(results: &[BenchmarkResult]) -> Vec<GroupThroughputInsight<'_>> {
+    let mut groups: BTreeMap<&str, Vec<&BenchmarkResult>> = BTreeMap::new();
+    for result in results {
+        groups.entry(&result.group).or_default().push(result);
+    }
+
+    groups
+        .into_iter()
+        .filter_map(|(group, results)| {
+            if results.len() < 2 || unique_throughput_unit(&results).is_none() {
+                return None;
+            }
+
+            let finite_results: Vec<_> = results
+                .into_iter()
+                .filter_map(|result| finite_throughput(result).map(|rate| (result, rate)))
+                .collect();
+            if finite_results.len() < 2 {
+                return None;
+            }
+
+            let (fastest, fastest_rate) = finite_results
+                .iter()
+                .copied()
+                .max_by(|left, right| left.1.total_cmp(&right.1))?;
+            let (slowest, slowest_rate) = finite_results
+                .iter()
+                .copied()
+                .min_by(|left, right| left.1.total_cmp(&right.1))?;
+
+            Some(GroupThroughputInsight {
+                group,
+                fastest,
+                fastest_rate,
+                slowest,
+                slowest_rate,
+            })
+        })
+        .collect()
 }
 
 fn default_suite_name() -> String {
@@ -1490,6 +1534,40 @@ mod tests {
         assert_eq!(finite_throughput(&make_result("ok", 1.0)), Some(1.0));
         assert_eq!(finite_throughput(&make_result("nan", f64::NAN)), None);
         assert_eq!(finite_throughput(&make_result("neg", -1.0)), None);
+    }
+
+    #[test]
+    fn throughput_insights_never_compare_across_groups() {
+        let results = vec![
+            make_result_in_group("parsing", "fast_parse", 1000.0),
+            make_result_in_group("parsing", "slow_parse", 500.0),
+            make_result_in_group("resolution", "fast_resolve", 10.0),
+            make_result_in_group("resolution", "slow_resolve", 1.0),
+        ];
+
+        let insights = group_throughput_insights(&results);
+        assert_eq!(insights.len(), 2);
+        assert_eq!(insights[0].group, "parsing");
+        assert_eq!(insights[0].fastest.name, "fast_parse");
+        assert_eq!(insights[0].slowest.name, "slow_parse");
+        assert_eq!(insights[0].fastest_rate / insights[0].slowest_rate, 2.0);
+        assert_eq!(insights[1].group, "resolution");
+        assert_eq!(insights[1].fastest.name, "fast_resolve");
+        assert_eq!(insights[1].slowest.name, "slow_resolve");
+        assert_eq!(insights[1].fastest_rate / insights[1].slowest_rate, 10.0);
+    }
+
+    #[test]
+    fn throughput_insights_require_two_same_unit_results_in_a_group() {
+        let mut bytes = make_result_in_group("mixed", "bytes", 100.0);
+        bytes.stats.throughput = Throughput::bytes(1);
+        let results = vec![
+            make_result_in_group("single", "only", 100.0),
+            make_result_in_group("mixed", "ops", 200.0),
+            bytes,
+        ];
+
+        assert!(group_throughput_insights(&results).is_empty());
     }
 
     #[test]

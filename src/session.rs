@@ -284,9 +284,7 @@ impl BenchmarkSession {
             .as_secs()
             .to_string();
 
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "unknown".to_string());
+        let hostname = current_hostname();
 
         let git_commit = std::process::Command::new("git")
             .args(["rev-parse", "--short", "HEAD"])
@@ -1270,10 +1268,73 @@ fn default_suite_name() -> String {
         .ok()
         .and_then(|path| {
             path.file_stem()
-                .map(|name| name.to_string_lossy().into_owned())
+                .map(|name| suite_name_from_executable_stem(&name.to_string_lossy()))
         })
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "benchmark".to_string())
+}
+
+fn suite_name_from_executable_stem(stem: &str) -> String {
+    let Some((target, suffix)) = stem.rsplit_once('-') else {
+        return stem.to_string();
+    };
+    if !target.is_empty()
+        && suffix.len() == 16
+        && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        target.to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+#[cfg(unix)]
+fn os_hostname() -> Option<String> {
+    let mut buffer = [0_u8; 256];
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return None;
+    }
+
+    let length = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    normalize_identity(String::from_utf8_lossy(&buffer[..length]).into_owned())
+}
+
+#[cfg(not(unix))]
+fn os_hostname() -> Option<String> {
+    None
+}
+
+fn normalize_identity(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn resolve_hostname(
+    operating_system: Option<String>,
+    hostname_environment: Option<String>,
+    computername_environment: Option<String>,
+) -> String {
+    operating_system
+        .and_then(normalize_identity)
+        .or_else(|| hostname_environment.and_then(normalize_identity))
+        .or_else(|| computername_environment.and_then(normalize_identity))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn current_hostname() -> String {
+    resolve_hostname(
+        os_hostname(),
+        std::env::var("HOSTNAME").ok(),
+        std::env::var("COMPUTERNAME").ok(),
+    )
+}
+
+fn hostname_is_known(hostname: &str) -> bool {
+    !hostname.trim().is_empty() && !hostname.eq_ignore_ascii_case("unknown")
 }
 
 /// Get the target directory for saving benchmark results, following criterion's approach
@@ -1311,7 +1372,10 @@ fn session_is_compatible(
         return false;
     }
 
-    if session.hostname != hostname {
+    if !hostname_is_known(hostname)
+        || !hostname_is_known(&session.hostname)
+        || session.hostname != hostname
+    {
         return false;
     }
 
@@ -1581,6 +1645,49 @@ mod tests {
     }
 
     #[test]
+    fn cargo_artifact_hashes_do_not_change_default_suite_identity() {
+        assert_eq!(
+            suite_name_from_executable_stem("image_index-c46e78954a2025fa"),
+            "image_index"
+        );
+        assert_eq!(
+            suite_name_from_executable_stem("image_index-95fb07f4cf4b73e5"),
+            "image_index"
+        );
+        assert_eq!(
+            suite_name_from_executable_stem("cas-5e67e437b80791ef"),
+            "cas"
+        );
+        assert_eq!(
+            suite_name_from_executable_stem("image_index"),
+            "image_index"
+        );
+        assert_eq!(
+            suite_name_from_executable_stem("report-deadbeef"),
+            "report-deadbeef"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_hostname_resolves_without_environment_fallbacks() {
+        let hostname = os_hostname().expect("Unix host should expose a hostname");
+        assert_eq!(
+            resolve_hostname(Some(hostname.clone()), None, None),
+            hostname
+        );
+    }
+
+    #[test]
+    fn hostname_resolution_falls_back_safely() {
+        assert_eq!(
+            resolve_hostname(None, Some(" env-host ".to_string()), None),
+            "env-host"
+        );
+        assert_eq!(resolve_hostname(None, None, None), "unknown");
+    }
+
+    #[test]
     fn session_compatibility_requires_same_host_suite_and_benchmark_set() {
         let current_results = vec![make_result("bench_a", 1.0), make_result("bench_b", 2.0)];
 
@@ -1596,6 +1703,14 @@ mod tests {
         assert!(!session_is_compatible(
             &wrong_host,
             "host-a",
+            "suite-a",
+            &current_results
+        ));
+
+        let unknown_host = make_session("unknown", Some("suite-a"), &["bench_a", "bench_b"]);
+        assert!(!session_is_compatible(
+            &unknown_host,
+            "unknown",
             "suite-a",
             &current_results
         ));

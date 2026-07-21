@@ -11,7 +11,7 @@ benchmark_main!(|runner| { /* register groups */ });
 benchmark_main!(options, |runner| { /* ... */ });
 ```
 
-Expands to `fn main()` calling `run_benchmark_main`. Parses an optional filter from `env::args()`, constructs a `BenchmarkRunner`, applies runtime options, runs your registration closure, prints the session summary, and saves the report.
+Expands to `fn main()` calling `run_benchmark_main`. Supplies the call site's `CARGO_CRATE_NAME` as the stable default suite, parses an optional filter from `env::args()`, constructs a `BenchmarkRunner`, applies runtime options, runs your registration closure, prints the session summary, and saves the report.
 
 `micromeasure::src/lib.rs`
 

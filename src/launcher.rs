@@ -64,6 +64,17 @@ impl Default for BenchmarkMainOptions {
     }
 }
 
+#[doc(hidden)]
+pub fn benchmark_options_with_default_suite(
+    mut options: BenchmarkMainOptions,
+    default_suite: &str,
+) -> BenchmarkMainOptions {
+    if options.suite.is_none() {
+        options.suite = Some(default_suite.to_string());
+    }
+    options
+}
+
 pub fn benchmark_filter_from_args(args: &[String]) -> Option<String> {
     let separator_pos = args.iter().position(|arg| arg == "--");
     if let Some(separator_pos) = separator_pos {
@@ -147,5 +158,18 @@ mod tests {
     fn output_follows_save_results_without_an_explicit_path() {
         assert_eq!(report_destination(None, true), ReportDestination::Default);
         assert_eq!(report_destination(None, false), ReportDestination::Disabled);
+    }
+
+    #[test]
+    fn call_site_suite_is_stable_and_preserves_explicit_override() {
+        let options = benchmark_options_with_default_suite(BenchmarkMainOptions::default(), "gpu");
+        assert_eq!(options.suite.as_deref(), Some("gpu"));
+
+        let explicit = BenchmarkMainOptions {
+            suite: Some("nightly".to_string()),
+            ..BenchmarkMainOptions::default()
+        };
+        let options = benchmark_options_with_default_suite(explicit, "gpu");
+        assert_eq!(options.suite.as_deref(), Some("nightly"));
     }
 }

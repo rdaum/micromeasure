@@ -47,7 +47,7 @@ pub use bench::{
 };
 pub use launcher::{
     BenchmarkMainOptions, OUTPUT_PATH_ENVIRONMENT, benchmark_filter_from_args,
-    benchmark_filter_from_env, run_benchmark_main,
+    benchmark_filter_from_env, benchmark_options_with_default_suite, run_benchmark_main,
 };
 pub use table::{Alignment, BorderColor, TableFormatter};
 
@@ -69,15 +69,18 @@ pub use perf_event;
 macro_rules! benchmark_main {
     (|$runner:ident| $body:block) => {
         fn main() {
-            let _ =
-                $crate::run_benchmark_main($crate::BenchmarkMainOptions::default(), |$runner| {
-                    $body
-                });
+            let options = $crate::benchmark_options_with_default_suite(
+                $crate::BenchmarkMainOptions::default(),
+                env!("CARGO_CRATE_NAME"),
+            );
+            let _ = $crate::run_benchmark_main(options, |$runner| $body);
         }
     };
     ($options:expr, |$runner:ident| $body:block) => {
         fn main() {
-            let _ = $crate::run_benchmark_main($options, |$runner| $body);
+            let options =
+                $crate::benchmark_options_with_default_suite($options, env!("CARGO_CRATE_NAME"));
+            let _ = $crate::run_benchmark_main(options, |$runner| $body);
         }
     };
 }

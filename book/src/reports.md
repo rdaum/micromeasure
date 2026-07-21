@@ -44,8 +44,8 @@ instead of the `benchmark_main!` macro.
 
 - `schema_version` — JSON document format version; currently `1`
 - `timestamp` — unix seconds string
-- `hostname` — used to gate comparison (different host = incompatible)
-- `suite` — optional suite name (defaults to the crate name); comparison requires same suite
+- `hostname` — operating-system hostname used to gate comparison (different host = incompatible)
+- `suite` — optional suite name; `benchmark_main!` defaults it to the stable Cargo benchmark target name, and comparison requires the same suite
 - `git_commit` — short SHA captured at session start (best-effort)
 - `results: Vec<BenchmarkResult>` — one per benchmark, each with `name`, `kind` (`Standard`/`Concurrent`), `execution_index`, metadata, stats, and (for concurrent) per-worker summaries
 
@@ -78,14 +78,25 @@ run_benchmark_main(
 
 A previous report is **compatible** with the current run when all of:
 
-- same `hostname`
-- same `suite` (crate name by default)
+- same known `hostname`; reports whose hostname cannot be resolved do not compare automatically
+- same `suite` (`CARGO_CRATE_NAME`, normally the benchmark target name, by default)
 - the same number of results, matched one-to-one by group, name, and kind
 - matching throughput configuration, measurement domain, and per-result metadata
 
 If the previous report has a different set of benchmarks (you added/removed/renamed one), it is not compatible and the runner skips the comparison rather than printing misleading deltas. Rename a benchmark and you lose comparability with the previous run — by design.
 
 The runner loads the most recent compatible report from the target directory by scanning `benchmark_results_*.json`, parsing timestamps, and picking the latest one whose result set matches.
+
+`benchmark_main!` supplies `env!("CARGO_CRATE_NAME")` as the default suite, so rebuilding a Cargo
+benchmark does not change comparison identity when Cargo changes the executable's hash suffix.
+An explicit `BenchmarkMainOptions::suite` still takes precedence. Code that constructs a
+`BenchmarkRunner` directly falls back to the executable stem and strips a trailing 16-character
+hexadecimal Cargo artifact hash when present.
+
+On Unix, hostname comes from the operating-system hostname API, with `HOSTNAME` and `COMPUTERNAME`
+used as fallbacks on platforms where necessary. If every lookup fails, the report retains
+`"unknown"` for transparency but is not eligible for automatic comparison; treating reports from
+unknown machines as the same host would make performance claims unsafe.
 
 Reports created before `schema_version` was added are interpreted as schema 1. Reports carrying a
 different schema version are skipped for comparison rather than being interpreted using incompatible

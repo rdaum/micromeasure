@@ -147,7 +147,7 @@ The macro is the standard entry point:
 benchmark_main!(|runner| { /* register groups */ });
 ```
 
-It expands to `fn main()` that calls `run_benchmark_main(BenchmarkMainOptions::default(), |runner| ...)`. `run_benchmark_main` does, in order:
+It expands to `fn main()` that supplies the call site's stable `env!("CARGO_CRATE_NAME")` as the default suite and calls `run_benchmark_main(BenchmarkMainOptions::default(), |runner| ...)`. An explicit `BenchmarkMainOptions::suite` overrides that default. `run_benchmark_main` then does, in order:
 
 1. Parse an optional filter from `env::args()` (first non-`--` argument).
 2. Construct a `BenchmarkRunner` with that filter.

@@ -1390,8 +1390,10 @@ fn session_is_compatible(
     pair_results_one_to_one(current_results, &session.results).len() == current_results.len()
 }
 
-fn load_latest_session() -> Option<BenchmarkReport> {
-    let target_dir = get_target_directory();
+fn load_latest_session_matching(
+    target_dir: &Path,
+    predicate: impl Fn(&BenchmarkReport) -> bool,
+) -> Option<BenchmarkReport> {
     if !target_dir.exists() {
         return None;
     }
@@ -1417,13 +1419,16 @@ fn load_latest_session() -> Option<BenchmarkReport> {
     });
     json_files.reverse();
 
-    // Return the most recent parseable session.
+    // Return the most recent parseable session satisfying the caller's
+    // compatibility predicate. Incompatible newer reports must not hide an
+    // older compatible baseline.
     for entry in json_files {
         let Ok(file) = File::open(entry.path()) else {
             continue;
         };
         if let Ok(session) = serde_json::from_reader::<_, BenchmarkReport>(file)
             && session.schema_version == REPORT_SCHEMA_VERSION
+            && predicate(&session)
         {
             return Some(session);
         }
@@ -1438,10 +1443,27 @@ fn load_comparison_session(
     suite: &str,
     current_results: &[BenchmarkResult],
 ) -> Option<BenchmarkReport> {
+    load_comparison_session_from(
+        &get_target_directory(),
+        comparison_policy,
+        hostname,
+        suite,
+        current_results,
+    )
+}
+
+fn load_comparison_session_from(
+    target_dir: &Path,
+    comparison_policy: ComparisonPolicy,
+    hostname: &str,
+    suite: &str,
+    current_results: &[BenchmarkResult],
+) -> Option<BenchmarkReport> {
     match comparison_policy {
         ComparisonPolicy::None => None,
-        ComparisonPolicy::LatestCompatible => load_latest_session()
-            .filter(|session| session_is_compatible(session, hostname, suite, current_results)),
+        ComparisonPolicy::LatestCompatible => load_latest_session_matching(target_dir, |session| {
+            session_is_compatible(session, hostname, suite, current_results)
+        }),
     }
 }
 
@@ -1524,6 +1546,34 @@ mod tests {
         }
     }
 
+    fn comparison_test_directory(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "micromeasure-comparison-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn persist_report_at_order(
+        directory: &Path,
+        order: u64,
+        mut report: BenchmarkReport,
+    ) -> PathBuf {
+        report.timestamp = order.to_string();
+        let path = directory.join(format!("benchmark_results_{order}.json"));
+        report.save_to_path(&path).unwrap();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(order)),
+        )
+        .unwrap();
+        path
+    }
+
     #[test]
     fn explicit_report_path_atomically_preserves_the_versioned_document() {
         let report = make_session("host-a", Some("suite-a"), &["bench-a"]);
@@ -1575,6 +1625,92 @@ mod tests {
             "suite-a",
             &[make_result("bench-a", 1.0)]
         ));
+    }
+
+    #[test]
+    fn latest_compatible_skips_newer_report_from_another_suite() {
+        let directory = comparison_test_directory("other-suite");
+        let current_results = vec![make_result("gpu_case", 3.0)];
+        persist_report_at_order(
+            &directory,
+            10,
+            make_session("host-a", Some("gpu"), &["gpu_case"]),
+        );
+        persist_report_at_order(
+            &directory,
+            20,
+            make_session("host-a", Some("image_index"), &["index_case"]),
+        );
+
+        let selected = load_comparison_session_from(
+            &directory,
+            ComparisonPolicy::LatestCompatible,
+            "host-a",
+            "gpu",
+            &current_results,
+        )
+        .unwrap();
+        assert_eq!(selected.timestamp, "10");
+        assert_eq!(selected.suite.as_deref(), Some("gpu"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn latest_compatible_skips_newer_same_suite_with_different_results() {
+        let directory = comparison_test_directory("different-results");
+        let current_results = vec![make_result("gpu_case", 3.0)];
+        persist_report_at_order(
+            &directory,
+            10,
+            make_session("host-a", Some("gpu"), &["gpu_case"]),
+        );
+        persist_report_at_order(
+            &directory,
+            20,
+            make_session("host-a", Some("gpu"), &["different_case"]),
+        );
+
+        let selected = load_comparison_session_from(
+            &directory,
+            ComparisonPolicy::LatestCompatible,
+            "host-a",
+            "gpu",
+            &current_results,
+        )
+        .unwrap();
+        assert_eq!(selected.timestamp, "10");
+        assert_eq!(selected.results[0].name, "gpu_case");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn latest_compatible_selects_newest_of_several_compatible_reports() {
+        let directory = comparison_test_directory("newest-compatible");
+        let current_results = vec![make_result("gpu_case", 3.0)];
+        persist_report_at_order(
+            &directory,
+            10,
+            make_session("host-a", Some("gpu"), &["gpu_case"]),
+        );
+        persist_report_at_order(
+            &directory,
+            20,
+            make_session("host-a", Some("gpu"), &["gpu_case"]),
+        );
+
+        let selected = load_comparison_session_from(
+            &directory,
+            ComparisonPolicy::LatestCompatible,
+            "host-a",
+            "gpu",
+            &current_results,
+        )
+        .unwrap();
+        assert_eq!(selected.timestamp, "20");
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

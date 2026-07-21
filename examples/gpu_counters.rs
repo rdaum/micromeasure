@@ -63,7 +63,7 @@ struct CudaMemsetBench {
 }
 
 impl BenchContext for CudaMemsetBench {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         let mut device_buffer = null_mut();
         unsafe {
             check_cuda(

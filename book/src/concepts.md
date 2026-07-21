@@ -28,7 +28,7 @@ Use the plain `bench(...)` when the framework-derived numbers (latency, throughp
 
 ```rust,ignore
 pub trait BenchContext {
-    fn prepare(num_chunks: usize) -> Self;
+    fn prepare(chunk_size: usize) -> Self;
 
     fn chunk_size() -> Option<usize> {
         None
@@ -40,7 +40,7 @@ pub trait BenchContext {
 }
 ```
 
-- `prepare(num_chunks)` constructs the context. The runner calls it once per sample (and during warm-up). `num_chunks` is a hint; most benches ignore it.
+- `prepare(chunk_size)` constructs fresh context for one benchmark invocation. During calibration it receives each trial size; during warm-up, measured samples, and diagnostic replay it receives the selected size. The benchmark function receives that same value as its `chunk_size` argument, so preparation can allocate exactly enough state for a stateful mutation case.
 - `chunk_size()` — return `Some(n)` to **bypass calibration** and use a fixed chunk size. This is the standard pattern for GPU work, where launch overhead dominates small chunks and algorithm selection can change with shape. When you return `None`, the runner calibrates automatically (the CPU default). See [GPU Benchmarking Sharp Edges](./gpu-sharp-edges.md#calibration-assumes-cpu-like-chunk-scaling) for why this matters.
 - `operations_per_chunk()` — when one chunk represents a number of logical operations different from `chunk_size` (e.g. each chunk iterates over `chunk_size` rows but does `chunk_size * 4096` byte reads), return it here so throughput is computed against the real operation count. Defaults to `chunk_size` when `None`.
 
@@ -63,6 +63,7 @@ The closure receives a `BenchmarkGroup<C>`, which is a **fluent** builder: each 
 |---|---|
 | `throughput(t)` | What one operation represents, for `X/s` output |
 | `factory(\|\| C)` | Override the default `C::prepare(...)` constructor. Returns a different type (`BenchmarkGroupWithFactory`), not `Self` — it's a type-state transition. The factory is called per sample, same lifecycle as `prepare`. |
+| `factory_for_chunk(\|chunk_size\| C)` | Override preparation with a closure that receives the exact chunk size. Use this when construction needs captured state and must size each fresh context to the invocation. |
 | `measurement_domain(d)` | `Cpu` / `Gpu` / `Io` / `Mixed` — controls CPU-PMU diagnostics |
 | `backend(\|\| Box<dyn MeasurementBackend>)` | Replace the platform default measurement path |
 | `bench(name, f)` | Register a `fn(&mut C, usize, usize)` benchmark |

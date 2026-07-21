@@ -21,7 +21,7 @@ struct ParseContext {
 }
 
 impl BenchContext for ParseContext {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         Self {
             input: vec![b'x'; INPUT_BYTES],
         }

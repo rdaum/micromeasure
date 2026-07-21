@@ -17,7 +17,7 @@ Combining fluent `factory(...)` with `Throughput` configuration. A `BenchContext
 struct ParseContext { input: Vec<u8> }
 
 impl BenchContext for ParseContext {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         Self { input: vec![b'x'; INPUT_BYTES] }
     }
 }

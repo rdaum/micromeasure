@@ -43,7 +43,7 @@ Filter parsing helpers, exposed for custom entry points.
 | Type | Purpose | Source |
 |---|---|---|
 | `BenchmarkRunner` | Owns groups, runtime options, filter. Also provides `set_case_cooldown` / `with_case_cooldown` and deterministic case ordering. | `src/bench.rs` |
-| `BenchmarkGroup<C>` | Fluent builder for single-threaded benches. `throughput`, `factory`, `measurement_domain`, `backend`, `bench`, `bench_sample`, `diagnostic_pass`, `diagnostic_samples`. | `src/bench.rs` |
+| `BenchmarkGroup<C>` | Fluent builder for single-threaded benches. `throughput`, `factory`, `factory_for_chunk`, `measurement_domain`, `backend`, `bench`, `bench_sample`, `diagnostic_pass`, `diagnostic_samples`. | `src/bench.rs` |
 | `ConcurrentBenchmarkGroup<C>` | Fluent concurrent builder: `sample_duration`, `throughput`, `measurement_domain`, `backend`, `lifecycle`, `metadata`, `factory`, `bench`. | `src/bench.rs` |
 | `BenchmarkCaseOrder` | `Declared` or deterministic `Randomized { seed }`; use with `ordered_case_indices`. | `src/bench.rs` |
 | `BenchmarkRuntimeOptions` | `warm_up_duration`, `benchmark_duration`, `min_samples`, `max_samples`. | `src/bench.rs` |
@@ -52,7 +52,7 @@ Filter parsing helpers, exposed for custom entry points.
 
 | Type | Purpose | Source |
 |---|---|---|
-| `BenchContext` | Trait: `prepare(num_chunks)`, `chunk_size() -> Option<usize>`, `operations_per_chunk() -> Option<u64>`. | `src/bench.rs` |
+| `BenchContext` | Trait: `prepare(chunk_size)`, `chunk_size() -> Option<usize>`, `operations_per_chunk() -> Option<u64>`. | `src/bench.rs` |
 | `NoContext` | Zero-sized context; implements `BenchContext` and `ConcurrentBenchContext`. | `src/bench.rs` |
 | `ConcurrentBenchContext` | Trait: `prepare(num_threads)`. | `src/bench.rs` |
 

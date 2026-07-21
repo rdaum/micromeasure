@@ -31,7 +31,7 @@ unsafe extern "C" {
 struct CudaMemsetBench { device_buffer: *mut c_void }
 
 impl BenchContext for CudaMemsetBench {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         let mut device_buffer = null_mut();
         unsafe { check_cuda("cudaMalloc", cudaMalloc(&mut device_buffer, BYTES_PER_OP as usize)); }
         Self { device_buffer }

@@ -58,7 +58,7 @@ Every GPU example in this crate uses a fixed `chunk_size()`:
 
 ```rust,ignore
 impl BenchContext for FakeGpuBench {
-    fn prepare(_num_chunks: usize) -> Self { FakeGpuBench }
+    fn prepare(_chunk_size: usize) -> Self { FakeGpuBench }
 
     fn chunk_size() -> Option<usize> {
         Some(4_000)

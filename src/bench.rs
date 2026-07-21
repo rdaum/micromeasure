@@ -469,7 +469,9 @@ impl Throughput {
 
 /// Generic benchmark context that can hold any preparation data
 pub trait BenchContext {
-    fn prepare(num_chunks: usize) -> Self;
+    /// Construct fresh state for a benchmark invocation using the exact chunk
+    /// size that invocation will receive.
+    fn prepare(chunk_size: usize) -> Self;
 
     fn chunk_size() -> Option<usize> {
         None
@@ -483,7 +485,7 @@ pub trait BenchContext {
 pub struct NoContext;
 
 impl BenchContext for NoContext {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         NoContext
     }
 }
@@ -874,7 +876,7 @@ fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
     diagnostics
 }
 
-fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize, usize)>(
+fn calibrate_engine<T: BenchContext, F: Fn(usize) -> T + ?Sized, G: Fn(&mut T, usize, usize)>(
     f: G,
     factory: &F,
     throughput: &Throughput,
@@ -890,7 +892,7 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize,
         let mut measured_warm_up_duration = Duration::ZERO;
         let mut last_progress = Instant::now();
         while Instant::now() < warm_up_end {
-            let mut prepared = factory();
+            let mut prepared = factory(preferred_chunk_size);
             backend.begin();
             let started = Instant::now();
             black_box(|| f(&mut prepared, preferred_chunk_size, warm_up_count))();
@@ -947,7 +949,7 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize,
     let mut estimated_throughput_per_sec = 0.0;
 
     for i in 0..15 {
-        let mut prepared = factory();
+        let mut prepared = factory(chunk_size);
         let started = Instant::now();
         black_box(|| f(&mut prepared, chunk_size, 0))();
         let duration = started.elapsed();
@@ -994,7 +996,7 @@ fn calibrate_engine<T: BenchContext, F: Fn() -> T + ?Sized, G: Fn(&mut T, usize,
     let mut warm_up_count = 0;
     let mut last_progress = Instant::now();
     while Instant::now() < warm_up_end {
-        let mut prepared = factory();
+        let mut prepared = factory(best_chunk_size);
         black_box(|| f(&mut prepared, best_chunk_size, warm_up_count))();
         warm_up_count += 1;
 
@@ -1197,7 +1199,7 @@ fn execute_standard_sample_with_metrics<T: BenchContext>(
     (results, metrics)
 }
 
-fn execute_diagnostic_pass<T: BenchContext, F: Fn() -> T + ?Sized>(
+fn execute_diagnostic_pass<T: BenchContext, F: Fn(usize) -> T + ?Sized>(
     diagnostic_pass: Option<DiagnosticPassFunction<T>>,
     factory: &F,
     chunk_size: usize,
@@ -1209,7 +1211,7 @@ fn execute_diagnostic_pass<T: BenchContext, F: Fn() -> T + ?Sized>(
 
     let mut all_metrics = Vec::new();
     for sample in 0..diagnostic_samples {
-        let mut prepared = factory();
+        let mut prepared = factory(chunk_size);
         match black_box(|| diagnostic_pass(&mut prepared, chunk_size, sample))() {
             Ok(result) => {
                 let metrics = result
@@ -1596,11 +1598,11 @@ impl BenchmarkRunner {
     }
 
     pub fn run<T: BenchContext>(&self, name: &str, group: &str, f: BenchFunction<T>) {
-        self.run_with_factory_and_throughput(
+        self.run_with_chunk_factory_and_throughput(
             name,
             group,
             f,
-            &|| T::prepare(T::chunk_size().unwrap_or(MIN_CHUNK_SIZE)),
+            &|chunk_size| T::prepare(chunk_size),
             Throughput::ops(),
             MeasurementDomain::default(),
             default_backend(),
@@ -1638,6 +1640,32 @@ impl BenchmarkRunner {
         factory: &F,
         throughput: Throughput,
         measurement_domain: MeasurementDomain,
+        backend: Box<dyn MeasurementBackend>,
+        diagnostic_pass: Option<DiagnosticPassFunction<T>>,
+        diagnostic_samples: usize,
+    ) {
+        self.run_with_chunk_factory_and_throughput(
+            name,
+            group,
+            f,
+            &|_chunk_size| factory(),
+            throughput,
+            measurement_domain,
+            backend,
+            diagnostic_pass,
+            diagnostic_samples,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_chunk_factory_and_throughput<T: BenchContext, F: Fn(usize) -> T + ?Sized>(
+        &self,
+        name: &str,
+        group: &str,
+        f: BenchFunction<T>,
+        factory: &F,
+        throughput: Throughput,
+        measurement_domain: MeasurementDomain,
         mut backend: Box<dyn MeasurementBackend>,
         diagnostic_pass: Option<DiagnosticPassFunction<T>>,
         diagnostic_samples: usize,
@@ -1668,7 +1696,7 @@ impl BenchmarkRunner {
         let mut all_metrics: Vec<Vec<MetricValue>> = vec![Vec::new(); config.target_samples];
 
         for sample in 0..config.target_samples {
-            let mut prepared = factory();
+            let mut prepared = factory(config.chunk_size);
             let ops = T::operations_per_chunk().unwrap_or(config.chunk_size as u64);
             let sample_result = execute_standard_sample(
                 &f,
@@ -1753,6 +1781,32 @@ impl BenchmarkRunner {
         factory: &F,
         throughput: Throughput,
         measurement_domain: MeasurementDomain,
+        backend: Box<dyn MeasurementBackend>,
+        diagnostic_pass: Option<DiagnosticPassFunction<T>>,
+        diagnostic_samples: usize,
+    ) {
+        self.run_sample_with_chunk_factory_and_throughput(
+            name,
+            group,
+            f,
+            &|_chunk_size| factory(),
+            throughput,
+            measurement_domain,
+            backend,
+            diagnostic_pass,
+            diagnostic_samples,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_sample_with_chunk_factory_and_throughput<T: BenchContext, F: Fn(usize) -> T + ?Sized>(
+        &self,
+        name: &str,
+        group: &str,
+        f: BenchSampleFunction<T>,
+        factory: &F,
+        throughput: Throughput,
+        measurement_domain: MeasurementDomain,
         mut backend: Box<dyn MeasurementBackend>,
         diagnostic_pass: Option<DiagnosticPassFunction<T>>,
         diagnostic_samples: usize,
@@ -1799,7 +1853,7 @@ impl BenchmarkRunner {
             Vec::with_capacity(config.target_samples);
 
         for sample in 0..config.target_samples {
-            let mut prepared = factory();
+            let mut prepared = factory(config.chunk_size);
             let (sample_result, sample_metrics) = execute_standard_sample_with_metrics(
                 &f,
                 &mut prepared,
@@ -2147,6 +2201,17 @@ pub struct BenchmarkGroupWithFactory<'a, 'f, T: BenchContext, F: Fn() -> T + ?Si
     factory: &'f F,
 }
 
+pub struct BenchmarkGroupWithChunkFactory<'a, 'f, T: BenchContext, F: Fn(usize) -> T + ?Sized> {
+    runner: &'a BenchmarkRunner,
+    name: &'static str,
+    throughput: Throughput,
+    measurement_domain: MeasurementDomain,
+    backend_factory: Option<Rc<dyn Fn() -> Box<dyn MeasurementBackend>>>,
+    diagnostic_pass: Option<DiagnosticPassFunction<T>>,
+    diagnostic_samples: usize,
+    factory: &'f F,
+}
+
 impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
     pub fn throughput(&self, throughput: Throughput) -> Self {
         Self {
@@ -2282,6 +2347,25 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
         self.factory(factory)
     }
 
+    /// Supply a context factory that receives the exact chunk size for each
+    /// calibration trial, warm-up invocation, measured sample, and diagnostic
+    /// pass.
+    pub fn factory_for_chunk<'f, F: Fn(usize) -> T + ?Sized>(
+        &self,
+        factory: &'f F,
+    ) -> BenchmarkGroupWithChunkFactory<'a, 'f, T, F> {
+        BenchmarkGroupWithChunkFactory {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
+            factory,
+        }
+    }
+
     fn make_backend(&self) -> Box<dyn MeasurementBackend> {
         match &self.backend_factory {
             Some(factory) => factory(),
@@ -2290,11 +2374,11 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
     }
 
     pub fn bench(&self, name: &str, f: BenchFunction<T>) {
-        self.runner.run_with_factory_and_throughput(
+        self.runner.run_with_chunk_factory_and_throughput(
             name,
             self.name,
             f,
-            &|| T::prepare(T::chunk_size().unwrap_or(MIN_CHUNK_SIZE)),
+            &|chunk_size| T::prepare(chunk_size),
             self.throughput.clone(),
             self.measurement_domain,
             self.make_backend(),
@@ -2316,11 +2400,11 @@ impl<'a, T: BenchContext> BenchmarkGroup<'a, T> {
     /// loops where the framework-derived numbers tell the whole story,
     /// prefer `bench`.
     pub fn bench_sample(&self, name: &str, f: BenchSampleFunction<T>) {
-        self.runner.run_sample_with_factory_and_throughput(
+        self.runner.run_sample_with_chunk_factory_and_throughput(
             name,
             self.name,
             f,
-            &|| T::prepare(T::chunk_size().unwrap_or(MIN_CHUNK_SIZE)),
+            &|chunk_size| T::prepare(chunk_size),
             self.throughput.clone(),
             self.measurement_domain,
             self.make_backend(),
@@ -2463,6 +2547,114 @@ impl<'a, 'f, T: BenchContext, F: Fn() -> T + ?Sized> BenchmarkGroupWithFactory<'
     /// `bench`.
     pub fn bench_sample(&self, name: &str, f: BenchSampleFunction<T>) {
         self.runner.run_sample_with_factory_and_throughput(
+            name,
+            self.name,
+            f,
+            self.factory,
+            self.throughput.clone(),
+            self.measurement_domain,
+            self.make_backend(),
+            self.diagnostic_pass,
+            self.diagnostic_samples,
+        );
+    }
+}
+
+impl<'a, 'f, T: BenchContext, F: Fn(usize) -> T + ?Sized>
+    BenchmarkGroupWithChunkFactory<'a, 'f, T, F>
+{
+    pub fn throughput(&self, throughput: Throughput) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput,
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
+            factory: self.factory,
+        }
+    }
+
+    pub fn measurement_domain(&self, measurement_domain: MeasurementDomain) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
+            factory: self.factory,
+        }
+    }
+
+    pub fn backend<B: Fn() -> Box<dyn MeasurementBackend> + 'static>(
+        &self,
+        backend_factory: B,
+    ) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: Some(Rc::new(backend_factory)),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples: self.diagnostic_samples,
+            factory: self.factory,
+        }
+    }
+
+    pub fn diagnostic_pass(&self, diagnostic_pass: DiagnosticPassFunction<T>) -> Self {
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: Some(diagnostic_pass),
+            diagnostic_samples: self.diagnostic_samples,
+            factory: self.factory,
+        }
+    }
+
+    pub fn diagnostic_samples(&self, diagnostic_samples: usize) -> Self {
+        assert!(diagnostic_samples > 0, "diagnostic_samples must be > 0");
+        Self {
+            runner: self.runner,
+            name: self.name,
+            throughput: self.throughput.clone(),
+            measurement_domain: self.measurement_domain,
+            backend_factory: self.backend_factory.clone(),
+            diagnostic_pass: self.diagnostic_pass,
+            diagnostic_samples,
+            factory: self.factory,
+        }
+    }
+
+    fn make_backend(&self) -> Box<dyn MeasurementBackend> {
+        match &self.backend_factory {
+            Some(factory) => factory(),
+            None => default_backend(),
+        }
+    }
+
+    pub fn bench(&self, name: &str, f: BenchFunction<T>) {
+        self.runner.run_with_chunk_factory_and_throughput(
+            name,
+            self.name,
+            f,
+            self.factory,
+            self.throughput.clone(),
+            self.measurement_domain,
+            self.make_backend(),
+            self.diagnostic_pass,
+            self.diagnostic_samples,
+        );
+    }
+
+    pub fn bench_sample(&self, name: &str, f: BenchSampleFunction<T>) {
+        self.runner.run_sample_with_chunk_factory_and_throughput(
             name,
             self.name,
             f,
@@ -3217,7 +3409,7 @@ mod tests {
         struct SlowContext;
 
         impl BenchContext for SlowContext {
-            fn prepare(_num_chunks: usize) -> Self {
+            fn prepare(_chunk_size: usize) -> Self {
                 Self
             }
         }
@@ -3234,7 +3426,7 @@ mod tests {
         };
         let config = calibrate_engine(
             slow_operation,
-            &|| SlowContext,
+            &|_chunk_size| SlowContext,
             &Throughput::ops(),
             &runtime,
             &mut crate::WallClockBackend::new(),
@@ -3256,7 +3448,7 @@ mod tests {
         struct FixedContext;
 
         impl BenchContext for FixedContext {
-            fn prepare(_num_chunks: usize) -> Self {
+            fn prepare(_chunk_size: usize) -> Self {
                 Self
             }
 
@@ -3298,7 +3490,7 @@ mod tests {
         };
         let config = calibrate_engine(
             fixed_operation,
-            &|| FixedContext,
+            &|_chunk_size| FixedContext,
             &Throughput::ops(),
             &runtime,
             &mut FixedDurationBackend,
@@ -3307,6 +3499,124 @@ mod tests {
         assert_eq!(config.chunk_size, 1);
         assert_eq!(config.target_samples, 5);
         assert!(config.estimated_throughput_per_sec > 0.0);
+    }
+
+    #[test]
+    fn preparation_receives_the_invocations_exact_chunk_size() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        static PREPARATIONS: AtomicUsize = AtomicUsize::new(0);
+        static INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
+        static LARGEST_CHUNK: AtomicUsize = AtomicUsize::new(0);
+
+        struct ChunkAwareContext {
+            prepared_for: usize,
+        }
+
+        impl crate::BenchContext for ChunkAwareContext {
+            fn prepare(chunk_size: usize) -> Self {
+                PREPARATIONS.fetch_add(1, Ordering::SeqCst);
+                Self {
+                    prepared_for: chunk_size,
+                }
+            }
+        }
+
+        fn assert_prepared_chunk(
+            context: &mut ChunkAwareContext,
+            chunk_size: usize,
+            _chunk_num: usize,
+        ) {
+            assert_eq!(context.prepared_for, chunk_size);
+            INVOCATIONS.fetch_add(1, Ordering::SeqCst);
+            LARGEST_CHUNK.fetch_max(chunk_size, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_micros(chunk_size.min(60_000) as u64));
+        }
+
+        fn assert_diagnostic_chunk(
+            context: &mut ChunkAwareContext,
+            chunk_size: usize,
+            chunk_num: usize,
+        ) -> Result<DiagnosticResult, DiagnosticError> {
+            assert_prepared_chunk(context, chunk_size, chunk_num);
+            Ok(DiagnosticResult::new("chunk preparation"))
+        }
+
+        PREPARATIONS.store(0, Ordering::SeqCst);
+        INVOCATIONS.store(0, Ordering::SeqCst);
+        LARGEST_CHUNK.store(0, Ordering::SeqCst);
+
+        let runner = crate::BenchmarkRunner::new().with_runtime(crate::BenchmarkRuntimeOptions {
+            warm_up_duration: Duration::from_millis(1),
+            benchmark_duration: Duration::from_millis(10),
+            min_samples: 2,
+            max_samples: 2,
+        });
+        runner.group::<ChunkAwareContext>("chunk-aware", |group| {
+            group
+                .diagnostic_pass(assert_diagnostic_chunk)
+                .bench("exact preparation", assert_prepared_chunk);
+        });
+
+        assert!(LARGEST_CHUNK.load(Ordering::SeqCst) > 1);
+        assert_eq!(
+            PREPARATIONS.load(Ordering::SeqCst),
+            INVOCATIONS.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn factory_for_chunk_receives_fixed_chunk_size() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        static FACTORY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        struct FixedChunkContext {
+            prepared_for: usize,
+        }
+
+        impl crate::BenchContext for FixedChunkContext {
+            fn prepare(_chunk_size: usize) -> Self {
+                panic!("factory_for_chunk should override BenchContext::prepare")
+            }
+
+            fn chunk_size() -> Option<usize> {
+                Some(8)
+            }
+        }
+
+        fn assert_fixed_chunk(
+            context: &mut FixedChunkContext,
+            chunk_size: usize,
+            _chunk_num: usize,
+        ) {
+            assert_eq!(context.prepared_for, chunk_size);
+            assert_eq!(chunk_size, 8);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        FACTORY_CALLS.store(0, Ordering::SeqCst);
+        let factory = |chunk_size| {
+            FACTORY_CALLS.fetch_add(1, Ordering::SeqCst);
+            FixedChunkContext {
+                prepared_for: chunk_size,
+            }
+        };
+        let runner = crate::BenchmarkRunner::new().with_runtime(crate::BenchmarkRuntimeOptions {
+            warm_up_duration: Duration::from_millis(1),
+            benchmark_duration: Duration::from_millis(2),
+            min_samples: 2,
+            max_samples: 2,
+        });
+        runner.group::<FixedChunkContext>("chunk factory", |group| {
+            group
+                .factory_for_chunk(&factory)
+                .bench("fixed chunk", assert_fixed_chunk);
+        });
+
+        assert!(FACTORY_CALLS.load(Ordering::SeqCst) >= 3);
     }
 
     /// End-to-end regression test: `bench_sample(...)` must populate
@@ -3321,7 +3631,7 @@ mod tests {
 
         struct DummyCtx;
         impl crate::BenchContext for DummyCtx {
-            fn prepare(_num_chunks: usize) -> Self {
+            fn prepare(_chunk_size: usize) -> Self {
                 DummyCtx
             }
             fn chunk_size() -> Option<usize> {
@@ -3380,7 +3690,7 @@ mod tests {
 
         struct DummyCtx;
         impl crate::BenchContext for DummyCtx {
-            fn prepare(_num_chunks: usize) -> Self {
+            fn prepare(_chunk_size: usize) -> Self {
                 DummyCtx
             }
             fn chunk_size() -> Option<usize> {

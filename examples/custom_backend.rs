@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 struct FakeGpuBench;
 
 impl BenchContext for FakeGpuBench {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         FakeGpuBench
     }
 

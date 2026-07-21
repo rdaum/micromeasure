@@ -34,7 +34,7 @@ When your bench needs pre-allocated input, implement `BenchContext`:
 struct ParseContext { input: Vec<u8> }
 
 impl BenchContext for ParseContext {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         Self { input: vec![b'x'; 4096] }
     }
 }
@@ -50,7 +50,7 @@ fn parse_config(ctx: &mut ParseContext, chunk_size: usize, _chunk_num: usize) {
 }
 ```
 
-`prepare` is called once per sample (and during warm-up), so each sample starts from a fresh context. To override the default `T::prepare(...)` constructor without changing the `BenchContext` impl — for example to close over external setup state, or to construct via a different code path — supply a `factory`:
+`prepare` is called for every calibration trial, warm-up invocation, measured sample, and diagnostic replay, so each invocation starts from fresh context. Its argument is the exact `chunk_size` passed to the benchmark function. To override the default `T::prepare(...)` constructor without changing the `BenchContext` impl — for example to close over external setup state, or to construct via a different code path — supply a `factory`:
 
 ```rust,ignore
 let factory = || ParseContext { input: vec![b'x'; 4096] };
@@ -65,6 +65,23 @@ runner.group::<ParseContext>("Parser", |g| {
 The `factory_builder` example demonstrates this end to end — see [factory_builder](./examples/factory-builder.md).
 
 Note: the factory is called once per sample (and during warm-up), same lifecycle as `prepare` — it does not reuse one instance across samples. Its purpose is to let you supply the constructor inline, close over external setup state, or use a different construction path than the trait default. If per-sample construction is the cost you are trying to avoid, that is a real limitation of the current API, not something `factory` solves.
+
+A zero-argument `factory` intentionally ignores chunk size for compatibility. When captured state
+must be expanded into exactly enough per-invocation input, use `factory_for_chunk`:
+
+```rust,ignore
+let path_prefix = String::from("layer");
+let factory = |chunk_size| ImageIndexContext {
+    paths: (0..chunk_size)
+        .map(|index| format!("{path_prefix}/{index}"))
+        .collect(),
+};
+
+runner.group::<ImageIndexContext>("Image index", |g| {
+    g.factory_for_chunk(&factory)
+        .bench("insert unique paths", insert_unique_paths);
+});
+```
 
 ## Throughput with the right unit
 
@@ -90,7 +107,7 @@ Calibration sets `chunk_size` to land at ~50 ms of work. If your inner loop does
 
 ```rust,ignore
 impl BenchContext for MyCtx {
-    fn prepare(_n: usize) -> Self { /* ... */ }
+    fn prepare(_chunk_size: usize) -> Self { /* ... */ }
 
     fn operations_per_chunk() -> Option<u64> {
         // each chunk iterates chunk_size rows, each row is 4096 bytes

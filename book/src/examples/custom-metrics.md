@@ -15,7 +15,7 @@ Phase 2 of the GPU benchmarking work: per-sample custom metrics via `bench_sampl
 
 ```rust,ignore
 impl BenchContext for FakeGpuBench {
-    fn prepare(_num_chunks: usize) -> Self { FakeGpuBench }
+    fn prepare(_chunk_size: usize) -> Self { FakeGpuBench }
 
     // Fixed chunk size: GPU work does not auto-scale the way CPU work does.
     fn chunk_size() -> Option<usize> { Some(4_000) }

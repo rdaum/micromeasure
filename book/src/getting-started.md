@@ -6,7 +6,7 @@ This page walks through wiring `micromeasure` into a crate, writing the smallest
 
 ```toml
 [dev-dependencies]
-micromeasure = "0.9"
+micromeasure = "0.11"
 ```
 
 ## 2. Declare a custom bench target with `harness = false`

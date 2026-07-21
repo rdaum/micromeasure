@@ -370,7 +370,10 @@ pub enum MeasurementDomain {
 /// [`end`](Self::end) immediately after it returns the operation count,
 /// then calls [`collect`](Self::collect) to materialize whatever it
 /// observed into the shared [`Results`] struct and a list of
-/// [`MetricValue`]s for any derived per-sample metrics.
+/// [`MetricValue`]s for any derived per-sample metrics. Fixed-chunk
+/// benchmarks also invoke the backend during warm-up so sample count can be
+/// based on backend-domain duration; those warm-up results and metrics are
+/// discarded before persisted measurement samples begin.
 ///
 /// ## Responsibilities
 ///
@@ -404,9 +407,10 @@ pub enum MeasurementDomain {
 ///
 /// `collect` receives `chunk_index: usize` so a backend can correlate the
 /// current sample with state it captured in [`begin`](Self::begin) /
-/// [`end`](Self::end) (e.g. sampling the GPU clock at sample N for
-/// thermal-state tracking, or skipping CUDA-event recording during the
-/// warm-up phase). Backends that have nothing to correlate ignore it.
+/// [`end`](Self::end), such as sampling the GPU clock at sample N for
+/// thermal-state tracking. Fixed-chunk warm-up uses increasing indices and
+/// persisted measurement samples restart at zero. Backends that have nothing
+/// to correlate ignore it.
 ///
 /// ## Example: a CUDA event backend
 ///
@@ -524,11 +528,11 @@ pub trait MeasurementBackend {
     /// must write it into `results.iterations` so the existing
     /// throughput/latency aggregation paths keep working unchanged.
     ///
-    /// `chunk_index` is the zero-based sample index within the current
-    /// benchmark run. Backends use it to correlate per-sample state (e.g.
-    /// skip CUDA-event recording during warmup, capture per-sample GPU
-    /// clock samples, or log per-algorithm switches). Backends that have
-    /// nothing to correlate ignore it.
+    /// `chunk_index` is the zero-based index within the current warm-up or
+    /// persisted measurement phase. Fixed-chunk warm-up and persisted samples
+    /// each start at zero. Backends use it to correlate per-sample state, such
+    /// as capturing GPU clock samples or logging per-algorithm switches.
+    /// Backends that have nothing to correlate ignore it.
     ///
     /// Backends must set `results.chunks_executed = 1` per sample to match
     /// the existing single-chunk measurement model.

@@ -71,7 +71,7 @@ When `chunk_size()` returns `Some`, the runner estimates chunk throughput and du
 ### What this implies
 
 - You are responsible for picking a chunk size that matches the workload you care about. The framework will not second-guess you.
-- `benchmark_duration` remains a target rather than a hard limit. The `min_samples` and `max_samples` bounds can still make the actual run shorter or longer.
+- `benchmark_duration` remains a target rather than a hard limit. The `min_samples` and `max_samples` bounds can still make the actual run shorter or longer. When a fixed chunk reaches `max_samples` before accumulating 80% of the requested backend-domain duration, the runner prints a warning rather than silently presenting the short run as if it met the budget.
 - If your per-sample device time is large, consider lowering `min_samples` or the chunk size so the run completes in reasonable wall-clock time.
 
 ## Host wall-clock is not device time

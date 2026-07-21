@@ -135,7 +135,7 @@ runner.set_runtime(BenchmarkRuntimeOptions {
 });
 ```
 
-`benchmark_duration` is the *target* total sample time; the actual number of samples is clamped to `[min_samples, max_samples]` based on the calibrated chunk duration. A 5s budget with 50ms chunks yields up to 100 samples; a 2s budget yields ~40.
+`benchmark_duration` is the *target* total sample time; the actual number of samples is clamped to `[min_samples, max_samples]` based on the calibrated chunk duration. A 5s budget with 50ms chunks yields up to 100 samples; a 2s budget yields ~40. Fixed chunks are never enlarged to fill the budget. If one reaches `max_samples` with less than 80% of the requested backend-domain duration, the runner warns that the measured run was short.
 
 All four fields must be > 0 and `min_samples <= max_samples`; the runner asserts this at startup.
 

@@ -320,6 +320,7 @@ pub struct BenchmarkConfig {
     pub chunk_size: usize,
     pub target_samples: usize,
     pub estimated_throughput_per_sec: f64,
+    pub fixed_chunk: bool,
 }
 
 struct ConcurrentBenchmarkConfig {
@@ -941,6 +942,7 @@ fn calibrate_engine<T: BenchContext, F: Fn(usize) -> T + ?Sized, G: Fn(&mut T, u
             chunk_size: preferred_chunk_size,
             target_samples,
             estimated_throughput_per_sec,
+            fixed_chunk: true,
         };
     }
 
@@ -1025,6 +1027,7 @@ fn calibrate_engine<T: BenchContext, F: Fn(usize) -> T + ?Sized, G: Fn(&mut T, u
         chunk_size: best_chunk_size,
         target_samples,
         estimated_throughput_per_sec,
+        fixed_chunk: false,
     }
 }
 
@@ -1038,6 +1041,30 @@ fn target_sample_count(
 
     ((runtime.benchmark_duration.as_secs_f64() / estimated_sample_duration_secs) as usize)
         .clamp(runtime.min_samples, runtime.max_samples)
+}
+
+const MIN_REALIZED_BENCHMARK_DURATION_FRACTION: f64 = 0.8;
+
+fn fixed_chunk_duration_shortfall(
+    config: &BenchmarkConfig,
+    runtime: &BenchmarkRuntimeOptions,
+    measured_duration: Duration,
+) -> Option<String> {
+    if !config.fixed_chunk
+        || config.target_samples != runtime.max_samples
+        || measured_duration
+            >= runtime
+                .benchmark_duration
+                .mul_f64(MIN_REALIZED_BENCHMARK_DURATION_FRACTION)
+    {
+        return None;
+    }
+
+    Some(format!(
+        "fixed chunk reached max_samples after {:.3} ms of the requested {:.3} ms measurement",
+        measured_duration.as_secs_f64() * 1_000.0,
+        runtime.benchmark_duration.as_secs_f64() * 1_000.0,
+    ))
 }
 
 fn total_worker_threads<T>(workers: &[ConcurrentWorker<T>]) -> usize {
@@ -1723,6 +1750,11 @@ impl BenchmarkRunner {
 
         clear_line();
         println!("  samples complete: {}", config.target_samples);
+        if let Some(warning) =
+            fixed_chunk_duration_shortfall(&config, &self.runtime, summed_results.duration)
+        {
+            println!("  ⚠️ warning: {warning}");
+        }
 
         let diagnostic_metrics = execute_diagnostic_pass(
             diagnostic_pass,
@@ -1879,6 +1911,11 @@ impl BenchmarkRunner {
 
         clear_line();
         println!("  samples complete: {}", config.target_samples);
+        if let Some(warning) =
+            fixed_chunk_duration_shortfall(&config, &self.runtime, summed_results.duration)
+        {
+            println!("  ⚠️ warning: {warning}");
+        }
 
         let diagnostic_metrics = execute_diagnostic_pass(
             diagnostic_pass,
@@ -3437,6 +3474,7 @@ mod tests {
             "expected a roughly 50 ms chunk, got {}",
             config.chunk_size
         );
+        assert!(!config.fixed_chunk);
     }
 
     #[test]
@@ -3499,6 +3537,47 @@ mod tests {
         assert_eq!(config.chunk_size, 1);
         assert_eq!(config.target_samples, 5);
         assert!(config.estimated_throughput_per_sec > 0.0);
+        assert!(config.fixed_chunk);
+    }
+
+    #[test]
+    fn fixed_chunk_duration_shortfall_requires_max_samples_and_material_shortfall() {
+        use super::{BenchmarkConfig, BenchmarkRuntimeOptions, fixed_chunk_duration_shortfall};
+        use std::time::Duration;
+
+        let runtime = BenchmarkRuntimeOptions {
+            warm_up_duration: Duration::from_millis(1),
+            benchmark_duration: Duration::from_secs(1),
+            min_samples: 2,
+            max_samples: 5,
+        };
+        let mut config = BenchmarkConfig {
+            chunk_size: 1,
+            target_samples: 5,
+            estimated_throughput_per_sec: 1.0,
+            fixed_chunk: true,
+        };
+
+        let warning =
+            fixed_chunk_duration_shortfall(&config, &runtime, Duration::from_millis(12)).unwrap();
+        assert!(warning.contains("fixed chunk reached max_samples"));
+        assert!(warning.contains("12.000 ms"));
+        assert!(warning.contains("1000.000 ms"));
+
+        assert!(
+            fixed_chunk_duration_shortfall(&config, &runtime, Duration::from_millis(800)).is_none()
+        );
+
+        config.target_samples = runtime.max_samples - 1;
+        assert!(
+            fixed_chunk_duration_shortfall(&config, &runtime, Duration::from_millis(12)).is_none()
+        );
+
+        config.target_samples = runtime.max_samples;
+        config.fixed_chunk = false;
+        assert!(
+            fixed_chunk_duration_shortfall(&config, &runtime, Duration::from_millis(12)).is_none()
+        );
     }
 
     #[test]

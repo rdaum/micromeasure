@@ -31,6 +31,9 @@ pub struct BenchmarkMainOptions {
 
 `micromeasure::src/launcher.rs`
 
+`OUTPUT_PATH_ENVIRONMENT` names the `MICROMEASURE_OUTPUT` environment variable. When set, it
+selects an explicit report path, overrides `save_results`, and makes persistence failure fatal.
+
 ### `benchmark_filter_from_args` / `benchmark_filter_from_env`
 
 Filter parsing helpers, exposed for custom entry points.
@@ -121,7 +124,8 @@ Register with `g.diagnostic_pass(f)` and `g.diagnostic_samples(n)` on a `Benchma
 
 | Type | Purpose | Source |
 |---|---|---|
-| `BenchmarkReport` | Persisted report: `timestamp`, `hostname`, `suite`, `git_commit`, `results`. `save_to_default_location()`, `print_summary_with(policy)`. | `src/session.rs` |
+| `BenchmarkReport` | Versioned persisted report: `schema_version`, `timestamp`, `hostname`, `suite`, `git_commit`, `results`. `save_to_path()`, `save_to_default_location()`, `print_summary_with(policy)`. | `src/session.rs` |
+| `REPORT_SCHEMA_VERSION` | JSON report schema emitted by this crate and accepted for persisted comparison. | `src/session.rs` |
 | `BenchmarkResult` | One persisted entry: `name`, `kind`, `execution_index`, metadata, stats, worker summaries. | `src/session.rs` |
 | `BenchmarkKind` | `Standard` / `Concurrent`. | `src/session.rs` |
 | `ComparisonPolicy` | `None` / `LatestCompatible`. | `src/session.rs` |

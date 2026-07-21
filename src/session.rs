@@ -16,9 +16,9 @@ use crate::{Alignment, MeasurementDomain, MetricFormat, TableFormatter, Throughp
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
-    io::IsTerminal,
-    path::PathBuf,
+    fs::{self, File, OpenOptions},
+    io::{BufWriter, IsTerminal, Write},
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -236,12 +236,25 @@ pub enum ComparisonPolicy {
 /// Persisted benchmark report for serialization and optional comparisons.
 #[derive(Serialize, Deserialize)]
 pub struct BenchmarkReport {
+    /// Version of the serialized JSON document shape.
+    ///
+    /// Reports without this field predate explicit schema versioning and are
+    /// interpreted as version 1 for backward compatibility.
+    #[serde(default = "default_report_schema_version")]
+    pub schema_version: u32,
     pub timestamp: String,
     pub hostname: String,
     #[serde(default)]
     pub suite: Option<String>,
     pub git_commit: Option<String>,
     pub results: Vec<BenchmarkResult>,
+}
+
+/// JSON document schema emitted by this version of `micromeasure`.
+pub const REPORT_SCHEMA_VERSION: u32 = 1;
+
+const fn default_report_schema_version() -> u32 {
+    REPORT_SCHEMA_VERSION
 }
 
 /// A live benchmark session that collects results
@@ -323,6 +336,7 @@ impl BenchmarkSession {
 
     pub(crate) fn report(&self) -> BenchmarkReport {
         BenchmarkReport {
+            schema_version: default_report_schema_version(),
             timestamp: self.timestamp.clone(),
             hostname: self.hostname.clone(),
             suite: Some(self.suite.clone()),
@@ -698,9 +712,62 @@ impl BenchmarkReport {
         fs::create_dir_all(&target_dir)?;
 
         let filename = target_dir.join(format!("benchmark_results_{}.json", self.timestamp));
-        let file = File::create(&filename)?;
-        serde_json::to_writer_pretty(file, self)?;
+        self.save_to_path(&filename)?;
         Ok(filename)
+    }
+
+    /// Persist this report at an explicit path for automation and external
+    /// evidence collectors.
+    ///
+    /// The parent directory is created when necessary. The document is first
+    /// written beside the destination and then renamed into place so readers
+    /// do not observe a partially serialized report.
+    pub fn save_to_path(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        if self.results.is_empty() {
+            return Err("no benchmark results to save".into());
+        }
+        let Some(file_name) = path.file_name() else {
+            return Err("report path must name a file".into());
+        };
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut temporary_name = file_name.to_os_string();
+        temporary_name.push(format!(
+            ".tmp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let temporary_path = path.with_file_name(temporary_name);
+
+        let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, self)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+
+        if let Err(error) = fs::rename(&temporary_path, path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error.into());
+        }
+        Ok(())
     }
 }
 
@@ -1196,6 +1263,10 @@ fn session_is_compatible(
     suite: &str,
     current_results: &[BenchmarkResult],
 ) -> bool {
+    if session.schema_version != REPORT_SCHEMA_VERSION {
+        return false;
+    }
+
     if session.hostname != hostname {
         return false;
     }
@@ -1243,7 +1314,9 @@ fn load_latest_session() -> Option<BenchmarkReport> {
         let Ok(file) = File::open(entry.path()) else {
             continue;
         };
-        if let Ok(session) = serde_json::from_reader(file) {
+        if let Ok(session) = serde_json::from_reader::<_, BenchmarkReport>(file)
+            && session.schema_version == REPORT_SCHEMA_VERSION
+        {
             return Some(session);
         }
     }
@@ -1331,6 +1404,7 @@ mod tests {
 
     fn make_session(hostname: &str, suite: Option<&str>, result_names: &[&str]) -> BenchmarkReport {
         BenchmarkReport {
+            schema_version: default_report_schema_version(),
             timestamp: "123".to_string(),
             hostname: hostname.to_string(),
             suite: suite.map(str::to_string),
@@ -1340,6 +1414,59 @@ mod tests {
                 .map(|name| make_result(name, 1.0))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn explicit_report_path_atomically_preserves_the_versioned_document() {
+        let report = make_session("host-a", Some("suite-a"), &["bench-a"]);
+        let directory = std::env::temp_dir().join(format!(
+            "micromeasure-report-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = directory.join("nested/report.json");
+
+        report.save_to_path(&path).unwrap();
+        let replacement = make_session("host-a", Some("suite-a"), &["bench-b"]);
+        replacement.save_to_path(&path).unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+
+        assert_eq!(document["schema_version"], REPORT_SCHEMA_VERSION);
+        assert_eq!(document["suite"], "suite-a");
+        assert_eq!(document["results"][0]["name"], "bench-b");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reports_without_a_schema_version_are_version_one() {
+        let report = make_session("host-a", Some("suite-a"), &["bench-a"]);
+        let mut document = serde_json::to_value(report).unwrap();
+        document.as_object_mut().unwrap().remove("schema_version");
+
+        let parsed: BenchmarkReport = serde_json::from_value(document).unwrap();
+        assert_eq!(parsed.schema_version, REPORT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn future_report_schemas_are_not_comparison_compatible() {
+        let mut report = make_session("host-a", Some("suite-a"), &["bench-a"]);
+        report.schema_version = REPORT_SCHEMA_VERSION + 1;
+
+        assert!(!session_is_compatible(
+            &report,
+            "host-a",
+            "suite-a",
+            &[make_result("bench-a", 1.0)]
+        ));
     }
 
     #[test]
@@ -1437,6 +1564,7 @@ mod tests {
         let append = make_result_in_group("append", "1t", 10.0);
         let strict = make_result_in_group("strict", "1t", 20.0);
         let report = BenchmarkReport {
+            schema_version: default_report_schema_version(),
             timestamp: "123".to_string(),
             hostname: "host-a".to_string(),
             suite: Some("suite-a".to_string()),
@@ -1488,6 +1616,7 @@ mod tests {
             make_result_in_group("strict", "1t", 20.0),
         ];
         let compatible = BenchmarkReport {
+            schema_version: default_report_schema_version(),
             timestamp: "123".to_string(),
             hostname: "host-a".to_string(),
             suite: Some("suite-a".to_string()),
@@ -1505,6 +1634,7 @@ mod tests {
         ));
 
         let reuses_one_previous = BenchmarkReport {
+            schema_version: default_report_schema_version(),
             timestamp: "123".to_string(),
             hostname: "host-a".to_string(),
             suite: Some("suite-a".to_string()),

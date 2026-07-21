@@ -153,7 +153,8 @@ It expands to `fn main()` that calls `run_benchmark_main(BenchmarkMainOptions::d
 3. Apply your `BenchmarkRuntimeOptions` from `BenchmarkMainOptions::runtime`.
 4. Call your registration closure.
 5. Build the report and call `report.print_summary_with(comparison_policy)` (default `LatestCompatible`).
-6. Save the report to `./target/benchmark_results_<timestamp>.json`.
+6. Save the report to `./target/benchmark_results_<timestamp>.json`, or to the exact path in
+   `MICROMEASURE_OUTPUT` when that environment variable is set.
 
 For custom suite name, custom filter help text, a different `ComparisonPolicy`, or disabling persistence, use `run_benchmark_main` directly:
 

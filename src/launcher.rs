@@ -13,7 +13,30 @@
 // limitations under the License.
 
 use crate::{BenchmarkReport, BenchmarkRunner, BenchmarkRuntimeOptions, ComparisonPolicy};
-use std::{env, time::Duration};
+use std::{env, ffi::OsString, path::PathBuf, time::Duration};
+
+/// Environment variable selecting an explicit JSON report destination.
+///
+/// When set, this takes precedence over [`BenchmarkMainOptions::save_results`]
+/// and the default target-directory destination. Failure to write the
+/// requested artifact is fatal so automation cannot silently continue without
+/// its expected evidence.
+pub const OUTPUT_PATH_ENVIRONMENT: &str = "MICROMEASURE_OUTPUT";
+
+#[derive(Debug, Eq, PartialEq)]
+enum ReportDestination {
+    Explicit(PathBuf),
+    Default,
+    Disabled,
+}
+
+fn report_destination(explicit_path: Option<OsString>, save_results: bool) -> ReportDestination {
+    match explicit_path {
+        Some(path) => ReportDestination::Explicit(PathBuf::from(path)),
+        None if save_results => ReportDestination::Default,
+        None => ReportDestination::Disabled,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct BenchmarkMainOptions {
@@ -87,12 +110,42 @@ pub fn run_benchmark_main(
     let report = runner.report();
     report.print_summary_with(options.comparison_policy);
 
-    if options.save_results {
-        match report.save_to_default_location() {
+    match report_destination(env::var_os(OUTPUT_PATH_ENVIRONMENT), options.save_results) {
+        ReportDestination::Explicit(path) => {
+            report.save_to_path(&path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to save benchmark results to {}: {error}",
+                    path.display()
+                )
+            });
+            println!("\n💾 Results saved to: {}", path.display());
+        }
+        ReportDestination::Default => match report.save_to_default_location() {
             Ok(path) => println!("\n💾 Results saved to: {}", path.display()),
             Err(error) => println!("\n⚠️  Failed to save results: {error}"),
-        }
+        },
+        ReportDestination::Disabled => {}
     }
 
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_output_takes_precedence_over_save_results() {
+        let path = OsString::from("artifacts/report.json");
+        assert_eq!(
+            report_destination(Some(path), false),
+            ReportDestination::Explicit(PathBuf::from("artifacts/report.json"))
+        );
+    }
+
+    #[test]
+    fn output_follows_save_results_without_an_explicit_path() {
+        assert_eq!(report_destination(None, true), ReportDestination::Default);
+        assert_eq!(report_destination(None, false), ReportDestination::Disabled);
+    }
 }

@@ -46,7 +46,8 @@ pub use bench::{
     GpuCounterResult,
 };
 pub use launcher::{
-    BenchmarkMainOptions, benchmark_filter_from_args, benchmark_filter_from_env, run_benchmark_main,
+    BenchmarkMainOptions, OUTPUT_PATH_ENVIRONMENT, benchmark_filter_from_args,
+    benchmark_filter_from_env, run_benchmark_main,
 };
 pub use table::{Alignment, BorderColor, TableFormatter};
 
@@ -54,7 +55,7 @@ pub use table::{Alignment, BorderColor, TableFormatter};
 pub use bench::PerfCounters;
 pub use session::{
     BenchmarkKind, BenchmarkReport, BenchmarkResult, BenchmarkStats, ComparisonPolicy,
-    SampleMetric, SampleMetricSet, WorkerCounterSummary, WorkerSummary,
+    REPORT_SCHEMA_VERSION, SampleMetric, SampleMetricSet, WorkerCounterSummary, WorkerSummary,
 };
 
 // Re-export key types for convenience

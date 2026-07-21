@@ -22,12 +22,27 @@ The runner prints the saved path at the end of a run:
 💾 Results saved to: ./target/benchmark_results_1738000000.json
 ```
 
-To disable saving, set `BenchmarkMainOptions { save_results: false, ... }` and call `run_benchmark_main` directly instead of the `benchmark_main!` macro.
+Automation can select an exact destination with `MICROMEASURE_OUTPUT`:
+
+```sh
+MICROMEASURE_OUTPUT=artifacts/benchmark.json cargo bench --bench basic
+```
+
+The runner creates missing parent directories and atomically replaces the destination, so an
+artifact reader does not observe a partially written report. An explicit destination takes
+precedence over `BenchmarkMainOptions::save_results`, including when that option is `false`.
+Failure to write an explicitly requested artifact terminates the benchmark process; automation
+should not continue under the assumption that its evidence was saved.
+
+When `MICROMEASURE_OUTPUT` is unset, disable saving by setting
+`BenchmarkMainOptions { save_results: false, ... }` and calling `run_benchmark_main` directly
+instead of the `benchmark_main!` macro.
 
 ## What's in a report
 
 `BenchmarkReport` (serde-serialized) contains:
 
+- `schema_version` — JSON document format version; currently `1`
 - `timestamp` — unix seconds string
 - `hostname` — used to gate comparison (different host = incompatible)
 - `suite` — optional suite name (defaults to the crate name); comparison requires same suite
@@ -71,6 +86,11 @@ A previous report is **compatible** with the current run when all of:
 If the previous report has a different set of benchmarks (you added/removed/renamed one), it is not compatible and the runner skips the comparison rather than printing misleading deltas. Rename a benchmark and you lose comparability with the previous run — by design.
 
 The runner loads the most recent compatible report from the target directory by scanning `benchmark_results_*.json`, parsing timestamps, and picking the latest one whose result set matches.
+
+Reports created before `schema_version` was added are interpreted as schema 1. Reports carrying a
+different schema version are skipped for comparison rather than being interpreted using incompatible
+assumptions. External consumers can compare the document field with
+`micromeasure::REPORT_SCHEMA_VERSION`.
 
 ## The regression analysis
 

@@ -163,7 +163,9 @@ pub fn run_benchmark_main(
                     baseline_display_path(&baseline)
                 )
             });
-        report.print_summary_against(baseline.as_native());
+        if let Some(native_baseline) = baseline.as_native() {
+            report.print_summary_against(native_baseline);
+        }
         println!(
             "\n📋 Structured comparison: {} matched, {} added, {} removed",
             comparison.summary.matched, comparison.summary.added, comparison.summary.removed

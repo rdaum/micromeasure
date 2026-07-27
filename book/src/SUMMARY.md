@@ -8,6 +8,7 @@
 - [GPU Benchmarks](./gpu.md)
 - [Linux PMU Setup](./linux-pmu.md)
 - [Persisted Reports & Comparison](./reports.md)
+- [External Sample Series](./series-reports.md)
 - [Examples](./examples.md)
   - [basic](./examples/basic.md)
   - [throughput_units](./examples/throughput-units.md)

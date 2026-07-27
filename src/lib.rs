@@ -19,6 +19,7 @@
 //! - Console output with Unicode tables
 //! - Explicit report rendering and JSON persistence
 //! - Structured, serializable comparison of persisted reports
+//! - Portable raw-sample reports for external orchestrators
 //! - Warm-up and calibration phases
 //! - Progress indicators
 //! - Generic table formatting
@@ -27,6 +28,7 @@ pub mod bench;
 mod comparison;
 mod context;
 mod launcher;
+mod series;
 mod session;
 pub mod table;
 mod threading;
@@ -49,18 +51,22 @@ pub use bench::{
     GpuCounterResult,
 };
 pub use comparison::{
-    BenchmarkCaseIdentity, COMPARISON_SCHEMA_VERSION, ComparisonCaseSnapshot, ComparisonError,
-    ComparisonOptions, ComparisonReport, ComparisonSide, ComparisonStatistics, ComparisonSummary,
-    EnvironmentComparison, EnvironmentOverride, MatchedBenchmark, MeasurementDirection,
-    MeasurementKind, MetricComparison, NativeMeasurementProjection, PrimaryMeasurement,
-    ReportDocument, ReportDocumentType, ReportError, ReportReference, UnmatchedBenchmark,
-    compare_reports,
+    BenchmarkCaseIdentity, COMPARISON_SCHEMA_VERSION, ComparisonCaseIdentity,
+    ComparisonCaseSnapshot, ComparisonError, ComparisonOptions, ComparisonReport, ComparisonSide,
+    ComparisonStatistics, ComparisonSummary, EnvironmentComparison, EnvironmentOverride,
+    MatchedBenchmark, MeasurementDirection, MeasurementKind, MetricComparison,
+    NativeMeasurementProjection, PrimaryMeasurement, ReportDocument, ReportDocumentType,
+    ReportError, ReportReference, SeriesCaseIdentity, UnmatchedBenchmark, compare_reports,
 };
 pub use context::{ContextError, ReportContext};
 pub use launcher::{
     BASELINE_PATH_ENVIRONMENT, BenchmarkMainOptions, CONTEXT_FILE_ENVIRONMENT,
     OUTPUT_PATH_ENVIRONMENT, benchmark_filter_from_args, benchmark_filter_from_env,
     benchmark_options_with_default_suite, run_benchmark_main,
+};
+pub use series::{
+    SERIES_DOCUMENT_TYPE, SERIES_SCHEMA_VERSION, SeriesReport, SeriesResult, SeriesValidationError,
+    Validity, ValidityStatus,
 };
 pub use table::{Alignment, BorderColor, TableFormatter};
 

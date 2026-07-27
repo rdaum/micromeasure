@@ -197,11 +197,13 @@ let comparison = compare_reports(&current, &baseline, &options)?;
 serde_json::to_writer_pretty(std::io::stdout(), &comparison)?;
 ```
 
-`ReportDocument::load_from_path` distinguishes I/O, malformed JSON, malformed
-report structure, and unsupported schema errors. It also gives the document a
-`ReportReference` containing a SHA-256 digest of the exact loaded bytes. For an
-in-memory comparison, `BenchmarkReport::compare` derives references from the
-same pretty JSON representation used by report persistence.
+`ReportDocument::load_from_path` detects native benchmark and external series
+documents and distinguishes I/O, malformed JSON, malformed structure,
+unsupported document/schema versions, and semantic validation errors. It also
+gives the document a `ReportReference` containing a SHA-256 digest of the exact
+loaded bytes. For an in-memory comparison, `BenchmarkReport::compare` and
+`SeriesReport::compare` derive references from their normal pretty JSON
+representations.
 
 Native benchmark cases are identified by group, name, kind, `Throughput`,
 measurement domain, and benchmark metadata. Duplicate identities are errors in
@@ -211,14 +213,19 @@ baseline-only cases as `removed`; changed identity fields therefore become an
 added/removed pair rather than a misleading numeric comparison. Strict
 comparison is the default.
 
-`ComparisonReport` is policy-free, versioned JSON. Each matched native case
-contains:
+External series cases are identified by group, name, measurement kind, unit,
+direction, and explicit comparison dimensions. Their artifact provenance does
+not participate in identity. See [External Sample Series](./series-reports.md)
+for the producer schema and validity rules.
 
-- median throughput as a `throughput`/`higher` primary measurement;
+`ComparisonReport` is policy-free, versioned JSON. Each matched case contains:
+
+- chronological samples and a direction-aware median primary measurement;
 - signed percentage improvement, where positive always means better;
-- native throughput and latency projections;
-- CV, MAD, sample, and outlier evidence; and
-- changes for custom metrics present on both sides.
+- CV, p95, MAD, sample, and outlier evidence;
+- result validity and per-case provenance; and
+- native throughput/latency projections and matching custom metrics when
+  present.
 
 Suite, effective runner identity, and the complete comparison-environment maps
 must match. `ComparisonOptions::with_environment_override(reason)` can permit

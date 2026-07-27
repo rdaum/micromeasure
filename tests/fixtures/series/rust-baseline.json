@@ -1,0 +1,127 @@
+{
+  "document_type": "micromeasure-series",
+  "schema_version": 1,
+  "timestamp": "2026-07-20T15:10:00Z",
+  "suite": "external-fixture",
+  "validity": {
+    "status": "valid"
+  },
+  "context": {
+    "runner_id": "fixture-runner",
+    "environment": {
+      "hardware_class": "test-node",
+      "profile": "release"
+    },
+    "provenance": {
+      "commit": "baseline-rust-commit",
+      "producer": "rust"
+    }
+  },
+  "results": [
+    {
+      "group": "scenario",
+      "name": "create",
+      "measurement": "latency",
+      "unit": "ms",
+      "direction": "lower",
+      "samples": [
+        100.0,
+        110.0,
+        120.0
+      ],
+      "validity": {
+        "status": "valid"
+      },
+      "dimensions": {
+        "model": "fixture-v1"
+      },
+      "provenance": {
+        "image_digest": "sha256:baseline"
+      }
+    },
+    {
+      "group": "scenario",
+      "name": "requests",
+      "measurement": "throughput",
+      "unit": "requests/s",
+      "direction": "higher",
+      "samples": [
+        90.0,
+        100.0,
+        110.0
+      ],
+      "validity": {
+        "status": "valid"
+      },
+      "dimensions": {
+        "model": "fixture-v1"
+      },
+      "provenance": {
+        "image_digest": "sha256:baseline"
+      }
+    },
+    {
+      "group": "scenario",
+      "name": "peak-memory",
+      "measurement": "memory",
+      "unit": "MiB",
+      "direction": "lower",
+      "samples": [
+        1000.0,
+        1050.0,
+        1100.0
+      ],
+      "validity": {
+        "status": "valid"
+      },
+      "dimensions": {
+        "model": "fixture-v1"
+      },
+      "provenance": {
+        "image_digest": "sha256:baseline"
+      }
+    },
+    {
+      "group": "scenario",
+      "name": "occupancy",
+      "measurement": "occupancy",
+      "unit": "ratio",
+      "direction": "higher",
+      "samples": [
+        0.7,
+        0.72,
+        0.71
+      ],
+      "validity": {
+        "status": "valid"
+      },
+      "dimensions": {
+        "model": "fixture-v1"
+      },
+      "provenance": {
+        "image_digest": "sha256:baseline"
+      }
+    },
+    {
+      "group": "scenario",
+      "name": "quality-score",
+      "measurement": "custom",
+      "unit": "points",
+      "direction": "informational",
+      "samples": [
+        42.0,
+        43.0,
+        44.0
+      ],
+      "validity": {
+        "status": "valid"
+      },
+      "dimensions": {
+        "model": "fixture-v1"
+      },
+      "provenance": {
+        "image_digest": "sha256:baseline"
+      }
+    }
+  ]
+}

@@ -143,7 +143,7 @@ Register with `g.diagnostic_pass(f)` and `g.diagnostic_samples(n)` on a `Benchma
 | `BenchmarkKind` | `Standard` / `Concurrent`. | `src/session.rs` |
 | `ComparisonPolicy` | `None` / `LatestCompatible`. | `src/session.rs` |
 | `ReportDocument` / `ReportReference` | Auto-detected native or series evidence retaining an exact-byte SHA-256 digest, document metadata, source provenance, and optional display path. `from_native` / `from_series` wrap in-memory evidence. | `src/comparison.rs` |
-| `ComparisonOptions` | Strict by default; `allow_partial_result_set(true)` reports matching, added, and removed cases, while `with_environment_override(reason)` explicitly permits and records an environment mismatch. | `src/comparison.rs` |
+| `ComparisonOptions` | Strict per-suite case comparison by default; `allow_partial_result_set(true)` reports matching, added, and removed cases, `require_same_suite_set(true)` rejects missing directory suites, and `with_environment_override(reason)` explicitly permits and records an environment mismatch. | `src/comparison.rs` |
 | `EnvironmentOverride` / `EnvironmentComparison` | Operator justification plus both original runner IDs and environment maps retained in the comparison artifact. | `src/comparison.rs` |
 | `ComparisonReport` | Versioned, serializable, policy-free comparison with report references, environment relationship, matched cases, unmatched cases, and summary counts. | `src/comparison.rs` |
 | `BenchmarkCaseIdentity` | Native case identity: group, name, kind, throughput configuration, measurement domain, and metadata. | `src/comparison.rs` |
@@ -154,7 +154,7 @@ Register with `g.diagnostic_pass(f)` and `g.diagnostic_samples(n)` on a `Benchma
 | `MeasurementKind` / `MeasurementDirection` | Machine-readable primary measurement semantics and higher/lower/informational direction. | `src/comparison.rs` |
 | `ReportError` / `ComparisonError` | Structured loading, document/schema, semantic validity, suite, runner/environment, override, duplicate-identity, and result-set errors. | `src/comparison.rs` |
 | `COMPARISON_SCHEMA_VERSION` | JSON schema emitted for `ComparisonReport`. | `src/comparison.rs` |
-| `RegressionPolicy` | Serializable advisory or gating policy with material-change, CV, and outlier thresholds. `advisory()` is the default; `gating()` blocks material regressions. | `src/policy.rs` |
+| `RegressionPolicy` | Serializable advisory or gating policy with material-change, CV, and outlier thresholds. `advisory()` is the default; `gating()` blocks material regressions, and `fail_on_invalid(true)` independently blocks invalid matched results. | `src/policy.rs` |
 | `ChangeClassification` / `PolicyFinding` | Direction-aware case outcome and independent invalidity/stability observations. | `src/policy.rs` |
 | `PolicyCaseEvaluation` / `PolicySummary` / `PolicyEvaluation` | Per-case and aggregate policy decisions kept separate from comparison evidence. | `src/policy.rs` |
 | `ComparisonAnalysis` | Versioned bundle of a `ComparisonReport` and its reproducible policy evaluation. Construct with `comparison.analyze(&policy)`. | `src/render.rs` |

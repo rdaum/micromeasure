@@ -81,9 +81,17 @@ struct CompareArgs {
     #[arg(long)]
     fail_on_regression: bool,
 
+    /// Return status 1 when a matched result is marked invalid.
+    #[arg(long)]
+    fail_on_invalid: bool,
+
     /// Require every matched suite to have identical case sets.
     #[arg(long)]
     strict_result_set: bool,
+
+    /// Require directory inputs to have identical suite sets.
+    #[arg(long)]
+    strict_suite_set: bool,
 
     /// Explicitly justify comparing different runners or environments.
     #[arg(long)]
@@ -127,8 +135,9 @@ fn compare(arguments: CompareArgs) -> Result<ComparisonExitStatus, CliError> {
         arguments.markdown_output.as_deref(),
     )?;
 
-    let mut options =
-        ComparisonOptions::default().allow_partial_result_set(!arguments.strict_result_set);
+    let mut options = ComparisonOptions::default()
+        .allow_partial_result_set(!arguments.strict_result_set)
+        .require_same_suite_set(arguments.strict_suite_set);
     if let Some(reason) = arguments.environment_override {
         options = options.with_environment_override(reason);
     }
@@ -136,7 +145,8 @@ fn compare(arguments: CompareArgs) -> Result<ComparisonExitStatus, CliError> {
         .with_minimum_change_percent(arguments.minimum_change)
         .with_maximum_cv_percent(Some(arguments.maximum_cv))
         .with_maximum_outlier_fraction(Some(arguments.maximum_outlier_fraction))
-        .fail_on_regression(arguments.fail_on_regression);
+        .fail_on_regression(arguments.fail_on_regression)
+        .fail_on_invalid(arguments.fail_on_invalid);
     let analysis = compare_report_inputs(arguments.current, arguments.baseline, &options, &policy)?;
 
     if let Some(path) = arguments.json_output {
@@ -179,12 +189,12 @@ fn reject_conflicting_outputs(
     json_output: Option<&Path>,
     markdown_output: Option<&Path>,
 ) -> Result<(), CliError> {
-    if let (Some(json), Some(markdown)) = (json_output, markdown_output) {
-        if json == markdown {
-            return Err(CliError::ConflictingOutputs {
-                path: json.to_path_buf(),
-            });
-        }
+    if let (Some(json), Some(markdown)) = (json_output, markdown_output)
+        && json == markdown
+    {
+        return Err(CliError::ConflictingOutputs {
+            path: json.to_path_buf(),
+        });
     }
     Ok(())
 }

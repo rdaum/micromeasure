@@ -251,6 +251,27 @@ pub fn compare_report_inputs(
         }
     }
 
+    let added_suite_names: Vec<_> = current
+        .documents
+        .keys()
+        .filter(|suite| !baseline.documents.contains_key(*suite))
+        .cloned()
+        .collect();
+    let removed_suite_names: Vec<_> = baseline
+        .documents
+        .keys()
+        .filter(|suite| !current.documents.contains_key(*suite))
+        .cloned()
+        .collect();
+    if options.require_same_suite_set
+        && (!added_suite_names.is_empty() || !removed_suite_names.is_empty())
+    {
+        return Err(SuiteComparisonError::SuiteSetMismatch {
+            added: added_suite_names,
+            removed: removed_suite_names,
+        });
+    }
+
     let mut comparisons = Vec::new();
     let mut added_suites = Vec::new();
     let mut removed_suites = Vec::new();
@@ -455,8 +476,8 @@ fn summarize(
 
 fn suite_gate_description(analysis: &SuiteComparisonAnalysis) -> String {
     if analysis.summary.blocking > 0 {
-        format!("FAIL ({} blocking regressions)", analysis.summary.blocking)
-    } else if analysis.policy.fail_on_regression {
+        format!("FAIL ({} blocking cases)", analysis.summary.blocking)
+    } else if analysis.policy.fail_on_regression || analysis.policy.fail_on_invalid {
         "PASS (gating enabled)".to_string()
     } else {
         "PASS (advisory only)".to_string()
@@ -464,10 +485,11 @@ fn suite_gate_description(analysis: &SuiteComparisonAnalysis) -> String {
 }
 
 fn suite_policy_description(policy: &RegressionPolicy) -> String {
-    let mode = if policy.fail_on_regression {
-        "gating"
-    } else {
-        "advisory"
+    let mode = match (policy.fail_on_regression, policy.fail_on_invalid) {
+        (true, true) => "regression and invalid-result gating",
+        (true, false) => "regression gating",
+        (false, true) => "invalid-result gating",
+        (false, false) => "advisory",
     };
     let cv = policy
         .maximum_cv_percent
@@ -586,6 +608,10 @@ pub enum SuiteComparisonError {
         current: ReportDocumentType,
         baseline: ReportDocumentType,
     },
+    SuiteSetMismatch {
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
     Comparison {
         suite: Option<String>,
         source: Box<ComparisonError>,
@@ -639,6 +665,10 @@ impl fmt::Display for SuiteComparisonError {
                 formatter,
                 "suite {suite:?} changes document type from {baseline:?} to {current:?}"
             ),
+            Self::SuiteSetMismatch { added, removed } => write!(
+                formatter,
+                "suite sets differ: current-only suites {added:?}, baseline-only suites {removed:?}"
+            ),
             Self::Comparison { suite, source } => {
                 if let Some(suite) = suite {
                     write!(formatter, "failed to compare suite {suite:?}: {source}")
@@ -669,7 +699,8 @@ impl Error for SuiteComparisonError {
             Self::UnsupportedInput { .. }
             | Self::NoReports { .. }
             | Self::DuplicateSuite { .. }
-            | Self::DocumentTypeMismatch { .. } => None,
+            | Self::DocumentTypeMismatch { .. }
+            | Self::SuiteSetMismatch { .. } => None,
         }
     }
 }

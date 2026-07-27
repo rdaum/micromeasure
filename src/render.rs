@@ -310,10 +310,14 @@ fn policy_case<'a>(
 }
 
 fn policy_description(policy: &PolicyEvaluation) -> String {
-    let mode = if policy.policy.fail_on_regression {
-        "gating"
-    } else {
-        "advisory"
+    let mode = match (
+        policy.policy.fail_on_regression,
+        policy.policy.fail_on_invalid,
+    ) {
+        (true, true) => "regression and invalid-result gating",
+        (true, false) => "regression gating",
+        (false, true) => "invalid-result gating",
+        (false, false) => "advisory",
     };
     let cv = policy
         .policy
@@ -333,8 +337,8 @@ fn policy_description(policy: &PolicyEvaluation) -> String {
 
 fn gate_description(policy: &PolicyEvaluation) -> String {
     if policy.gate_failed {
-        format!("FAIL ({} blocking regressions)", policy.summary.blocking)
-    } else if policy.policy.fail_on_regression {
+        format!("FAIL ({} blocking cases)", policy.summary.blocking)
+    } else if policy.policy.fail_on_regression || policy.policy.fail_on_invalid {
         "PASS (gating enabled)".to_string()
     } else {
         "PASS (advisory only)".to_string()

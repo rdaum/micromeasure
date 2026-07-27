@@ -40,7 +40,10 @@ pub struct RegressionPolicy {
     pub minimum_change_percent: f64,
     pub maximum_cv_percent: Option<f64>,
     pub maximum_outlier_fraction: Option<f64>,
+    #[serde(default)]
     pub fail_on_regression: bool,
+    #[serde(default)]
+    pub fail_on_invalid: bool,
 }
 
 impl Default for RegressionPolicy {
@@ -56,6 +59,7 @@ impl RegressionPolicy {
             maximum_cv_percent: Some(DEFAULT_MAXIMUM_CV_PERCENT),
             maximum_outlier_fraction: Some(DEFAULT_MAXIMUM_OUTLIER_FRACTION),
             fail_on_regression: false,
+            fail_on_invalid: false,
         }
     }
 
@@ -86,18 +90,22 @@ impl RegressionPolicy {
         self
     }
 
+    pub fn fail_on_invalid(mut self, fail: bool) -> Self {
+        self.fail_on_invalid = fail;
+        self
+    }
+
     pub fn validate(&self) -> Result<(), PolicyError> {
         validate_nonnegative_finite("minimum_change_percent", self.minimum_change_percent)?;
         if let Some(maximum) = self.maximum_cv_percent {
             validate_nonnegative_finite("maximum_cv_percent", maximum)?;
         }
-        if let Some(maximum) = self.maximum_outlier_fraction {
-            if !maximum.is_finite() || !(0.0..=1.0).contains(&maximum) {
-                return Err(PolicyError::InvalidConfiguration {
-                    reason: "maximum_outlier_fraction must be finite and between 0 and 1"
-                        .to_string(),
-                });
-            }
+        if let Some(maximum) = self.maximum_outlier_fraction
+            && (!maximum.is_finite() || !(0.0..=1.0).contains(&maximum))
+        {
+            return Err(PolicyError::InvalidConfiguration {
+                reason: "maximum_outlier_fraction must be finite and between 0 and 1".to_string(),
+            });
         }
         Ok(())
     }
@@ -128,8 +136,9 @@ impl RegressionPolicy {
                     matched.percent_improvement,
                     self.minimum_change_percent,
                 );
-                let blocking =
-                    self.fail_on_regression && classification == ChangeClassification::Regression;
+                let blocking = (self.fail_on_regression
+                    && classification == ChangeClassification::Regression)
+                    || (self.fail_on_invalid && classification == ChangeClassification::Invalid);
 
                 PolicyCaseEvaluation {
                     identity: matched.identity.clone(),
@@ -227,25 +236,25 @@ fn stability_findings(
                 .unwrap_or_else(|| "no reason supplied".to_string()),
         });
     }
-    if let (Some(maximum), Some(actual)) = (maximum_cv_percent, snapshot.statistics.cv_percent) {
-        if actual > maximum {
-            findings.push(PolicyFinding::HighCoefficientOfVariation {
-                side,
-                actual_percent: actual,
-                maximum_percent: maximum,
-            });
-        }
+    if let (Some(maximum), Some(actual)) = (maximum_cv_percent, snapshot.statistics.cv_percent)
+        && actual > maximum
+    {
+        findings.push(PolicyFinding::HighCoefficientOfVariation {
+            side,
+            actual_percent: actual,
+            maximum_percent: maximum,
+        });
     }
-    if let Some(maximum) = maximum_outlier_fraction {
-        if snapshot.statistics.samples > 0 {
-            let actual = snapshot.statistics.outliers as f64 / snapshot.statistics.samples as f64;
-            if actual > maximum {
-                findings.push(PolicyFinding::ExcessiveOutlierFraction {
-                    side,
-                    actual,
-                    maximum,
-                });
-            }
+    if let Some(maximum) = maximum_outlier_fraction
+        && snapshot.statistics.samples > 0
+    {
+        let actual = snapshot.statistics.outliers as f64 / snapshot.statistics.samples as f64;
+        if actual > maximum {
+            findings.push(PolicyFinding::ExcessiveOutlierFraction {
+                side,
+                actual,
+                maximum,
+            });
         }
     }
     findings
@@ -553,6 +562,21 @@ mod tests {
             ChangeClassification::Invalid
         );
         assert!(!evaluation.gate_failed);
+
+        let invalid_gate = RegressionPolicy::advisory()
+            .fail_on_invalid(true)
+            .evaluate(&comparison(
+                {
+                    let mut invalid = snapshot(MeasurementDirection::Higher, None, None, 0, 0);
+                    invalid.validity = Validity::invalid("checksum mismatch");
+                    invalid
+                },
+                snapshot(MeasurementDirection::Higher, Some(100.0), None, 0, 1),
+                None,
+            ))
+            .unwrap();
+        assert!(invalid_gate.gate_failed);
+        assert!(invalid_gate.cases[0].blocking);
 
         let informational = RegressionPolicy::gating()
             .evaluate(&comparison(

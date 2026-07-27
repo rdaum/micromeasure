@@ -227,13 +227,18 @@ for the producer schema and validity rules.
 - native throughput/latency projections and matching custom metrics when
   present.
 
+Comparison-ready native reports must contain at least one result. An empty
+native report remains readable JSON but fails comparison validation with
+`ComparisonError::EmptyResultSet`.
+
 Suite, effective runner identity, and the complete comparison-environment maps
 must match. `ComparisonOptions::with_environment_override(reason)` can permit
 an intentional mismatch. The resulting `ComparisonReport.environment` records
 the reason, both runner IDs, both original environment maps, and whether the
-inputs were an exact match. An empty override reason is rejected. A zero or
-non-finite baseline value is retained as evidence but produces no percentage
-improvement.
+inputs were an exact match. An empty override reason is rejected. Percentage
+improvement divides by the absolute baseline magnitude, so negative directional
+measurements retain the correct sign. A zero or non-finite baseline value is
+retained as evidence but produces no percentage improvement.
 
 Apply a configurable advisory or gating decision and render the same evidence
 as terminal text, Markdown, or versioned JSON with `RegressionPolicy` and

@@ -36,6 +36,7 @@ pub enum ValidityStatus {
 
 /// Correctness status for a report or individual result.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Validity {
     pub status: ValidityStatus,
@@ -76,6 +77,7 @@ impl Validity {
 
 /// Raw observations for one externally orchestrated measurement.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SeriesResult {
     pub group: String,
@@ -153,6 +155,7 @@ impl SeriesResult {
 
 /// A portable external report containing chronological raw samples.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SeriesReport {
     pub document_type: String,
@@ -302,6 +305,27 @@ mod tests {
     #[test]
     fn valid_series_passes_semantic_validation() {
         valid_report().validate().unwrap();
+    }
+
+    #[test]
+    fn interchange_types_reject_unknown_fields() {
+        let report = serde_json::to_value(valid_report()).unwrap();
+
+        let mut unknown_report = report.clone();
+        unknown_report["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<SeriesReport>(unknown_report).is_err());
+
+        let mut unknown_result = report.clone();
+        unknown_result["results"][0]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<SeriesReport>(unknown_result).is_err());
+
+        let mut unknown_validity = report.clone();
+        unknown_validity["results"][0]["validity"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<SeriesReport>(unknown_validity).is_err());
+
+        let mut unknown_context = report;
+        unknown_context["context"]["enviroment"] = serde_json::json!({});
+        assert!(serde_json::from_value::<SeriesReport>(unknown_context).is_err());
     }
 
     #[test]

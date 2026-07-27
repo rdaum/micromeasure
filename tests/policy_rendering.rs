@@ -78,7 +78,7 @@ fn renderers_expose_the_same_gating_decision() {
     assert_eq!(analysis.exit_status().code(), 1);
 
     let terminal = analysis.render_terminal();
-    assert!(terminal.contains("gate: FAIL (1 blocking regressions)"));
+    assert!(terminal.contains("gate: FAIL (1 blocking cases)"));
     assert!(terminal.contains("REGRESSION"));
 
     assert_eq!(

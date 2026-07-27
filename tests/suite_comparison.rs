@@ -71,15 +71,11 @@ fn series(suite: &str, timestamp: &str, samples: Vec<f64>) -> SeriesReport {
 }
 
 fn native(suite: &str, timestamp: &str) -> BenchmarkReport {
-    BenchmarkReport {
-        schema_version: REPORT_SCHEMA_VERSION,
-        timestamp: timestamp.to_string(),
-        hostname: "fixture-runner".to_string(),
-        suite: Some(suite.to_string()),
-        git_commit: None,
-        context: context(),
-        results: Vec::new(),
-    }
+    let mut report: BenchmarkReport =
+        serde_json::from_str(include_str!("fixtures/native-report.json")).unwrap();
+    report.timestamp = timestamp.to_string();
+    report.suite = Some(suite.to_string());
+    report
 }
 
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) {
@@ -131,7 +127,7 @@ fn directory_comparison_combines_mixed_types_and_unmatched_suites() {
     assert_eq!(analysis.summary.matched_suites, 2);
     assert_eq!(analysis.summary.added_suites, 1);
     assert_eq!(analysis.summary.removed_suites, 1);
-    assert_eq!(analysis.summary.matched_cases, 1);
+    assert_eq!(analysis.summary.matched_cases, 2);
     assert_eq!(analysis.summary.improvements, 1);
     assert_eq!(analysis.summary.blocking, 0);
     assert_eq!(
@@ -229,5 +225,65 @@ fn one_suite_cannot_change_document_type() {
             &RegressionPolicy::default(),
         ),
         Err(SuiteComparisonError::DocumentTypeMismatch { .. })
+    ));
+}
+
+#[test]
+fn comparison_validation_rejects_empty_native_reports() {
+    let root = TemporaryDirectory::new("empty-native");
+    let report = BenchmarkReport {
+        schema_version: REPORT_SCHEMA_VERSION,
+        timestamp: "now".to_string(),
+        hostname: "fixture-runner".to_string(),
+        suite: Some("empty".to_string()),
+        git_commit: None,
+        context: context(),
+        results: Vec::new(),
+    };
+    let path = root.path().join("empty.json");
+    write_json(&path, &report);
+
+    assert!(matches!(
+        validate_report_input(path),
+        Err(SuiteComparisonError::InvalidDocument { source, .. })
+            if matches!(*source, ComparisonError::EmptyResultSet { .. })
+    ));
+}
+
+#[test]
+fn strict_suite_sets_reject_added_and_removed_suites() {
+    let root = TemporaryDirectory::new("strict-suites");
+    let current = root.path().join("current");
+    let baseline = root.path().join("baseline");
+    fs::create_dir(&current).unwrap();
+    fs::create_dir(&baseline).unwrap();
+    write_json(
+        current.join("shared.json"),
+        &series("shared", "current", vec![1.0]),
+    );
+    write_json(
+        baseline.join("shared.json"),
+        &series("shared", "baseline", vec![1.0]),
+    );
+    write_json(
+        current.join("added.json"),
+        &series("added", "current", vec![1.0]),
+    );
+    write_json(
+        baseline.join("removed.json"),
+        &series("removed", "baseline", vec![1.0]),
+    );
+
+    let error = compare_report_inputs(
+        current,
+        baseline,
+        &ComparisonOptions::default().require_same_suite_set(true),
+        &RegressionPolicy::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SuiteComparisonError::SuiteSetMismatch { added, removed }
+            if added == vec!["added"] && removed == vec!["removed"]
     ));
 }

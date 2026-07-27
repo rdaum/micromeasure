@@ -31,7 +31,7 @@ use std::{
 /// JSON schema emitted for structured comparison reports.
 pub const COMPARISON_SCHEMA_VERSION: u32 = 1;
 
-/// Options controlling native report comparison.
+/// Options controlling report and report-set comparison.
 ///
 /// The default remains conservative: reports must contain exactly the same
 /// result set. CI callers which intentionally selected a baseline may opt into
@@ -40,12 +40,21 @@ pub const COMPARISON_SCHEMA_VERSION: u32 = 1;
 #[non_exhaustive]
 pub struct ComparisonOptions {
     pub allow_partial_result_set: bool,
+    /// Require directory inputs to contain exactly the same suite names.
+    ///
+    /// This option is interpreted by [`crate::compare_report_inputs`].
+    pub require_same_suite_set: bool,
     pub environment_override: Option<EnvironmentOverride>,
 }
 
 impl ComparisonOptions {
     pub fn allow_partial_result_set(mut self, allow: bool) -> Self {
         self.allow_partial_result_set = allow;
+        self
+    }
+
+    pub fn require_same_suite_set(mut self, require: bool) -> Self {
+        self.require_same_suite_set = require;
         self
     }
 
@@ -442,6 +451,7 @@ impl ReportDocument {
         let normalized = normalize_document(self, ComparisonSide::Current)?;
         validate_report_validity(&normalized.validity, ComparisonSide::Current)?;
         validate_runner(&normalized.runner_id, ComparisonSide::Current)?;
+        validate_nonempty_result_set(&normalized.cases, ComparisonSide::Current)?;
         reject_duplicate_identities(&normalized.cases, ComparisonSide::Current)
     }
 }
@@ -591,6 +601,9 @@ pub enum ComparisonError {
         side: ComparisonSide,
         identity: ComparisonCaseIdentity,
     },
+    EmptyResultSet {
+        side: ComparisonSide,
+    },
     InvalidReport {
         side: ComparisonSide,
         reason: String,
@@ -641,6 +654,9 @@ impl fmt::Display for ComparisonError {
                 identity.group(),
                 identity.name()
             ),
+            Self::EmptyResultSet { side } => {
+                write!(formatter, "{side} report contains no benchmark results")
+            }
             Self::InvalidReport { side, reason } => {
                 write!(formatter, "{side} report is invalid: {reason}")
             }
@@ -760,6 +776,8 @@ fn compare_normalized_reports(
 ) -> Result<ComparisonReport, ComparisonError> {
     validate_report_validity(&current.validity, ComparisonSide::Current)?;
     validate_report_validity(&baseline.validity, ComparisonSide::Baseline)?;
+    validate_nonempty_result_set(&current.cases, ComparisonSide::Current)?;
+    validate_nonempty_result_set(&baseline.cases, ComparisonSide::Baseline)?;
 
     if current.suite != baseline.suite {
         return Err(ComparisonError::SuiteMismatch {
@@ -873,6 +891,17 @@ fn validate_report_validity(
         });
     }
     Ok(())
+}
+
+fn validate_nonempty_result_set(
+    cases: &[NormalizedCase],
+    side: ComparisonSide,
+) -> Result<(), ComparisonError> {
+    if cases.is_empty() {
+        Err(ComparisonError::EmptyResultSet { side })
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_runner(hostname: &str, side: ComparisonSide) -> Result<(), ComparisonError> {
@@ -1424,8 +1453,8 @@ fn improvement_percent(
         return None;
     }
     let ratio = match direction {
-        MeasurementDirection::Higher => (current - baseline) / baseline,
-        MeasurementDirection::Lower => (baseline - current) / baseline,
+        MeasurementDirection::Higher => (current - baseline) / baseline.abs(),
+        MeasurementDirection::Lower => (baseline - current) / baseline.abs(),
         MeasurementDirection::Informational => return None,
     };
     finite(ratio * 100.0)
@@ -1727,6 +1756,27 @@ mod tests {
                 MeasurementDirection::Informational
             ),
             None
+        );
+        assert_eq!(
+            improvement_percent(Some(-5.0), Some(-10.0), MeasurementDirection::Higher),
+            Some(50.0)
+        );
+        assert_eq!(
+            improvement_percent(Some(-5.0), Some(-10.0), MeasurementDirection::Lower),
+            Some(-50.0)
+        );
+    }
+
+    #[test]
+    fn empty_native_reports_are_not_comparison_ready() {
+        let error = report(&[])
+            .compare(&report(&[("case", 1.0)]), &ComparisonOptions::default())
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ComparisonError::EmptyResultSet {
+                side: ComparisonSide::Current
+            }
         );
     }
 

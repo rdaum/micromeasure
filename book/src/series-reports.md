@@ -94,6 +94,10 @@ numbers; a valid result must contain at least one. Micromeasure derives the
 median, p95, median absolute deviation, coefficient of variation, and Tukey
 outlier count from those samples while preserving their original order.
 
+`SeriesReport`, `SeriesResult`, `Validity`, and `ReportContext` reject unknown
+fields. This is intentional for a versioned interchange format: a misspelled
+constraint such as `enviroment` is an input error, not an ignored key.
+
 ## Identity and provenance
 
 An external result's identity is:

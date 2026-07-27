@@ -29,6 +29,7 @@ use std::{
 /// in compatibility. Callers must not place credentials or secrets in any
 /// context value because the complete context is persisted in report artifacts.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ReportContext {
     #[serde(default)]
@@ -210,6 +211,24 @@ mod tests {
         assert_eq!(context.runner_id, "gpu-host-05");
         assert_eq!(context.environment["gpu"], "GB300");
         assert_eq!(context.provenance["commit"], "0123456789abcdef");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explicit_context_rejects_unknown_fields() {
+        let path = temporary_path("unknown-field");
+        fs::write(
+            &path,
+            r#"{
+                "runner_id": "gpu-host-05",
+                "enviroment": {"gpu": "GB300"}
+            }"#,
+        )
+        .unwrap();
+
+        let error = ReportContext::load_from_path(&path).unwrap_err();
+        assert!(error.to_string().contains("unknown field `enviroment`"));
 
         fs::remove_file(path).unwrap();
     }

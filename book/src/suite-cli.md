@@ -5,9 +5,11 @@ report artifacts without adding command-line dependencies to library users.
 Its binary name is `micromeasure`:
 
 ```sh
-cargo install --path micromeasure-cli
+cargo install micromeasure-cli
 micromeasure --help
 ```
+
+From a source checkout, use `cargo install --path micromeasure-cli`.
 
 The tool is provider-neutral. It does not inspect CI-provider environment
 variables, and it does not download baselines, upload artifacts, publish
@@ -81,9 +83,11 @@ document type across current and baseline. Implicitly composing several report
 shards into one suite is not supported.
 
 Matched suites allow added and removed cases by default. Use
-`--strict-result-set` to reject a case-set change. Runner identity and the
-complete comparison environment must still match exactly. An intentional
-exception must carry a visible reason:
+`--strict-result-set` to reject a case-set change. Directory comparisons also
+retain current-only and baseline-only suites by default; use
+`--strict-suite-set` to reject either. Runner identity and the complete
+comparison environment must still match exactly. An intentional exception
+must carry a visible reason:
 
 ```sh
 micromeasure compare \
@@ -94,16 +98,17 @@ micromeasure compare \
 
 ## Policy options
 
-Comparison is advisory unless `--fail-on-regression` is supplied. The initial
-defaults match `RegressionPolicy::advisory()`:
+Comparison is advisory unless `--fail-on-regression`, `--fail-on-invalid`, or
+both are supplied. The initial defaults match `RegressionPolicy::advisory()`:
 
 - `--minimum-change 5`
 - `--maximum-cv 10`
 - `--maximum-outlier-fraction 0.10`
 
 With `--fail-on-regression`, a material regression becomes blocking. Stability
-findings remain visible but do not become regressions or independently fail
-the gate.
+findings remain visible but do not become regressions or independently fail the
+gate. With `--fail-on-invalid`, a matched current or baseline result carrying
+invalid correctness evidence becomes blocking.
 
 ## Process status
 
@@ -111,8 +116,8 @@ The executable implements the stable comparison status contract:
 
 | Code | Meaning |
 |---:|---|
-| `0` | validation/comparison completed and no enabled regression gate failed |
-| `1` | comparison completed and an enabled regression gate failed |
+| `0` | validation/comparison completed and no enabled policy gate failed |
+| `1` | comparison completed and an enabled policy gate failed |
 | `2` | invocation, input, schema, validation, compatibility, policy, serialization, or output error |
 
 Status `1` still produces terminal, Markdown, and JSON results. It represents a

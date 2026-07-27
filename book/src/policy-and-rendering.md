@@ -64,6 +64,7 @@ RegressionPolicy {
     maximum_cv_percent: Some(10.0),
     maximum_outlier_fraction: Some(0.10),
     fail_on_regression: false,
+    fail_on_invalid: false,
 }
 ```
 
@@ -71,6 +72,11 @@ It classifies changes and reports stability findings without failing a
 regression gate. `RegressionPolicy::gating()` uses the same thresholds and
 enables `fail_on_regression`. A material regression is then marked `blocking`;
 one or more blocking cases fail the gate.
+
+Correctness gating is independent. Set `fail_on_invalid(true)` to make any
+matched case classified as `invalid` blocking, whether the invalid status came
+from the current or baseline result. It can be combined with regression gating
+or enabled by itself.
 
 The CV and outlier settings produce findings for the current and baseline
 evidence independently. They do not turn a case into a regression and do not
@@ -88,8 +94,8 @@ fraction must be in range.
 
 | Code | Variant | Meaning |
 |---:|---|---|
-| `0` | `Success` | comparison completed and no enabled regression gate failed |
-| `1` | `RegressionGateFailed` | a configured regression gate found at least one blocking regression |
+| `0` | `Success` | comparison completed and no enabled policy gate failed |
+| `1` | `RegressionGateFailed` | a configured policy gate found at least one blocking case |
 | `2` | `Error` | invocation, report loading, schema validation, compatibility, policy, rendering, or other operational failure |
 
 `analysis.exit_status().code()` returns `0` or `1`. A frontend maps errors

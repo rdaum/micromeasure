@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "timestamp": "fixture",
+  "hostname": "fixture-runner",
+  "suite": "fixture-suite",
+  "git_commit": null,
+  "context": {
+    "runner_id": "fixture-runner",
+    "environment": {
+      "hardware": "test-node"
+    },
+    "provenance": {}
+  },
+  "results": [
+    {
+      "name": "fixture",
+      "group": "native",
+      "kind": "standard",
+      "execution_index": 0,
+      "throughput": {
+        "amount_per_operation": 1,
+        "unit": "ops"
+      },
+      "throughput_per_sec": 100,
+      "median_throughput_per_sec": 100,
+      "ns_per_op": 10000000,
+      "median_ns_per_op": 10000000,
+      "p95_ns_per_op": 10000000,
+      "mad_ns_per_op": 0,
+      "cycles_per_op": 0,
+      "instructions_per_op": 0,
+      "ipc": 0,
+      "cache_references_per_op": 0,
+      "l1i_misses_per_op": 0,
+      "branches_per_op": 0,
+      "branch_miss_rate": 0,
+      "branch_misses_per_op": 0,
+      "cache_misses_per_op": 0,
+      "cache_miss_percent": 0,
+      "frontend_stall_cycles_per_op": 0,
+      "frontend_stall_percent": 0,
+      "backend_stall_cycles_per_op": 0,
+      "backend_stall_percent": 0,
+      "cv_percent": 0,
+      "outlier_count": 0,
+      "samples": 1,
+      "operations": 1,
+      "total_duration_sec": 0.01,
+      "sample_throughput_per_sec": [
+        100
+      ],
+      "sample_latency_ns_per_op": [
+        10000000
+      ]
+    }
+  ]
+}

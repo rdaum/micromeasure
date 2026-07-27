@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use micromeasure::{
-    BenchmarkReport, MeasurementDirection, MeasurementKind, REPORT_SCHEMA_VERSION, ReportContext,
-    SeriesReport, SeriesResult, SuiteComparisonAnalysis,
+    BenchmarkReport, MeasurementDirection, MeasurementKind, ReportContext, SeriesReport,
+    SeriesResult, SuiteComparisonAnalysis, Validity,
 };
 use serde::Serialize;
 use std::{
@@ -71,15 +71,11 @@ fn series(suite: &str, timestamp: &str, samples: Vec<f64>) -> SeriesReport {
 }
 
 fn native(suite: &str, timestamp: &str) -> BenchmarkReport {
-    BenchmarkReport {
-        schema_version: REPORT_SCHEMA_VERSION,
-        timestamp: timestamp.to_string(),
-        hostname: "fixture-runner".to_string(),
-        suite: Some(suite.to_string()),
-        git_commit: None,
-        context: context(),
-        results: Vec::new(),
-    }
+    let mut report: BenchmarkReport =
+        serde_json::from_str(include_str!("../../tests/fixtures/native-report.json")).unwrap();
+    report.timestamp = timestamp.to_string();
+    report.suite = Some(suite.to_string());
+    report
 }
 
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) {
@@ -305,5 +301,87 @@ fn strict_result_sets_reject_case_additions() {
         String::from_utf8(strict_output.stderr)
             .unwrap()
             .contains("result sets differ")
+    );
+}
+
+#[test]
+fn invalid_results_have_an_independent_gate() {
+    let root = TemporaryDirectory::new("invalid-gate");
+    let current = root.path().join("current.json");
+    let baseline = root.path().join("baseline.json");
+    let invalid = SeriesResult::new(
+        "scenario",
+        "latency",
+        MeasurementKind::Latency,
+        "ms",
+        MeasurementDirection::Lower,
+        Vec::new(),
+    )
+    .with_validity(Validity::invalid("checksum mismatch"));
+    write_json(
+        &current,
+        &SeriesReport::new("current", "suite", context(), vec![invalid]),
+    );
+    write_json(&baseline, &series("suite", "baseline", vec![1.0]));
+
+    let advisory = command(&[
+        "compare",
+        "--current",
+        current.to_str().unwrap(),
+        "--baseline",
+        baseline.to_str().unwrap(),
+        "--fail-on-regression",
+    ]);
+    assert_eq!(advisory.status.code(), Some(0));
+
+    let gating = command(&[
+        "compare",
+        "--current",
+        current.to_str().unwrap(),
+        "--baseline",
+        baseline.to_str().unwrap(),
+        "--fail-on-invalid",
+    ]);
+    assert_eq!(gating.status.code(), Some(1));
+    assert!(
+        String::from_utf8(gating.stdout)
+            .unwrap()
+            .contains("1 invalid")
+    );
+}
+
+#[test]
+fn strict_suite_sets_reject_missing_suites() {
+    let root = TemporaryDirectory::new("strict-suites");
+    let current = root.path().join("current");
+    let baseline = root.path().join("baseline");
+    fs::create_dir(&current).unwrap();
+    fs::create_dir(&baseline).unwrap();
+    write_json(
+        current.join("shared.json"),
+        &series("shared", "current", vec![1.0]),
+    );
+    write_json(
+        baseline.join("shared.json"),
+        &series("shared", "baseline", vec![1.0]),
+    );
+    write_json(
+        current.join("added.json"),
+        &series("added", "current", vec![1.0]),
+    );
+
+    let output = command(&[
+        "compare",
+        "--current",
+        current.to_str().unwrap(),
+        "--baseline",
+        baseline.to_str().unwrap(),
+        "--strict-suite-set",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("suite sets differ")
     );
 }

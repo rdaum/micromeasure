@@ -3,8 +3,8 @@
 - Current: `series` `sha256:5f80133053bc64ee320ede633a2c4ae496c54bfb3050cc10c4dea96c60aad043`
 - Baseline: `series` `sha256:ec6b9da91b45400c5db49ba129ee3263831255756432f53c9f77e57ac9181217`
 - Environment: exact match on runner runner-a
-- Policy: gating; material change &gt; 5.00%; max CV 2.00%; max outliers disabled
-- Gate: **FAIL (1 blocking regressions)**
+- Policy: regression gating; material change &gt; 5.00%; max CV 2.00%; max outliers disabled
+- Gate: **FAIL (1 blocking cases)**
 
 | Outcome | Count |
 |---|---:|

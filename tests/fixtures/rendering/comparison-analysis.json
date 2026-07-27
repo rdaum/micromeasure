@@ -127,7 +127,8 @@
       "minimum_change_percent": 5.0,
       "maximum_cv_percent": 2.0,
       "maximum_outlier_fraction": null,
-      "fail_on_regression": true
+      "fail_on_regression": true,
+      "fail_on_invalid": false
     },
     "cases": [
       {

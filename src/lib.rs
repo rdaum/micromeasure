@@ -20,6 +20,7 @@
 //! - Explicit report rendering and JSON persistence
 //! - Structured, serializable comparison of persisted reports
 //! - Portable raw-sample reports for external orchestrators
+//! - Advisory or gating policy with terminal, Markdown, and JSON rendering
 //! - Warm-up and calibration phases
 //! - Progress indicators
 //! - Generic table formatting
@@ -28,6 +29,8 @@ pub mod bench;
 mod comparison;
 mod context;
 mod launcher;
+mod policy;
+mod render;
 mod series;
 mod session;
 pub mod table;
@@ -64,6 +67,12 @@ pub use launcher::{
     OUTPUT_PATH_ENVIRONMENT, benchmark_filter_from_args, benchmark_filter_from_env,
     benchmark_options_with_default_suite, run_benchmark_main,
 };
+pub use policy::{
+    ChangeClassification, ComparisonExitStatus, DEFAULT_MAXIMUM_CV_PERCENT,
+    DEFAULT_MAXIMUM_OUTLIER_FRACTION, DEFAULT_MINIMUM_CHANGE_PERCENT, PolicyCaseEvaluation,
+    PolicyError, PolicyEvaluation, PolicyFinding, PolicySummary, RegressionPolicy,
+};
+pub use render::{ANALYSIS_SCHEMA_VERSION, ComparisonAnalysis, render_markdown, render_terminal};
 pub use series::{
     SERIES_DOCUMENT_TYPE, SERIES_SCHEMA_VERSION, SeriesReport, SeriesResult, SeriesValidationError,
     Validity, ValidityStatus,

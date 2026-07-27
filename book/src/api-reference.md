@@ -154,6 +154,13 @@ Register with `g.diagnostic_pass(f)` and `g.diagnostic_samples(n)` on a `Benchma
 | `MeasurementKind` / `MeasurementDirection` | Machine-readable primary measurement semantics and higher/lower/informational direction. | `src/comparison.rs` |
 | `ReportError` / `ComparisonError` | Structured loading, document/schema, semantic validity, suite, runner/environment, override, duplicate-identity, and result-set errors. | `src/comparison.rs` |
 | `COMPARISON_SCHEMA_VERSION` | JSON schema emitted for `ComparisonReport`. | `src/comparison.rs` |
+| `RegressionPolicy` | Serializable advisory or gating policy with material-change, CV, and outlier thresholds. `advisory()` is the default; `gating()` blocks material regressions. | `src/policy.rs` |
+| `ChangeClassification` / `PolicyFinding` | Direction-aware case outcome and independent invalidity/stability observations. | `src/policy.rs` |
+| `PolicyCaseEvaluation` / `PolicySummary` / `PolicyEvaluation` | Per-case and aggregate policy decisions kept separate from comparison evidence. | `src/policy.rs` |
+| `ComparisonAnalysis` | Versioned bundle of a `ComparisonReport` and its reproducible policy evaluation. Construct with `comparison.analyze(&policy)`. | `src/render.rs` |
+| `render_terminal` / `render_markdown` | Side-effect-free rendering for job logs and CI annotations; methods of the same names are also available on `ComparisonAnalysis`. | `src/render.rs` |
+| `ComparisonExitStatus` | Stable frontend status contract: success `0`, regression gate failure `1`, operational error `2`. | `src/policy.rs` |
+| `ANALYSIS_SCHEMA_VERSION` | JSON schema emitted for `ComparisonAnalysis`. | `src/render.rs` |
 | `WorkerSummary` | Per-role summary for concurrent benchmarks: `name`, `threads`, `stats`, `counters`. | `src/session.rs` |
 | `WorkerCounterSummary` | Aggregated event counter: `name`, `total`, `per_op`, `per_sec`. | `src/session.rs` |
 

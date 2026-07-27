@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "comparison": {
+    "schema_version": 1,
+    "current": {
+      "document_type": "series",
+      "schema_version": 1,
+      "suite": "render-suite",
+      "content_digest": "sha256:5f80133053bc64ee320ede633a2c4ae496c54bfb3050cc10c4dea96c60aad043",
+      "capture_time": "2026-07-27T14:00:00Z",
+      "source_provenance": {
+        "commit": "current"
+      }
+    },
+    "baseline": {
+      "document_type": "series",
+      "schema_version": 1,
+      "suite": "render-suite",
+      "content_digest": "sha256:ec6b9da91b45400c5db49ba129ee3263831255756432f53c9f77e57ac9181217",
+      "capture_time": "2026-07-26T14:00:00Z",
+      "source_provenance": {
+        "commit": "baseline"
+      }
+    },
+    "suite": "render-suite",
+    "environment": {
+      "current_runner_id": "runner-a",
+      "baseline_runner_id": "runner-a",
+      "current_environment": {
+        "hardware": "test-host"
+      },
+      "baseline_environment": {
+        "hardware": "test-host"
+      },
+      "exact_match": true
+    },
+    "matched": [
+      {
+        "identity": {
+          "group": "request|path",
+          "name": "latency\np50",
+          "measurement": "latency",
+          "unit": "ms",
+          "direction": "lower",
+          "dimensions": {}
+        },
+        "current": {
+          "primary": {
+            "measurement": "latency",
+            "unit": "ms",
+            "direction": "lower",
+            "samples": [
+              110.0,
+              115.0,
+              120.0
+            ],
+            "value": 115.0
+          },
+          "statistics": {
+            "cv_percent": 3.5499851344683746,
+            "mad": 5.0,
+            "p95": 119.5,
+            "samples": 3,
+            "outliers": 0
+          },
+          "native": {
+            "mean_throughput_per_sec": null,
+            "median_throughput_per_sec": null,
+            "median_ns_per_op": null,
+            "p95_ns_per_op": null,
+            "mad_ns_per_op": null
+          },
+          "validity": {
+            "status": "valid"
+          },
+          "provenance": {
+            "image": "sha256:current"
+          }
+        },
+        "baseline": {
+          "primary": {
+            "measurement": "latency",
+            "unit": "ms",
+            "direction": "lower",
+            "samples": [
+              100.0,
+              100.0,
+              100.0
+            ],
+            "value": 100.0
+          },
+          "statistics": {
+            "cv_percent": 0.0,
+            "mad": 0.0,
+            "p95": 100.0,
+            "samples": 3,
+            "outliers": 0
+          },
+          "native": {
+            "mean_throughput_per_sec": null,
+            "median_throughput_per_sec": null,
+            "median_ns_per_op": null,
+            "p95_ns_per_op": null,
+            "mad_ns_per_op": null
+          },
+          "validity": {
+            "status": "valid"
+          },
+          "provenance": {
+            "image": "sha256:baseline"
+          }
+        },
+        "absolute_change": 15.0,
+        "percent_improvement": -15.0
+      }
+    ],
+    "added": [],
+    "removed": [],
+    "summary": {
+      "matched": 1,
+      "added": 0,
+      "removed": 0
+    }
+  },
+  "policy": {
+    "policy": {
+      "minimum_change_percent": 5.0,
+      "maximum_cv_percent": 2.0,
+      "maximum_outlier_fraction": null,
+      "fail_on_regression": true
+    },
+    "cases": [
+      {
+        "identity": {
+          "group": "request|path",
+          "name": "latency\np50",
+          "measurement": "latency",
+          "unit": "ms",
+          "direction": "lower",
+          "dimensions": {}
+        },
+        "classification": "regression",
+        "percent_improvement": -15.0,
+        "findings": [
+          {
+            "kind": "high_coefficient_of_variation",
+            "side": "current",
+            "actual_percent": 3.5499851344683746,
+            "maximum_percent": 2.0
+          }
+        ],
+        "blocking": true
+      }
+    ],
+    "summary": {
+      "improvements": 0,
+      "regressions": 1,
+      "no_material_change": 0,
+      "informational": 0,
+      "invalid": 0,
+      "inconclusive": 0,
+      "unstable": 1,
+      "blocking": 1
+    },
+    "gate_failed": true
+  }
+}

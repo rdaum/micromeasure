@@ -24,7 +24,7 @@ That means:
 - simple hand-written microbench drivers, not macro-heavy harness structure
 - output that emphasizes instruction count, branch behaviour, cache misses, and timing together
 - benchmark binaries that can be filtered and run directly during systems work
-- persisted raw samples for immediate local comparison, explicit CI baselines, external sample-series ingestion, and reusable structured comparison
+- persisted raw samples for immediate local comparison, explicit CI baselines, external sample-series ingestion, reusable structured comparison, and advisory or gating renderers
 - GPU benchmarking with pluggable measurement backends, per-sample custom metrics, measurement domain tagging, and optional NVIDIA GPU counter diagnostics
 
 ## Documentation
@@ -46,6 +46,7 @@ Quick orientation:
 - [Linux PMU Setup](./book/src/linux-pmu.md) — `perf_event_paranoid`, capabilities, fallback
 - [Persisted Reports & Comparison](./book/src/reports.md)
 - [External Sample Series](./book/src/series-reports.md) — portable raw samples, dimensions, provenance, and validity
+- [Regression Policy & Rendering](./book/src/policy-and-rendering.md) — material-change policy, stability findings, terminal/Markdown/JSON output, and exit status
 - [Examples](./book/src/examples.md) — one annotated walkthrough per runnable example
 - [GPU Benchmarking Sharp Edges](./book/src/gpu-sharp-edges.md) — the failure modes that motivated the GPU design
 - [micromeasure vs Criterion](./book/src/vs-criterion.md)

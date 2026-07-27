@@ -235,6 +235,12 @@ inputs were an exact match. An empty override reason is rejected. A zero or
 non-finite baseline value is retained as evidence but produces no percentage
 improvement.
 
+Apply a configurable advisory or gating decision and render the same evidence
+as terminal text, Markdown, or versioned JSON with `RegressionPolicy` and
+`ComparisonAnalysis`. See
+[Regression Policy & Rendering](./policy-and-rendering.md) for classification,
+stability findings, and the stable `0`/`1`/`2` frontend status contract.
+
 ## The regression analysis
 
 When a compatible previous report is found, the session summary prints:

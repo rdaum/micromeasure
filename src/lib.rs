@@ -18,11 +18,13 @@
 //! - Performance counter integration (Linux only)
 //! - Console output with Unicode tables
 //! - Explicit report rendering and JSON persistence
+//! - Structured, serializable comparison of persisted reports
 //! - Warm-up and calibration phases
 //! - Progress indicators
 //! - Generic table formatting
 
 pub mod bench;
+mod comparison;
 mod launcher;
 mod session;
 pub mod table;
@@ -45,6 +47,13 @@ pub use bench::{
     DEFAULT_NVIDIA_GPU_COUNTERS, GpuCounterCollector, GpuCounterError, GpuCounterMetric,
     GpuCounterResult,
 };
+pub use comparison::{
+    BenchmarkCaseIdentity, COMPARISON_SCHEMA_VERSION, ComparisonCaseSnapshot, ComparisonError,
+    ComparisonOptions, ComparisonReport, ComparisonSide, ComparisonStatistics, ComparisonSummary,
+    MatchedBenchmark, MeasurementDirection, MeasurementKind, MetricComparison,
+    NativeMeasurementProjection, PrimaryMeasurement, ReportDocument, ReportDocumentType,
+    ReportError, ReportReference, UnmatchedBenchmark, compare_reports,
+};
 pub use launcher::{
     BenchmarkMainOptions, OUTPUT_PATH_ENVIRONMENT, benchmark_filter_from_args,
     benchmark_filter_from_env, benchmark_options_with_default_suite, run_benchmark_main,
@@ -55,7 +64,8 @@ pub use table::{Alignment, BorderColor, TableFormatter};
 pub use bench::PerfCounters;
 pub use session::{
     BenchmarkKind, BenchmarkReport, BenchmarkResult, BenchmarkStats, ComparisonPolicy,
-    REPORT_SCHEMA_VERSION, SampleMetric, SampleMetricSet, WorkerCounterSummary, WorkerSummary,
+    MetricSummary, REPORT_SCHEMA_VERSION, SampleMetric, SampleMetricSet, WorkerCounterSummary,
+    WorkerSummary,
 };
 
 // Re-export key types for convenience

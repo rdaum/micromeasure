@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Alignment, MeasurementDomain, MetricFormat, TableFormatter, Throughput};
+use crate::{
+    Alignment, MeasurementDomain, MetricFormat, TableFormatter, Throughput,
+    comparison::pair_results_one_to_one,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -234,7 +237,7 @@ pub enum ComparisonPolicy {
 }
 
 /// Persisted benchmark report for serialization and optional comparisons.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BenchmarkReport {
     /// Version of the serialized JSON document shape.
     ///
@@ -873,38 +876,6 @@ fn matching_previous_result<'previous>(
     pairs
         .iter()
         .find_map(|(current, previous)| std::ptr::eq(*current, result).then_some(*previous))
-}
-
-fn result_identity_matches(current: &BenchmarkResult, previous: &BenchmarkResult) -> bool {
-    current.name == previous.name
-        && current.group == previous.group
-        && current.kind == previous.kind
-        && current.metadata == previous.metadata
-        && current.stats.throughput == previous.stats.throughput
-        && current.stats.measurement_domain == previous.stats.measurement_domain
-}
-
-fn pair_results_one_to_one<'current, 'previous>(
-    current_results: &'current [BenchmarkResult],
-    previous_results: &'previous [BenchmarkResult],
-) -> Vec<(&'current BenchmarkResult, &'previous BenchmarkResult)> {
-    let mut matched_previous = vec![false; previous_results.len()];
-    let mut pairs = Vec::with_capacity(current_results.len().min(previous_results.len()));
-    for current in current_results {
-        let Some((index, previous)) =
-            previous_results
-                .iter()
-                .enumerate()
-                .find(|(index, previous)| {
-                    !matched_previous[*index] && result_identity_matches(current, previous)
-                })
-        else {
-            continue;
-        };
-        matched_previous[index] = true;
-        pairs.push((current, previous));
-    }
-    pairs
 }
 
 fn result_mean_throughput(result: &BenchmarkResult) -> f64 {

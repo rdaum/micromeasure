@@ -85,7 +85,9 @@ A previous report is **compatible** with the current run when all of:
 
 If the previous report has a different set of benchmarks (you added/removed/renamed one), it is not compatible and the runner skips the comparison rather than printing misleading deltas. Rename a benchmark and you lose comparability with the previous run — by design.
 
-The runner loads the most recent compatible report from the target directory by scanning `benchmark_results_*.json`, parsing timestamps, and picking the latest one whose result set matches.
+The runner loads the most recent compatible report from the target directory by scanning
+`benchmark_results_*.json` in modification-time order and selecting the newest report whose result
+set matches.
 
 `benchmark_main!` supplies `env!("CARGO_CRATE_NAME")` as the default suite, so rebuilding a Cargo
 benchmark does not change comparison identity when Cargo changes the executable's hash suffix.
@@ -102,6 +104,52 @@ Reports created before `schema_version` was added are interpreted as schema 1. R
 different schema version are skipped for comparison rather than being interpreted using incompatible
 assumptions. External consumers can compare the document field with
 `micromeasure::REPORT_SCHEMA_VERSION`.
+
+## Structured comparison
+
+The local `LatestCompatible` workflow remains deliberately strict and
+zero-configuration. Automation which has already selected an exact baseline can
+instead load two evidence documents and request a reusable structured
+comparison:
+
+```rust,ignore
+use micromeasure::{
+    ComparisonOptions, ReportDocument, compare_reports,
+};
+
+let current = ReportDocument::load_from_path("artifacts/current.json")?;
+let baseline = ReportDocument::load_from_path("artifacts/baseline.json")?;
+let options = ComparisonOptions::default().allow_partial_result_set(true);
+let comparison = compare_reports(&current, &baseline, &options)?;
+
+serde_json::to_writer_pretty(std::io::stdout(), &comparison)?;
+```
+
+`ReportDocument::load_from_path` distinguishes I/O, malformed JSON, malformed
+report structure, and unsupported schema errors. It also gives the document a
+`ReportReference` containing a SHA-256 digest of the exact loaded bytes. For an
+in-memory comparison, `BenchmarkReport::compare` derives references from the
+same pretty JSON representation used by report persistence.
+
+Native benchmark cases are identified by group, name, kind, `Throughput`,
+measurement domain, and benchmark metadata. Duplicate identities are errors in
+the structured API. With partial matching enabled, semantically matching cases
+are compared while current-only cases are reported as `added` and
+baseline-only cases as `removed`; changed identity fields therefore become an
+added/removed pair rather than a misleading numeric comparison. Strict
+comparison is the default.
+
+`ComparisonReport` is policy-free, versioned JSON. Each matched native case
+contains:
+
+- median throughput as a `throughput`/`higher` primary measurement;
+- signed percentage improvement, where positive always means better;
+- native throughput and latency projections;
+- CV, MAD, sample, and outlier evidence; and
+- changes for custom metrics present on both sides.
+
+Suite and known-host identities must match. A zero or non-finite baseline value
+is retained as evidence but produces no percentage improvement.
 
 ## The regression analysis
 

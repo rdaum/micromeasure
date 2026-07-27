@@ -124,11 +124,19 @@ Register with `g.diagnostic_pass(f)` and `g.diagnostic_samples(n)` on a `Benchma
 
 | Type | Purpose | Source |
 |---|---|---|
-| `BenchmarkReport` | Versioned persisted report: `schema_version`, `timestamp`, `hostname`, `suite`, `git_commit`, `results`. `save_to_path()`, `save_to_default_location()`, `print_summary_with(policy)`. | `src/session.rs` |
+| `BenchmarkReport` | Versioned persisted report: `schema_version`, `timestamp`, `hostname`, `suite`, `git_commit`, `results`. Loading, persistence, local summary, and in-memory structured comparison. | `src/session.rs`, `src/comparison.rs` |
 | `REPORT_SCHEMA_VERSION` | JSON report schema emitted by this crate and accepted for persisted comparison. | `src/session.rs` |
 | `BenchmarkResult` | One persisted entry: `name`, `kind`, `execution_index`, metadata, stats, worker summaries. | `src/session.rs` |
 | `BenchmarkKind` | `Standard` / `Concurrent`. | `src/session.rs` |
 | `ComparisonPolicy` | `None` / `LatestCompatible`. | `src/session.rs` |
+| `ReportDocument` / `ReportReference` | Loaded evidence retaining an exact-byte SHA-256 digest, document metadata, source provenance, and optional display path. | `src/comparison.rs` |
+| `ComparisonOptions` | Strict by default; `allow_partial_result_set(true)` reports matching, added, and removed cases. | `src/comparison.rs` |
+| `ComparisonReport` | Versioned, serializable, policy-free comparison with report references, matched cases, unmatched cases, and summary counts. | `src/comparison.rs` |
+| `BenchmarkCaseIdentity` | Native case identity: group, name, kind, throughput configuration, measurement domain, and metadata. | `src/comparison.rs` |
+| `PrimaryMeasurement` | Normalized measurement kind, unit, direction, and optional finite median value. | `src/comparison.rs` |
+| `MeasurementKind` / `MeasurementDirection` | Machine-readable primary measurement semantics and higher/lower/informational direction. | `src/comparison.rs` |
+| `ReportError` / `ComparisonError` | Structured loading, schema, suite, runner, duplicate-identity, and result-set errors. | `src/comparison.rs` |
+| `COMPARISON_SCHEMA_VERSION` | JSON schema emitted for `ComparisonReport`. | `src/comparison.rs` |
 | `WorkerSummary` | Per-role summary for concurrent benchmarks: `name`, `threads`, `stats`, `counters`. | `src/session.rs` |
 | `WorkerCounterSummary` | Aggregated event counter: `name`, `total`, `per_op`, `per_sec`. | `src/session.rs` |
 

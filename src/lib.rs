@@ -21,6 +21,7 @@
 //! - Structured, serializable comparison of persisted reports
 //! - Portable raw-sample reports for external orchestrators
 //! - Advisory or gating policy with terminal, Markdown, and JSON rendering
+//! - Multi-suite file and directory validation and comparison
 //! - Warm-up and calibration phases
 //! - Progress indicators
 //! - Generic table formatting
@@ -33,6 +34,7 @@ mod policy;
 mod render;
 mod series;
 mod session;
+mod suite;
 pub mod table;
 mod threading;
 
@@ -76,6 +78,10 @@ pub use render::{ANALYSIS_SCHEMA_VERSION, ComparisonAnalysis, render_markdown, r
 pub use series::{
     SERIES_DOCUMENT_TYPE, SERIES_SCHEMA_VERSION, SeriesReport, SeriesResult, SeriesValidationError,
     Validity, ValidityStatus,
+};
+pub use suite::{
+    ReportInputRole, SUITE_ANALYSIS_SCHEMA_VERSION, SuiteComparisonAnalysis, SuiteComparisonError,
+    SuiteComparisonSummary, compare_report_inputs, validate_report_input,
 };
 pub use table::{Alignment, BorderColor, TableFormatter};
 

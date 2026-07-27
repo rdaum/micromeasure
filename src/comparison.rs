@@ -430,6 +430,20 @@ impl ReportDocument {
             Self::Native { reference, .. } | Self::Series { reference, .. } => reference,
         }
     }
+
+    /// Validate that this document is usable as one side of a structured
+    /// comparison.
+    ///
+    /// Loading already checks JSON shape and schema version. This additional
+    /// pass checks comparison-level invariants such as suite and runner
+    /// identity, report validity, context semantics, and duplicate case
+    /// identities.
+    pub fn validate_for_comparison(&self) -> Result<(), ComparisonError> {
+        let normalized = normalize_document(self, ComparisonSide::Current)?;
+        validate_report_validity(&normalized.validity, ComparisonSide::Current)?;
+        validate_runner(&normalized.runner_id, ComparisonSide::Current)?;
+        reject_duplicate_identities(&normalized.cases, ComparisonSide::Current)
+    }
 }
 
 /// Serializable, policy-free relationship between two benchmark reports.
@@ -897,6 +911,13 @@ fn normalize_native_report(
             supported: REPORT_SCHEMA_VERSION,
         });
     }
+    report
+        .context
+        .validate()
+        .map_err(|error| ComparisonError::InvalidReport {
+            side,
+            reason: error.to_string(),
+        })?;
     let suite = report
         .suite
         .as_deref()

@@ -98,3 +98,6 @@ The library does not terminate the process itself.
 
 This contract intentionally distinguishes a valid negative performance result
 from a failure to produce or interpret a result.
+
+The separately packaged [`micromeasure` suite CLI](./suite-cli.md) implements
+this contract for report files and directories.

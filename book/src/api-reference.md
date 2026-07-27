@@ -161,6 +161,11 @@ Register with `g.diagnostic_pass(f)` and `g.diagnostic_samples(n)` on a `Benchma
 | `render_terminal` / `render_markdown` | Side-effect-free rendering for job logs and CI annotations; methods of the same names are also available on `ComparisonAnalysis`. | `src/render.rs` |
 | `ComparisonExitStatus` | Stable frontend status contract: success `0`, regression gate failure `1`, operational error `2`. | `src/policy.rs` |
 | `ANALYSIS_SCHEMA_VERSION` | JSON schema emitted for `ComparisonAnalysis`. | `src/render.rs` |
+| `compare_report_inputs` | Load and compare one report pair or two directory trees, validating all documents before suite matching. | `src/suite.rs` |
+| `validate_report_input` | Validate one report or a recursive directory of native and external JSON reports, including duplicate suites and cases. | `src/suite.rs` |
+| `SuiteComparisonAnalysis` / `SuiteComparisonSummary` | Versioned combined comparison plus matched, added, removed, policy, stability, and gate totals across suites. | `src/suite.rs` |
+| `SuiteComparisonError` / `ReportInputRole` | Precise input, duplicate-suite, document-type, compatibility, and policy errors for suite operations. | `src/suite.rs` |
+| `SUITE_ANALYSIS_SCHEMA_VERSION` | JSON schema emitted for `SuiteComparisonAnalysis`. | `src/suite.rs` |
 | `WorkerSummary` | Per-role summary for concurrent benchmarks: `name`, `threads`, `stats`, `counters`. | `src/session.rs` |
 | `WorkerCounterSummary` | Aggregated event counter: `name`, `total`, `per_op`, `per_sec`. | `src/session.rs` |
 

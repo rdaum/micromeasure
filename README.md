@@ -24,7 +24,7 @@ That means:
 - simple hand-written microbench drivers, not macro-heavy harness structure
 - output that emphasizes instruction count, branch behaviour, cache misses, and timing together
 - benchmark binaries that can be filtered and run directly during systems work
-- persisted raw samples for immediate local comparison, explicit CI baselines, external sample-series ingestion, reusable structured comparison, and advisory or gating renderers
+- persisted raw samples for immediate local comparison, explicit CI baselines, external sample-series ingestion, reusable structured comparison, advisory or gating renderers, and a separately packaged provider-neutral suite CLI
 - GPU benchmarking with pluggable measurement backends, per-sample custom metrics, measurement domain tagging, and optional NVIDIA GPU counter diagnostics
 
 ## Documentation
@@ -47,6 +47,7 @@ Quick orientation:
 - [Persisted Reports & Comparison](./book/src/reports.md)
 - [External Sample Series](./book/src/series-reports.md) — portable raw samples, dimensions, provenance, and validity
 - [Regression Policy & Rendering](./book/src/policy-and-rendering.md) — material-change policy, stability findings, terminal/Markdown/JSON output, and exit status
+- [Suite CLI](./book/src/suite-cli.md) — report validation, file/directory comparison, combined artifacts, and process status
 - [Examples](./book/src/examples.md) — one annotated walkthrough per runnable example
 - [GPU Benchmarking Sharp Edges](./book/src/gpu-sharp-edges.md) — the failure modes that motivated the GPU design
 - [micromeasure vs Criterion](./book/src/vs-criterion.md)

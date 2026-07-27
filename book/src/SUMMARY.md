@@ -10,6 +10,7 @@
 - [Persisted Reports & Comparison](./reports.md)
 - [External Sample Series](./series-reports.md)
 - [Regression Policy & Rendering](./policy-and-rendering.md)
+- [Suite CLI](./suite-cli.md)
 - [Examples](./examples.md)
   - [basic](./examples/basic.md)
   - [throughput_units](./examples/throughput-units.md)

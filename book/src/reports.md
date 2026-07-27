@@ -44,12 +44,57 @@ instead of the `benchmark_main!` macro.
 
 - `schema_version` — JSON document format version; currently `1`
 - `timestamp` — unix seconds string
-- `hostname` — operating-system hostname used to gate comparison (different host = incompatible)
+- `hostname` — operating-system hostname retained for compatibility and used as the default runner identity
 - `suite` — optional suite name; `benchmark_main!` defaults it to the stable Cargo benchmark target name, and comparison requires the same suite
 - `git_commit` — short SHA captured at session start (best-effort)
+- `context` — resolved stable runner identity, exact comparison-environment map, and provenance map
 - `results: Vec<BenchmarkResult>` — one per benchmark, each with `name`, `kind` (`Standard`/`Concurrent`), `execution_index`, metadata, stats, and (for concurrent) per-worker summaries
 
+New reports capture full source commit, branch, dirty-worktree state, and Rust
+toolchain in `context.provenance` when those values are available. The legacy
+short `git_commit` field remains for compatibility. Provenance describes the
+evidence but never controls whether two reports may be compared.
+
 `BenchmarkStats` (the per-benchmark payload) carries the aggregated numbers: throughput median/p95, latency median/p95, MAD, CV, outlier count, sample count, all the PMU-derived per-op counts, the PMU coverage fields, the `measurement_label`, `measurement_domain`, `emits_cpu_diagnostics`, custom `metrics: Vec<MetricSummary>` (mean/median/p95/min/max/sample count per `(section, name, unit)`), and chronological `sample_metrics`.
+
+## Supplying report context
+
+Automation can provide one shared JSON context document to every benchmark
+executable:
+
+```sh
+MICROMEASURE_CONTEXT_FILE=/work/benchmark-context.json \
+MICROMEASURE_OUTPUT=/work/current.json \
+cargo bench --bench basic
+```
+
+```json
+{
+  "runner_id": "gpu-node-05",
+  "environment": {
+    "hardware_class": "gb300",
+    "gpu_driver": "595.71.05",
+    "cuda_toolkit": "13.1"
+  },
+  "provenance": {
+    "ci": "example-ci",
+    "commit": "83a20ec058e2fb00e7fa4558c4c6e81e2dcf253d",
+    "build_number": "418"
+  }
+}
+```
+
+`runner_id` defaults to the operating-system hostname when omitted or empty.
+The complete `environment` map participates in compatibility; `provenance`
+does not. Supplied provenance keys win over locally detected defaults, which
+lets trusted automation provide the full CI commit and build identity.
+
+An unreadable, malformed, or semantically invalid explicitly requested context
+file is fatal. Empty environment/provenance keys or values are invalid. Do not
+put credentials or secrets in the document: the resolved context is persisted
+verbatim in the report. Rust callers can supply the same data through
+`BenchmarkMainOptions::report_context` or
+`BenchmarkRunner::with_report_context`.
 
 ## Comparison policy
 
@@ -78,7 +123,8 @@ run_benchmark_main(
 
 A previous report is **compatible** with the current run when all of:
 
-- same known `hostname`; reports whose hostname cannot be resolved do not compare automatically
+- same known effective runner identity (`context.runner_id`, falling back to `hostname` for legacy reports)
+- exactly equal `context.environment` maps
 - same `suite` (`CARGO_CRATE_NAME`, normally the benchmark target name, by default)
 - the same number of results, matched one-to-one by group, name, and kind
 - matching throughput configuration, measurement domain, and per-result metadata
@@ -100,10 +146,36 @@ used as fallbacks on platforms where necessary. If every lookup fails, the repor
 `"unknown"` for transparency but is not eligible for automatic comparison; treating reports from
 unknown machines as the same host would make performance claims unsafe.
 
-Reports created before `schema_version` was added are interpreted as schema 1. Reports carrying a
-different schema version are skipped for comparison rather than being interpreted using incompatible
+Reports created before `schema_version` was added are interpreted as schema 1.
+Reports created before `context` was added deserialize with empty context and
+continue comparing by hostname. Reports carrying a different schema version
+are skipped for comparison rather than being interpreted using incompatible
 assumptions. External consumers can compare the document field with
 `micromeasure::REPORT_SCHEMA_VERSION`.
+
+## Selecting an exact baseline
+
+An automated run can select one exact baseline artifact:
+
+```sh
+MICROMEASURE_CONTEXT_FILE=/work/benchmark-context.json \
+MICROMEASURE_BASELINE=/work/baseline/basic.json \
+MICROMEASURE_OUTPUT=/work/current/basic.json \
+cargo bench --bench basic
+```
+
+The launcher loads the context and baseline before running benchmarks. A
+missing, unreadable, malformed, unsupported, or incompatible explicit baseline
+is fatal and names the requested artifact; it never falls back to a local
+`LatestCompatible` report. The current report is still persisted before the
+compatibility check so a valid measurement is not lost when the selected
+baseline is incompatible. Explicit launcher comparison allows partial result
+sets by default, reporting matching, added, and removed cases.
+
+Rust callers configure the same flow with
+`BenchmarkMainOptions::report_context` and
+`BenchmarkMainOptions::explicit_comparison`; the exact baseline path remains
+selected with `MICROMEASURE_BASELINE`.
 
 ## Structured comparison
 
@@ -148,8 +220,13 @@ contains:
 - CV, MAD, sample, and outlier evidence; and
 - changes for custom metrics present on both sides.
 
-Suite and known-host identities must match. A zero or non-finite baseline value
-is retained as evidence but produces no percentage improvement.
+Suite, effective runner identity, and the complete comparison-environment maps
+must match. `ComparisonOptions::with_environment_override(reason)` can permit
+an intentional mismatch. The resulting `ComparisonReport.environment` records
+the reason, both runner IDs, both original environment maps, and whether the
+inputs were an exact match. An empty override reason is rejected. A zero or
+non-finite baseline value is retained as evidence but produces no percentage
+improvement.
 
 ## The regression analysis
 
@@ -184,7 +261,7 @@ chronological as well; percentile calculation never sorts the stored arrays.
 
 ## Workflow tips
 
-- Run from the same checkout and the same machine for comparable reports. Hostname and suite mismatch intentionally block comparison.
+- Run with the same suite, stable runner identity, and explicit environment map for comparable reports.
 - Changing `Throughput`, `MeasurementDomain`, or benchmark metadata makes the previous report incompatible, preventing a misleading comparison.
-- The report captures `git_commit` best-effort. If you are benchmarking uncommitted changes, the SHA still points at HEAD, not your working tree.
+- `context.provenance.commit` points at `HEAD`; use `dirty_worktree` to distinguish uncommitted changes.
 - Reports accumulate in `target/`. They are not garbage-collected. Either add a `make clean-reports` target or clean the directory manually when it gets large.

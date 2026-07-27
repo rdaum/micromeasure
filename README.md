@@ -24,7 +24,7 @@ That means:
 - simple hand-written microbench drivers, not macro-heavy harness structure
 - output that emphasizes instruction count, branch behaviour, cache misses, and timing together
 - benchmark binaries that can be filtered and run directly during systems work
-- persisted raw samples for immediate local comparison and reusable structured report comparison
+- persisted raw samples for immediate local comparison, explicit CI baselines, and reusable structured report comparison
 - GPU benchmarking with pluggable measurement backends, per-sample custom metrics, measurement domain tagging, and optional NVIDIA GPU counter diagnostics
 
 ## Documentation

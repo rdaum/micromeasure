@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{
-    Alignment, MeasurementDomain, MetricFormat, TableFormatter, Throughput,
+    Alignment, MeasurementDomain, MetricFormat, ReportContext, TableFormatter, Throughput,
     comparison::pair_results_one_to_one,
 };
 use serde::{Deserialize, Serialize};
@@ -250,6 +250,12 @@ pub struct BenchmarkReport {
     #[serde(default)]
     pub suite: Option<String>,
     pub git_commit: Option<String>,
+    /// Stable runner identity, comparison environment, and source provenance.
+    ///
+    /// Legacy reports without this additive field deserialize with an empty
+    /// context and continue to use `hostname` as their runner identity.
+    #[serde(default)]
+    pub context: ReportContext,
     pub results: Vec<BenchmarkResult>,
 }
 
@@ -266,6 +272,7 @@ pub(crate) struct BenchmarkSession {
     hostname: String,
     suite: String,
     git_commit: Option<String>,
+    context: ReportContext,
     results: Mutex<Vec<BenchmarkResult>>,
 }
 
@@ -289,19 +296,8 @@ impl BenchmarkSession {
 
         let hostname = current_hostname();
 
-        let git_commit = std::process::Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    String::from_utf8(output.stdout)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                } else {
-                    None
-                }
-            });
+        let git_commit = command_output("git", &["rev-parse", "--short", "HEAD"]);
+        let context = ReportContext::default().resolved(&hostname, local_provenance());
 
         let suite = suite.into();
 
@@ -310,8 +306,18 @@ impl BenchmarkSession {
             hostname,
             suite,
             git_commit,
+            context,
             results: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn set_context(&mut self, context: ReportContext) {
+        let defaults = self.context.provenance.clone();
+        self.context = context.resolved(&self.hostname, defaults);
+    }
+
+    pub(crate) fn set_suite(&mut self, suite: impl Into<String>) {
+        self.suite = suite.into();
     }
 
     pub(crate) fn add_result(&self, mut result: BenchmarkResult) {
@@ -342,6 +348,7 @@ impl BenchmarkSession {
             hostname: self.hostname.clone(),
             suite: Some(self.suite.clone()),
             git_commit: self.git_commit.clone(),
+            context: self.context.clone(),
             results: self.get_results(),
         }
     }
@@ -353,6 +360,23 @@ impl BenchmarkReport {
     }
 
     pub fn print_summary_with(&self, comparison_policy: ComparisonPolicy) {
+        let previous_session = self.suite.as_deref().and_then(|suite| {
+            load_comparison_session(
+                comparison_policy,
+                &self.hostname,
+                &self.context,
+                suite,
+                &self.results,
+            )
+        });
+        self.print_summary_with_baseline(previous_session.as_ref());
+    }
+
+    pub(crate) fn print_summary_against(&self, baseline: &BenchmarkReport) {
+        self.print_summary_with_baseline(Some(baseline));
+    }
+
+    fn print_summary_with_baseline(&self, previous_session: Option<&BenchmarkReport>) {
         if self.results.is_empty() {
             return;
         }
@@ -360,11 +384,7 @@ impl BenchmarkReport {
         println!("\n🎯 BENCHMARK SESSION SUMMARY");
         println!("═══════════════════════════════════════════════════════════════════════");
 
-        let previous_session = self.suite.as_deref().and_then(|suite| {
-            load_comparison_session(comparison_policy, &self.hostname, suite, &self.results)
-        });
-
-        if let Some(ref prev) = previous_session {
+        if let Some(prev) = previous_session {
             println!("📊 Comparing with previous run from {}", prev.timestamp);
             if let Some(ref suite) = prev.suite {
                 println!("   Previous suite: {suite}");
@@ -375,7 +395,6 @@ impl BenchmarkReport {
             println!();
         }
         let comparison_pairs = previous_session
-            .as_ref()
             .map(|previous| pair_results_one_to_one(&self.results, &previous.results))
             .unwrap_or_default();
 
@@ -1304,8 +1323,57 @@ fn current_hostname() -> String {
     )
 }
 
+fn command_output(command: &str, arguments: &[&str]) -> Option<String> {
+    command_output_allow_empty(command, arguments).filter(|value| !value.is_empty())
+}
+
+fn command_output_allow_empty(command: &str, arguments: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(command)
+        .args(arguments)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
+fn local_provenance() -> BTreeMap<String, String> {
+    let mut provenance = BTreeMap::new();
+    if let Some(commit) = command_output("git", &["rev-parse", "HEAD"]) {
+        provenance.insert("commit".to_string(), commit);
+    }
+    if let Some(branch) = command_output("git", &["branch", "--show-current"]) {
+        provenance.insert("branch".to_string(), branch);
+    }
+    if let Some(status) = command_output_allow_empty(
+        "git",
+        &["status", "--porcelain", "--untracked-files=normal"],
+    ) {
+        provenance.insert(
+            "dirty_worktree".to_string(),
+            (!status.is_empty()).to_string(),
+        );
+    }
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if let Some(toolchain) = command_output(&rustc, &["--version"]) {
+        provenance.insert("rust_toolchain".to_string(), toolchain);
+    }
+    provenance
+}
+
 fn hostname_is_known(hostname: &str) -> bool {
     !hostname.trim().is_empty() && !hostname.eq_ignore_ascii_case("unknown")
+}
+
+fn effective_runner_id<'a>(hostname: &'a str, context: &'a ReportContext) -> &'a str {
+    if context.runner_id.trim().is_empty() {
+        hostname
+    } else {
+        &context.runner_id
+    }
 }
 
 /// Get the target directory for saving benchmark results, following criterion's approach
@@ -1336,6 +1404,7 @@ fn get_target_directory() -> PathBuf {
 fn session_is_compatible(
     session: &BenchmarkReport,
     hostname: &str,
+    context: &ReportContext,
     suite: &str,
     current_results: &[BenchmarkResult],
 ) -> bool {
@@ -1343,9 +1412,12 @@ fn session_is_compatible(
         return false;
     }
 
-    if !hostname_is_known(hostname)
-        || !hostname_is_known(&session.hostname)
-        || session.hostname != hostname
+    let current_runner = effective_runner_id(hostname, context);
+    let baseline_runner = effective_runner_id(&session.hostname, &session.context);
+    if !hostname_is_known(current_runner)
+        || !hostname_is_known(baseline_runner)
+        || baseline_runner != current_runner
+        || session.context.environment != context.environment
     {
         return false;
     }
@@ -1411,6 +1483,7 @@ fn load_latest_session_matching(
 fn load_comparison_session(
     comparison_policy: ComparisonPolicy,
     hostname: &str,
+    context: &ReportContext,
     suite: &str,
     current_results: &[BenchmarkResult],
 ) -> Option<BenchmarkReport> {
@@ -1418,6 +1491,7 @@ fn load_comparison_session(
         &get_target_directory(),
         comparison_policy,
         hostname,
+        context,
         suite,
         current_results,
     )
@@ -1427,13 +1501,14 @@ fn load_comparison_session_from(
     target_dir: &Path,
     comparison_policy: ComparisonPolicy,
     hostname: &str,
+    context: &ReportContext,
     suite: &str,
     current_results: &[BenchmarkResult],
 ) -> Option<BenchmarkReport> {
     match comparison_policy {
         ComparisonPolicy::None => None,
         ComparisonPolicy::LatestCompatible => load_latest_session_matching(target_dir, |session| {
-            session_is_compatible(session, hostname, suite, current_results)
+            session_is_compatible(session, hostname, context, suite, current_results)
         }),
     }
 }
@@ -1510,6 +1585,7 @@ mod tests {
             hostname: hostname.to_string(),
             suite: suite.map(str::to_string),
             git_commit: Some("abc123".to_string()),
+            context: ReportContext::default(),
             results: result_names
                 .iter()
                 .map(|name| make_result(name, 1.0))
@@ -1593,6 +1669,7 @@ mod tests {
         assert!(!session_is_compatible(
             &report,
             "host-a",
+            &ReportContext::default(),
             "suite-a",
             &[make_result("bench-a", 1.0)]
         ));
@@ -1617,6 +1694,7 @@ mod tests {
             &directory,
             ComparisonPolicy::LatestCompatible,
             "host-a",
+            &ReportContext::default(),
             "gpu",
             &current_results,
         )
@@ -1646,6 +1724,7 @@ mod tests {
             &directory,
             ComparisonPolicy::LatestCompatible,
             "host-a",
+            &ReportContext::default(),
             "gpu",
             &current_results,
         )
@@ -1675,11 +1754,42 @@ mod tests {
             &directory,
             ComparisonPolicy::LatestCompatible,
             "host-a",
+            &ReportContext::default(),
             "gpu",
             &current_results,
         )
         .unwrap();
         assert_eq!(selected.timestamp, "20");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn latest_compatible_skips_newer_report_from_another_environment() {
+        let directory = comparison_test_directory("other-environment");
+        let current_results = vec![make_result("gpu_case", 3.0)];
+        persist_report_at_order(
+            &directory,
+            10,
+            make_session("host-a", Some("gpu"), &["gpu_case"]),
+        );
+        let mut incompatible = make_session("host-a", Some("gpu"), &["gpu_case"]);
+        incompatible
+            .context
+            .environment
+            .insert("accelerator".to_string(), "different-hardware".to_string());
+        persist_report_at_order(&directory, 20, incompatible);
+
+        let selected = load_comparison_session_from(
+            &directory,
+            ComparisonPolicy::LatestCompatible,
+            "host-a",
+            &ReportContext::default(),
+            "gpu",
+            &current_results,
+        )
+        .unwrap();
+        assert_eq!(selected.timestamp, "10");
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1802,6 +1912,7 @@ mod tests {
         assert!(session_is_compatible(
             &compatible,
             "host-a",
+            &ReportContext::default(),
             "suite-a",
             &current_results
         ));
@@ -1810,6 +1921,7 @@ mod tests {
         assert!(!session_is_compatible(
             &wrong_host,
             "host-a",
+            &ReportContext::default(),
             "suite-a",
             &current_results
         ));
@@ -1818,6 +1930,7 @@ mod tests {
         assert!(!session_is_compatible(
             &unknown_host,
             "unknown",
+            &ReportContext::default(),
             "suite-a",
             &current_results
         ));
@@ -1826,6 +1939,7 @@ mod tests {
         assert!(!session_is_compatible(
             &wrong_suite,
             "host-a",
+            &ReportContext::default(),
             "suite-a",
             &current_results
         ));
@@ -1834,6 +1948,7 @@ mod tests {
         assert!(!session_is_compatible(
             &missing_suite,
             "host-a",
+            &ReportContext::default(),
             "suite-a",
             &current_results
         ));
@@ -1842,6 +1957,7 @@ mod tests {
         assert!(!session_is_compatible(
             &different_results,
             "host-a",
+            &ReportContext::default(),
             "suite-a",
             &current_results
         ));
@@ -1854,9 +1970,49 @@ mod tests {
         assert!(!session_is_compatible(
             &different_storage,
             "host-a",
+            &ReportContext::default(),
             "suite-a",
             &current_results
         ));
+    }
+
+    #[test]
+    fn session_compatibility_uses_stable_runner_and_exact_environment() {
+        let current_results = vec![make_result("bench_a", 1.0)];
+        let current_context =
+            ReportContext::new("stable-runner").with_environment("accelerator", "GB300");
+        let mut baseline = make_session("different-ephemeral-host", Some("suite-a"), &["bench_a"]);
+        baseline.context = current_context.clone();
+
+        assert!(session_is_compatible(
+            &baseline,
+            "current-ephemeral-host",
+            &current_context,
+            "suite-a",
+            &current_results
+        ));
+
+        baseline
+            .context
+            .environment
+            .insert("driver".to_string(), "595.71.05".to_string());
+        assert!(!session_is_compatible(
+            &baseline,
+            "current-ephemeral-host",
+            &current_context,
+            "suite-a",
+            &current_results
+        ));
+    }
+
+    #[test]
+    fn new_sessions_capture_resolved_context_and_full_commit_provenance() {
+        let report = BenchmarkSession::new_with_suite("suite-a").report();
+        assert_eq!(report.context.runner_id, report.hostname);
+        if let Some(commit) = report.context.provenance.get("commit") {
+            assert_eq!(commit.len(), 40);
+            assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
     }
 
     #[test]
@@ -1869,6 +2025,7 @@ mod tests {
             hostname: "host-a".to_string(),
             suite: Some("suite-a".to_string()),
             git_commit: None,
+            context: ReportContext::default(),
             results: vec![append, strict],
         };
 
@@ -1921,6 +2078,7 @@ mod tests {
             hostname: "host-a".to_string(),
             suite: Some("suite-a".to_string()),
             git_commit: None,
+            context: ReportContext::default(),
             results: vec![
                 make_result_in_group("strict", "1t", 21.0),
                 make_result_in_group("append", "1t", 11.0),
@@ -1929,6 +2087,7 @@ mod tests {
         assert!(session_is_compatible(
             &compatible,
             "host-a",
+            &ReportContext::default(),
             "suite-a",
             &current
         ));
@@ -1939,6 +2098,7 @@ mod tests {
             hostname: "host-a".to_string(),
             suite: Some("suite-a".to_string()),
             git_commit: None,
+            context: ReportContext::default(),
             results: vec![
                 make_result_in_group("append", "1t", 11.0),
                 make_result_in_group("relaxed", "1t", 12.0),
@@ -1951,6 +2111,7 @@ mod tests {
         assert!(!session_is_compatible(
             &reuses_one_previous,
             "host-a",
+            &ReportContext::default(),
             "suite-a",
             &duplicate_current
         ));

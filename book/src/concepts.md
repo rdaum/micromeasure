@@ -149,15 +149,21 @@ benchmark_main!(|runner| { /* register groups */ });
 
 It expands to `fn main()` that supplies the call site's stable `env!("CARGO_CRATE_NAME")` as the default suite and calls `run_benchmark_main(BenchmarkMainOptions::default(), |runner| ...)`. An explicit `BenchmarkMainOptions::suite` overrides that default. `run_benchmark_main` then does, in order:
 
-1. Parse an optional filter from `env::args()` (first non-`--` argument).
-2. Construct a `BenchmarkRunner` with that filter.
-3. Apply your `BenchmarkRuntimeOptions` from `BenchmarkMainOptions::runtime`.
-4. Call your registration closure.
-5. Build the report and call `report.print_summary_with(comparison_policy)` (default `LatestCompatible`).
-6. Save the report to `./target/benchmark_results_<timestamp>.json`, or to the exact path in
-   `MICROMEASURE_OUTPUT` when that environment variable is set.
+1. Load any exact context and baseline requested through
+   `MICROMEASURE_CONTEXT_FILE` and `MICROMEASURE_BASELINE`.
+2. Parse an optional filter from `env::args()` (first non-`--` argument).
+3. Construct a `BenchmarkRunner` with that filter, suite, and resolved report context.
+4. Apply your `BenchmarkRuntimeOptions` from `BenchmarkMainOptions::runtime`.
+5. Call your registration closure.
+6. Build the report.
+7. With an explicit baseline, persist the current evidence and compare against
+   that exact artifact. Otherwise, use `comparison_policy` (default
+   `LatestCompatible`) and then persist the report. `MICROMEASURE_OUTPUT`
+   selects the exact destination.
 
-For custom suite name, custom filter help text, a different `ComparisonPolicy`, or disabling persistence, use `run_benchmark_main` directly:
+For custom suite name, custom filter help text, report context, explicit
+comparison behavior, a different `ComparisonPolicy`, or disabling persistence,
+use `run_benchmark_main` directly:
 
 ```rust,ignore
 run_benchmark_main(

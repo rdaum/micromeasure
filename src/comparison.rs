@@ -39,6 +39,7 @@ pub const COMPARISON_SCHEMA_VERSION: u32 = 1;
 #[non_exhaustive]
 pub struct ComparisonOptions {
     pub allow_partial_result_set: bool,
+    pub environment_override: Option<EnvironmentOverride>,
 }
 
 impl ComparisonOptions {
@@ -46,6 +47,37 @@ impl ComparisonOptions {
         self.allow_partial_result_set = allow;
         self
     }
+
+    /// Permit an explicitly justified runner or environment mismatch.
+    ///
+    /// The reason and both original environments are retained in the
+    /// resulting [`ComparisonReport`].
+    pub fn with_environment_override(mut self, reason: impl Into<String>) -> Self {
+        self.environment_override = Some(EnvironmentOverride {
+            reason: reason.into(),
+        });
+        self
+    }
+}
+
+/// Operator-supplied justification for comparing non-identical environments.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct EnvironmentOverride {
+    pub reason: String,
+}
+
+/// Complete environment relationship recorded in a comparison artifact.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct EnvironmentComparison {
+    pub current_runner_id: String,
+    pub baseline_runner_id: String,
+    pub current_environment: BTreeMap<String, String>,
+    pub baseline_environment: BTreeMap<String, String>,
+    pub exact_match: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_override: Option<EnvironmentOverride>,
 }
 
 /// The semantic kind of a comparison's primary measurement.
@@ -237,9 +269,11 @@ pub struct ReportReference {
 
 impl ReportReference {
     fn native(report: &BenchmarkReport, bytes: &[u8], display_path: Option<&Path>) -> Self {
-        let mut source_provenance = BTreeMap::new();
-        if let Some(commit) = report.git_commit.as_deref() {
-            source_provenance.insert("git_commit".to_string(), commit.to_string());
+        let mut source_provenance = report.context.provenance.clone();
+        if let Some(commit) = report.git_commit.as_deref()
+            && !source_provenance.contains_key("commit")
+        {
+            source_provenance.insert("commit".to_string(), commit.to_string());
         }
 
         Self {
@@ -307,6 +341,8 @@ pub struct ComparisonReport {
     pub current: ReportReference,
     pub baseline: ReportReference,
     pub suite: String,
+    #[serde(default)]
+    pub environment: EnvironmentComparison,
     pub matched: Vec<MatchedBenchmark>,
     pub added: Vec<UnmatchedBenchmark>,
     pub removed: Vec<UnmatchedBenchmark>,
@@ -414,6 +450,11 @@ pub enum ComparisonError {
         current: String,
         baseline: String,
     },
+    EnvironmentMismatch {
+        current: BTreeMap<String, String>,
+        baseline: BTreeMap<String, String>,
+    },
+    InvalidEnvironmentOverride,
     DuplicateIdentity {
         side: ComparisonSide,
         identity: BenchmarkCaseIdentity,
@@ -451,6 +492,13 @@ impl fmt::Display for ComparisonError {
                 formatter,
                 "runner mismatch: current report is from {current:?}, baseline report is from {baseline:?}"
             ),
+            Self::EnvironmentMismatch { current, baseline } => write!(
+                formatter,
+                "comparison environment mismatch: current is {current:?}, baseline is {baseline:?}"
+            ),
+            Self::InvalidEnvironmentOverride => {
+                formatter.write_str("environment override reason must not be empty")
+            }
             Self::DuplicateIdentity { side, identity } => write!(
                 formatter,
                 "{side} report contains duplicate benchmark identity {}/{}",
@@ -556,14 +604,40 @@ fn compare_native_reports(
         });
     }
 
-    validate_runner(&current.hostname, ComparisonSide::Current)?;
-    validate_runner(&baseline.hostname, ComparisonSide::Baseline)?;
-    if current.hostname != baseline.hostname {
+    let current_runner = effective_runner_id(current);
+    let baseline_runner = effective_runner_id(baseline);
+    validate_runner(current_runner, ComparisonSide::Current)?;
+    validate_runner(baseline_runner, ComparisonSide::Baseline)?;
+
+    if matches!(
+        options.environment_override.as_ref(),
+        Some(environment_override) if environment_override.reason.trim().is_empty()
+    ) {
+        return Err(ComparisonError::InvalidEnvironmentOverride);
+    }
+
+    let runner_matches = current_runner == baseline_runner;
+    let environment_matches = current.context.environment == baseline.context.environment;
+    if !runner_matches && options.environment_override.is_none() {
         return Err(ComparisonError::RunnerMismatch {
-            current: current.hostname.clone(),
-            baseline: baseline.hostname.clone(),
+            current: current_runner.to_string(),
+            baseline: baseline_runner.to_string(),
         });
     }
+    if !environment_matches && options.environment_override.is_none() {
+        return Err(ComparisonError::EnvironmentMismatch {
+            current: current.context.environment.clone(),
+            baseline: baseline.context.environment.clone(),
+        });
+    }
+    let environment = EnvironmentComparison {
+        current_runner_id: current_runner.to_string(),
+        baseline_runner_id: baseline_runner.to_string(),
+        current_environment: current.context.environment.clone(),
+        baseline_environment: baseline.context.environment.clone(),
+        exact_match: runner_matches && environment_matches,
+        operator_override: options.environment_override.clone(),
+    };
 
     reject_duplicate_identities(&current.results, ComparisonSide::Current)?;
     reject_duplicate_identities(&baseline.results, ComparisonSide::Baseline)?;
@@ -622,6 +696,7 @@ fn compare_native_reports(
         current: current_reference,
         baseline: baseline_reference,
         suite: current_suite.to_string(),
+        environment,
         matched,
         added,
         removed,
@@ -648,6 +723,14 @@ fn validate_runner(hostname: &str, side: ComparisonSide) -> Result<(), Compariso
         return Err(ComparisonError::UnknownRunner { side });
     }
     Ok(())
+}
+
+fn effective_runner_id(report: &BenchmarkReport) -> &str {
+    if report.context.runner_id.trim().is_empty() {
+        &report.hostname
+    } else {
+        &report.context.runner_id
+    }
 }
 
 fn reject_duplicate_identities(
@@ -1014,7 +1097,7 @@ pub(crate) fn pair_results_one_to_one<'current, 'previous>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BenchmarkStats, MetricSummary};
+    use crate::{BenchmarkStats, MetricSummary, ReportContext};
 
     fn result(group: &str, name: &str, rate: f64) -> BenchmarkResult {
         BenchmarkResult {
@@ -1084,6 +1167,7 @@ mod tests {
             hostname: "host-a".to_string(),
             suite: Some("suite-a".to_string()),
             git_commit: Some("abc123".to_string()),
+            context: ReportContext::default(),
             results: names_and_rates
                 .iter()
                 .map(|(name, rate)| result("group", name, *rate))
@@ -1404,5 +1488,113 @@ mod tests {
                 baseline: "suite-b".to_string()
             }
         );
+    }
+
+    #[test]
+    fn runner_and_environment_must_match_exactly() {
+        let mut current = report(&[("a", 100.0)]);
+        let mut baseline = report(&[("a", 100.0)]);
+        current.hostname = "ephemeral-current".to_string();
+        baseline.hostname = "ephemeral-baseline".to_string();
+        current.context = ReportContext::new("stable-runner")
+            .with_environment("accelerator", "GB300")
+            .with_environment("driver", "595.71.05");
+        baseline.context = current.context.clone();
+
+        let comparison = current
+            .compare(&baseline, &ComparisonOptions::default())
+            .unwrap();
+        assert!(comparison.environment.exact_match);
+        assert_eq!(comparison.environment.current_runner_id, "stable-runner");
+
+        baseline
+            .context
+            .environment
+            .insert("driver".to_string(), "595.80.01".to_string());
+        assert!(matches!(
+            current
+                .compare(&baseline, &ComparisonOptions::default())
+                .unwrap_err(),
+            ComparisonError::EnvironmentMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn provenance_does_not_affect_compatibility_and_is_referenced() {
+        let mut current = report(&[("a", 100.0)]);
+        let mut baseline = report(&[("a", 100.0)]);
+        current.context.provenance.insert(
+            "commit".to_string(),
+            "0123456789abcdef0123456789abcdef01234567".to_string(),
+        );
+        baseline
+            .context
+            .provenance
+            .insert("commit".to_string(), "different".to_string());
+
+        let comparison = current
+            .compare(&baseline, &ComparisonOptions::default())
+            .unwrap();
+        assert_eq!(
+            comparison.current.source_provenance["commit"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(comparison.baseline.source_provenance["commit"], "different");
+    }
+
+    #[test]
+    fn environment_override_is_explicit_and_auditable() {
+        let mut current = report(&[("a", 100.0)]);
+        let mut baseline = report(&[("a", 100.0)]);
+        current.context = ReportContext::new("runner-a").with_environment("accelerator", "GB300");
+        baseline.context = ReportContext::new("runner-b").with_environment("accelerator", "B300");
+
+        let comparison = current
+            .compare(
+                &baseline,
+                &ComparisonOptions::default()
+                    .with_environment_override("controlled cross-runner calibration"),
+            )
+            .unwrap();
+        assert!(!comparison.environment.exact_match);
+        assert_eq!(comparison.environment.current_runner_id, "runner-a");
+        assert_eq!(comparison.environment.baseline_runner_id, "runner-b");
+        assert_eq!(
+            comparison
+                .environment
+                .operator_override
+                .as_ref()
+                .unwrap()
+                .reason,
+            "controlled cross-runner calibration"
+        );
+
+        assert_eq!(
+            current
+                .compare(
+                    &baseline,
+                    &ComparisonOptions::default().with_environment_override("  ")
+                )
+                .unwrap_err(),
+            ComparisonError::InvalidEnvironmentOverride
+        );
+    }
+
+    #[test]
+    fn reports_without_context_remain_comparable_by_hostname() {
+        let current = report(&[("a", 100.0)]);
+        let baseline = report(&[("a", 100.0)]);
+        let mut current_json = serde_json::to_value(current).unwrap();
+        let mut baseline_json = serde_json::to_value(baseline).unwrap();
+        current_json.as_object_mut().unwrap().remove("context");
+        baseline_json.as_object_mut().unwrap().remove("context");
+        let current: BenchmarkReport = serde_json::from_value(current_json).unwrap();
+        let baseline: BenchmarkReport = serde_json::from_value(baseline_json).unwrap();
+
+        let comparison = current
+            .compare(&baseline, &ComparisonOptions::default())
+            .unwrap();
+        assert_eq!(comparison.environment.current_runner_id, "host-a");
+        assert!(comparison.environment.exact_match);
     }
 }

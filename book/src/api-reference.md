@@ -17,13 +17,16 @@ Expands to `fn main()` calling `run_benchmark_main`. Supplies the call site's `C
 
 ### `run_benchmark_main` / `BenchmarkMainOptions`
 
-For custom suite name, filter help, comparison policy, or disabling persistence:
+For custom suite name, filter help, comparison policy, report context, explicit
+baseline comparison behavior, or disabling persistence:
 
 ```rust,ignore
 pub struct BenchmarkMainOptions {
     pub suite: Option<String>,
     pub filter_help: Option<String>,
     pub comparison_policy: ComparisonPolicy,
+    pub report_context: Option<ReportContext>,
+    pub explicit_comparison: ComparisonOptions,
     pub save_results: bool,
     pub runtime: BenchmarkRuntimeOptions,
 }
@@ -33,6 +36,10 @@ pub struct BenchmarkMainOptions {
 
 `OUTPUT_PATH_ENVIRONMENT` names the `MICROMEASURE_OUTPUT` environment variable. When set, it
 selects an explicit report path, overrides `save_results`, and makes persistence failure fatal.
+`CONTEXT_FILE_ENVIRONMENT` and `BASELINE_PATH_ENVIRONMENT` name
+`MICROMEASURE_CONTEXT_FILE` and `MICROMEASURE_BASELINE`. Explicit context and
+baseline loading errors are fatal; an explicit baseline never falls back to a
+locally discovered report.
 
 ### `benchmark_filter_from_args` / `benchmark_filter_from_env`
 
@@ -42,7 +49,7 @@ Filter parsing helpers, exposed for custom entry points.
 
 | Type | Purpose | Source |
 |---|---|---|
-| `BenchmarkRunner` | Owns groups, runtime options, filter. Also provides `set_case_cooldown` / `with_case_cooldown` and deterministic case ordering. | `src/bench.rs` |
+| `BenchmarkRunner` | Owns groups, runtime options, filter. Also provides `set_case_cooldown` / `with_case_cooldown`, `try_with_report_context` / `with_report_context`, and deterministic case ordering. | `src/bench.rs` |
 | `BenchmarkGroup<C>` | Fluent builder for single-threaded benches. `throughput`, `factory`, `factory_for_chunk`, `measurement_domain`, `backend`, `bench`, `bench_sample`, `diagnostic_pass`, `diagnostic_samples`. | `src/bench.rs` |
 | `ConcurrentBenchmarkGroup<C>` | Fluent concurrent builder: `sample_duration`, `throughput`, `measurement_domain`, `backend`, `lifecycle`, `metadata`, `factory`, `bench`. | `src/bench.rs` |
 | `BenchmarkCaseOrder` | `Declared` or deterministic `Randomized { seed }`; use with `ordered_case_indices`. | `src/bench.rs` |
@@ -124,18 +131,21 @@ Register with `g.diagnostic_pass(f)` and `g.diagnostic_samples(n)` on a `Benchma
 
 | Type | Purpose | Source |
 |---|---|---|
-| `BenchmarkReport` | Versioned persisted report: `schema_version`, `timestamp`, `hostname`, `suite`, `git_commit`, `results`. Loading, persistence, local summary, and in-memory structured comparison. | `src/session.rs`, `src/comparison.rs` |
+| `BenchmarkReport` | Versioned persisted report: `schema_version`, `timestamp`, `hostname`, `suite`, `git_commit`, resolved `context`, and `results`. Loading, persistence, local summary, and in-memory structured comparison. | `src/session.rs`, `src/comparison.rs` |
+| `ReportContext` | Stable `runner_id`, exact comparison `environment`, and non-comparing `provenance`; load with semantic validation or build fluently. | `src/context.rs` |
+| `ContextError` | Precise I/O, malformed JSON, and invalid context errors. | `src/context.rs` |
 | `REPORT_SCHEMA_VERSION` | JSON report schema emitted by this crate and accepted for persisted comparison. | `src/session.rs` |
 | `BenchmarkResult` | One persisted entry: `name`, `kind`, `execution_index`, metadata, stats, worker summaries. | `src/session.rs` |
 | `BenchmarkKind` | `Standard` / `Concurrent`. | `src/session.rs` |
 | `ComparisonPolicy` | `None` / `LatestCompatible`. | `src/session.rs` |
 | `ReportDocument` / `ReportReference` | Loaded evidence retaining an exact-byte SHA-256 digest, document metadata, source provenance, and optional display path. | `src/comparison.rs` |
-| `ComparisonOptions` | Strict by default; `allow_partial_result_set(true)` reports matching, added, and removed cases. | `src/comparison.rs` |
-| `ComparisonReport` | Versioned, serializable, policy-free comparison with report references, matched cases, unmatched cases, and summary counts. | `src/comparison.rs` |
+| `ComparisonOptions` | Strict by default; `allow_partial_result_set(true)` reports matching, added, and removed cases, while `with_environment_override(reason)` explicitly permits and records an environment mismatch. | `src/comparison.rs` |
+| `EnvironmentOverride` / `EnvironmentComparison` | Operator justification plus both original runner IDs and environment maps retained in the comparison artifact. | `src/comparison.rs` |
+| `ComparisonReport` | Versioned, serializable, policy-free comparison with report references, environment relationship, matched cases, unmatched cases, and summary counts. | `src/comparison.rs` |
 | `BenchmarkCaseIdentity` | Native case identity: group, name, kind, throughput configuration, measurement domain, and metadata. | `src/comparison.rs` |
 | `PrimaryMeasurement` | Normalized measurement kind, unit, direction, and optional finite median value. | `src/comparison.rs` |
 | `MeasurementKind` / `MeasurementDirection` | Machine-readable primary measurement semantics and higher/lower/informational direction. | `src/comparison.rs` |
-| `ReportError` / `ComparisonError` | Structured loading, schema, suite, runner, duplicate-identity, and result-set errors. | `src/comparison.rs` |
+| `ReportError` / `ComparisonError` | Structured loading, schema, suite, runner/environment, override, duplicate-identity, and result-set errors. | `src/comparison.rs` |
 | `COMPARISON_SCHEMA_VERSION` | JSON schema emitted for `ComparisonReport`. | `src/comparison.rs` |
 | `WorkerSummary` | Per-role summary for concurrent benchmarks: `name`, `threads`, `stats`, `counters`. | `src/session.rs` |
 | `WorkerCounterSummary` | Aggregated event counter: `name`, `total`, `per_op`, `per_sec`. | `src/session.rs` |

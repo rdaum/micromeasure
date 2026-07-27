@@ -23,8 +23,8 @@ mod stats;
 
 use crate::session::BenchmarkSession;
 use crate::{
-    Alignment, BenchmarkKind, BenchmarkReport, BenchmarkResult, TableFormatter,
-    WorkerCounterSummary, WorkerSummary,
+    Alignment, BenchmarkKind, BenchmarkReport, BenchmarkResult, ContextError, ReportContext,
+    TableFormatter, WorkerCounterSummary, WorkerSummary,
 };
 #[cfg(target_os = "linux")]
 use affinity::concurrent_worker_pin_cores;
@@ -1529,8 +1529,28 @@ impl BenchmarkRunner {
     }
 
     pub fn with_suite(mut self, suite: impl Into<String>) -> Self {
-        self.session = std::sync::Arc::new(BenchmarkSession::new_with_suite(suite));
+        std::sync::Arc::get_mut(&mut self.session)
+            .expect("benchmark session is not shared while configuring a runner")
+            .set_suite(suite);
         self
+    }
+
+    /// Attach stable runner, comparison-environment, and provenance context.
+    ///
+    /// Context is resolved against locally captured provenance without
+    /// overwriting explicitly supplied keys.
+    pub fn try_with_report_context(mut self, context: ReportContext) -> Result<Self, ContextError> {
+        context.validate()?;
+        std::sync::Arc::get_mut(&mut self.session)
+            .expect("benchmark session is not shared while configuring a runner")
+            .set_context(context);
+        Ok(self)
+    }
+
+    /// Panicking builder counterpart to [`Self::try_with_report_context`].
+    pub fn with_report_context(self, context: ReportContext) -> Self {
+        self.try_with_report_context(context)
+            .unwrap_or_else(|error| panic!("invalid benchmark report context: {error}"))
     }
 
     pub fn with_filter(mut self, filter: Option<&str>) -> Self {
@@ -3091,7 +3111,7 @@ mod tests {
     use super::stats::{median, median_absolute_deviation, percentile, tukey_outlier_count};
     use super::{DiagnosticError, DiagnosticResult, MeasurementDomain, MetricValue, Throughput};
 
-    use crate::BenchmarkStats;
+    use crate::{BenchmarkStats, ReportContext};
 
     fn stats_with_domain(domain: MeasurementDomain) -> BenchmarkStats {
         // A benchmark whose CPU PMU fields would normally trigger the
@@ -3373,6 +3393,26 @@ mod tests {
         let mut runner = crate::BenchmarkRunner::new();
         runner.set_case_cooldown(std::time::Duration::from_millis(25));
         assert_eq!(runner.case_cooldown, std::time::Duration::from_millis(25));
+    }
+
+    #[test]
+    fn suite_and_report_context_builders_are_order_independent() {
+        let context = ReportContext::new("stable-runner").with_environment("accelerator", "GB300");
+        let context_then_suite = crate::BenchmarkRunner::new()
+            .with_report_context(context.clone())
+            .with_suite("suite-a")
+            .report();
+        let suite_then_context = crate::BenchmarkRunner::new()
+            .with_suite("suite-a")
+            .with_report_context(context.clone())
+            .report();
+
+        assert_eq!(context_then_suite.suite.as_deref(), Some("suite-a"));
+        assert_eq!(suite_then_context.suite.as_deref(), Some("suite-a"));
+        assert_eq!(context_then_suite.context.runner_id, "stable-runner");
+        assert_eq!(suite_then_context.context.runner_id, "stable-runner");
+        assert_eq!(context_then_suite.context.environment, context.environment);
+        assert_eq!(suite_then_context.context.environment, context.environment);
     }
 
     #[test]

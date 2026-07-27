@@ -1417,7 +1417,16 @@ fn path_suffix(path: &Option<PathBuf>) -> String {
 }
 
 fn sha256_digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity("sha256:".len() + digest.len() * 2);
+    encoded.push_str("sha256:");
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn finite(value: f64) -> Option<f64> {
@@ -1764,6 +1773,15 @@ mod tests {
         assert_eq!(
             improvement_percent(Some(-5.0), Some(-10.0), MeasurementDirection::Lower),
             Some(-50.0)
+        );
+    }
+
+    #[test]
+    fn report_digest_is_lowercase_sha256() {
+        assert_eq!(
+            sha256_digest(b""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb924\
+             27ae41e4649b934ca495991b7852b855"
         );
     }
 

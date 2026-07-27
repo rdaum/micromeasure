@@ -83,8 +83,10 @@ Add `micromeasure` as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-micromeasure = "0.11"
+micromeasure = "0.12"
 ```
+
+The minimum supported Rust version is 1.95.
 
 Then add a custom bench target in your `Cargo.toml`:
 

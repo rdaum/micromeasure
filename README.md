@@ -83,7 +83,7 @@ Add `micromeasure` as a dev-dependency:
 
 ```toml
 [dev-dependencies]
-micromeasure = "0.12"
+micromeasure = "0.13"
 ```
 
 The minimum supported Rust version is 1.95.

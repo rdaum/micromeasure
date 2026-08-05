@@ -6,10 +6,10 @@ This page walks through wiring `micromeasure` into a crate, writing the smallest
 
 ```toml
 [dev-dependencies]
-micromeasure = "0.12"
+micromeasure = "0.13"
 ```
 
-Micromeasure 0.12 requires Rust 1.95 or newer.
+Micromeasure 0.13 requires Rust 1.95 or newer.
 
 ## 2. Declare a custom bench target with `harness = false`
 

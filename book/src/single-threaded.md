@@ -147,7 +147,7 @@ After the table, a `possible bottlenecks:` block may appear, derived from the PM
 
 ## `bench` vs `bench_sample`
 
-- `g.bench(name, f)` — `f: fn(&mut C, usize, usize)`. The framework derives operation count from `chunk_size` (or `operations_per_chunk()`). Use this for tight CPU loops.
+- `g.bench(name, f)` — `f: fn(&mut C, usize, usize)`. The framework derives operation count from `chunk_size` (or `operations_per_chunk()`). Use this for tight CPU loops. Metrics emitted by its measurement backend, including RAPL energy, are retained.
 - `g.bench_sample(name, f)` — `f: fn(&mut C, usize, usize) -> BenchSampleResult`. The bench explicitly returns its operation count *and* any custom metrics. Use this when the bench knows facts only available after execution (selected algorithm, device time, TFLOP/s). The runner routes `operations` into the normal throughput/latency path and aggregates `metrics` into a `custom metrics:` table. See [GPU Benchmarks](./gpu.md#per-sample-custom-metrics).
 
 Both paths share the same calibration, warm-up, sample count, PMU, and persistence pipeline. `bench_sample` is strictly additive.

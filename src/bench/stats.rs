@@ -1,7 +1,10 @@
 use super::{Results, Throughput, safe_ratio_f64, throughput_ops_per_sec};
 use crate::bench::backend::{MetricFormat, MetricValue};
 use crate::session::{MetricSummary, SampleMetric, SampleMetricSet};
-use crate::{Alignment, BenchmarkStats, BorderColor, MeasurementDomain, PmuScope, TableFormatter};
+use crate::{
+    Alignment, BenchmarkStats, BorderColor, EnergyScope, MeasurementDomain, PmuScope,
+    TableFormatter,
+};
 use std::io::IsTerminal;
 
 pub(super) fn colorize_label(text: &str) -> String {
@@ -40,6 +43,7 @@ pub(super) fn benchmark_stats_from_samples(
     throughput: &Throughput,
     measurement_domain: MeasurementDomain,
     pmu_scope: PmuScope,
+    energy_scope: EnergyScope,
     measurement_label: &str,
     emits_cpu_diagnostics: bool,
     per_sample_metrics: &[Vec<MetricValue>],
@@ -139,6 +143,7 @@ pub(super) fn benchmark_stats_from_samples(
         measurement_domain,
         measurement_label: measurement_label.to_string(),
         pmu_scope,
+        energy_scope,
         emits_cpu_diagnostics,
         metrics: aggregate_metrics(per_sample_metrics),
         sample_metrics: per_sample_metrics
@@ -870,6 +875,7 @@ mod tests {
             &Throughput::ops(),
             MeasurementDomain::Cpu,
             PmuScope::CallingThread,
+            EnergyScope::None,
             "",
             true,
             &[

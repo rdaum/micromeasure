@@ -17,6 +17,12 @@ Do not use it for "run the same CPU bench on N threads and sum the throughput" â
 
 This API owns and measures the worker loops it creates. If one benchmark function instead dispatches into an existing Rayon or other thread pool, keep the standard benchmark API and select `LinuxPerfBackend::process_threads()` or a `LinuxPerfThreadSet`; see [Benchmarks that dispatch to existing worker pools](./linux-pmu.md#benchmarks-that-dispatch-to-existing-worker-pools).
 
+Linux RAPL energy can measure the complete coordinated worker window because
+it is package-wide rather than thread-scoped. Configure the concurrent group
+with `LinuxPerfBackend::new().with_rapl_energy()` to retain worker-local PMU
+counters while adding gross package energy per operation and average power to
+the combined scenario result. See [RAPL energy measurement](./linux-pmu.md#rapl-energy-measurement).
+
 ## The API surface
 
 | Type | Role |

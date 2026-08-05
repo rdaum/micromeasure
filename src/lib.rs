@@ -43,8 +43,9 @@ pub use bench::{
     BenchContext, BenchmarkCaseOrder, BenchmarkRunner, BenchmarkRuntimeOptions,
     ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentBenchmarkGroup, ConcurrentSampleInfo,
     ConcurrentSampleLifecycle, ConcurrentSamplePhase, ConcurrentWorker, ConcurrentWorkerResult,
-    CounterValue, DiagnosticError, DiagnosticResult, MeasurementBackend, MeasurementDomain,
-    MetricFormat, MetricValue, NoContext, PmuScope, Throughput, WallClockBackend,
+    CounterValue, DiagnosticError, DiagnosticResult, EnergyScope, MeasurementBackend,
+    MeasurementDomain, MetricFormat, MetricValue, NoContext, PmuScope, Throughput,
+    WallClockBackend,
 };
 #[cfg(feature = "cuda")]
 pub use bench::{CudaError, CudaEvent, CudaEventBackend, CudaResult};

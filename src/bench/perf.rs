@@ -4,7 +4,7 @@ use super::{
 };
 use crate::bench::backend::{MeasurementBackend, MetricValue};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     sync::{
         Arc,
@@ -14,7 +14,7 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use perf_event::events::{Cache, CacheId, CacheOp, CacheResult, Hardware};
+use perf_event::events::{Cache, CacheId, CacheOp, CacheResult, Dynamic, Hardware};
 #[cfg(target_os = "linux")]
 use perf_event::{Builder, Group};
 #[cfg(target_os = "linux")]
@@ -108,6 +108,277 @@ fn process_thread_ids() -> io::Result<Vec<libc::pid_t>> {
 }
 
 #[cfg(target_os = "linux")]
+fn parse_cpu_list(value: &str) -> Result<Vec<usize>, String> {
+    let mut cpus = BTreeSet::new();
+    for part in value.trim().split(',').filter(|part| !part.is_empty()) {
+        let mut bounds = part.split('-');
+        let start = bounds
+            .next()
+            .ok_or_else(|| format!("invalid CPU list segment '{part}'"))?
+            .parse::<usize>()
+            .map_err(|error| format!("invalid CPU in '{part}': {error}"))?;
+        let end = match bounds.next() {
+            Some(end) => end
+                .parse::<usize>()
+                .map_err(|error| format!("invalid CPU in '{part}': {error}"))?,
+            None => start,
+        };
+        if bounds.next().is_some() || end < start {
+            return Err(format!("invalid CPU range '{part}'"));
+        }
+        cpus.extend(start..=end);
+    }
+    if cpus.is_empty() {
+        return Err("CPU list is empty".to_string());
+    }
+    Ok(cpus.into_iter().collect())
+}
+
+#[cfg(target_os = "linux")]
+fn discover_rapl_event(spec: RaplEventSpec) -> Option<RaplEventConfig> {
+    let pmu_path = format!("/sys/bus/event_source/devices/{}", spec.pmu);
+    let event_path = format!("{pmu_path}/events/{}", spec.event);
+    if !std::path::Path::new(&event_path).is_file() {
+        return None;
+    }
+
+    let cpus = match fs::read_to_string(format!("{pmu_path}/cpumask"))
+        .map_err(|error| error.to_string())
+        .and_then(|value| parse_cpu_list(&value))
+    {
+        Ok(cpus) => cpus,
+        Err(error) => {
+            record_perf_issue(format!(
+                "RAPL event '{}/{}' CPU scope unavailable: {error}",
+                spec.pmu, spec.event
+            ));
+            return None;
+        }
+    };
+
+    let mut dynamic = match Dynamic::builder(spec.pmu) {
+        Ok(dynamic) => dynamic,
+        Err(error) => {
+            record_perf_issue(format!(
+                "RAPL PMU '{}' configuration unavailable: {error}",
+                spec.pmu
+            ));
+            return None;
+        }
+    };
+    if let Err(error) = dynamic.event(spec.event) {
+        record_perf_issue(format!(
+            "RAPL event '{}/{}' configuration unavailable: {error}",
+            spec.pmu, spec.event
+        ));
+        return None;
+    }
+
+    let scale_joules = match dynamic.scale() {
+        Ok(Some(scale)) if scale.is_finite() && scale > 0.0 => scale,
+        Ok(_) => {
+            record_perf_issue(format!(
+                "RAPL event '{}/{}' has no usable Joule scale",
+                spec.pmu, spec.event
+            ));
+            return None;
+        }
+        Err(error) => {
+            record_perf_issue(format!(
+                "RAPL event '{}/{}' scale unavailable: {error}",
+                spec.pmu, spec.event
+            ));
+            return None;
+        }
+    };
+    match dynamic.unit() {
+        Ok(Some(unit)) if unit.eq_ignore_ascii_case("joules") => {}
+        Ok(unit) => {
+            record_perf_issue(format!(
+                "RAPL event '{}/{}' reported unexpected unit {unit:?}",
+                spec.pmu, spec.event
+            ));
+            return None;
+        }
+        Err(error) => {
+            record_perf_issue(format!(
+                "RAPL event '{}/{}' unit unavailable: {error}",
+                spec.pmu, spec.event
+            ));
+            return None;
+        }
+    }
+
+    let event = match dynamic.build() {
+        Ok(event) => event,
+        Err(error) => {
+            record_perf_issue(format!(
+                "RAPL event '{}/{}' could not be configured: {error}",
+                spec.pmu, spec.event
+            ));
+            return None;
+        }
+    };
+    Some(RaplEventConfig {
+        domain: spec.domain,
+        event,
+        scale_joules,
+        cpus,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn discover_rapl_events(scope: crate::EnergyScope) -> Vec<RaplEventConfig> {
+    let mut configs: Vec<_> = RAPL_PACKAGE_EVENTS
+        .iter()
+        .filter_map(|spec| discover_rapl_event(*spec))
+        .collect();
+    if scope == crate::EnergyScope::RaplPackageAndCore {
+        configs.extend(
+            RAPL_CORE_EVENTS
+                .iter()
+                .filter_map(|spec| discover_rapl_event(*spec)),
+        );
+    }
+    configs
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_rapl_measurement(configs: &[RaplEventConfig]) -> RaplMeasurement {
+    let mut measurement = RaplMeasurement::default();
+    for config in configs {
+        for &cpu in &config.cpus {
+            let mut builder = Builder::new(config.event);
+            // RAPL is an uncore/system-wide PMU and advertises
+            // PERF_PMU_CAP_NO_EXCLUDE. perf-event2 defaults to excluding
+            // kernel and hypervisor activity for ordinary CPU events, which
+            // makes RAPL reject the event configuration on affected kernels.
+            builder
+                .any_pid()
+                .one_cpu(cpu)
+                .exclude_kernel(false)
+                .exclude_hv(false);
+            match builder.build() {
+                Ok(counter) => measurement.counters.push(RaplCounter {
+                    domain: config.domain,
+                    scale_joules: config.scale_joules,
+                    counter,
+                }),
+                Err(error) => {
+                    record_perf_issue(format!("RAPL event on CPU {cpu} unavailable: {error}"))
+                }
+            }
+        }
+    }
+    measurement
+}
+
+#[cfg(target_os = "linux")]
+impl RaplMeasurement {
+    fn begin(&mut self) {
+        self.counters.retain_mut(|measurement| {
+            if let Err(error) = measurement.counter.reset() {
+                record_perf_issue(format!("RAPL counter reset failed: {error}"));
+                return false;
+            }
+            if let Err(error) = measurement.counter.enable() {
+                record_perf_issue(format!("RAPL counter enable failed: {error}"));
+                return false;
+            }
+            true
+        });
+    }
+
+    fn end(&mut self) {
+        for measurement in &mut self.counters {
+            if let Err(error) = measurement.counter.disable() {
+                record_perf_issue(format!("RAPL counter disable failed: {error}"));
+            }
+        }
+    }
+
+    fn collect(&mut self) -> BTreeMap<RaplDomain, f64> {
+        let mut joules = BTreeMap::<RaplDomain, f64>::new();
+        for measurement in &mut self.counters {
+            match measurement.counter.read_count_and_time() {
+                Ok(reading) if reading.time_enabled > 0 && reading.time_running > 0 => {
+                    let count = scale_multiplexed_count(
+                        reading.count,
+                        reading.time_enabled,
+                        reading.time_running,
+                    );
+                    *joules.entry(measurement.domain).or_default() +=
+                        count as f64 * measurement.scale_joules;
+                }
+                Ok(_) => record_perf_issue(
+                    "RAPL counter has no usable scheduled window; omitting it".to_string(),
+                ),
+                Err(error) => {
+                    record_perf_issue(format!("RAPL counter read failed: {error}"));
+                }
+            }
+        }
+        joules
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn push_rapl_metrics(
+    joules: &BTreeMap<RaplDomain, f64>,
+    operations: u64,
+    elapsed: Duration,
+    metrics: &mut Vec<MetricValue>,
+) {
+    for (&domain, &energy_joules) in joules {
+        let (per_op_name, joules_name, watts_name) = domain.metric_names();
+        if operations > 0 {
+            metrics.push(
+                MetricValue::new(
+                    per_op_name,
+                    energy_joules * 1_000_000.0 / operations as f64,
+                    "µJ/op",
+                )
+                .with_display_name(match domain {
+                    RaplDomain::Package => "Package energy/op",
+                    RaplDomain::Cores => "CPU cores energy/op",
+                    RaplDomain::Dram => "DRAM energy/op",
+                    RaplDomain::Gpu => "Integrated GPU energy/op",
+                    RaplDomain::Platform => "Platform energy/op",
+                    RaplDomain::Core => "Per-core total energy/op",
+                })
+                .with_section("RAPL energy"),
+            );
+        }
+        metrics.push(
+            MetricValue::new(joules_name, energy_joules, "J")
+                .with_display_name(match domain {
+                    RaplDomain::Package => "Package energy/sample",
+                    RaplDomain::Cores => "CPU cores energy/sample",
+                    RaplDomain::Dram => "DRAM energy/sample",
+                    RaplDomain::Gpu => "Integrated GPU energy/sample",
+                    RaplDomain::Platform => "Platform energy/sample",
+                    RaplDomain::Core => "Per-core total energy/sample",
+                })
+                .with_section("RAPL energy"),
+        );
+        if elapsed > Duration::ZERO {
+            metrics.push(
+                MetricValue::new(watts_name, energy_joules / elapsed.as_secs_f64(), "W")
+                    .with_display_name(match domain {
+                        RaplDomain::Package => "Package power",
+                        RaplDomain::Cores => "CPU cores power",
+                        RaplDomain::Dram => "DRAM power",
+                        RaplDomain::Gpu => "Integrated GPU power",
+                        RaplDomain::Platform => "Platform power",
+                        RaplDomain::Core => "Per-core total power",
+                    })
+                    .with_section("RAPL energy"),
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 enum PerfScope {
     CurrentThread,
@@ -120,6 +391,109 @@ enum PerfScope {
 enum PerfTarget {
     CurrentThread,
     Thread(libc::pid_t),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RaplDomain {
+    Package,
+    Cores,
+    Dram,
+    Gpu,
+    Platform,
+    Core,
+}
+
+#[cfg(target_os = "linux")]
+impl RaplDomain {
+    fn metric_names(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Package => (
+                "rapl_package_uj_per_op",
+                "rapl_package_joules",
+                "rapl_package_watts",
+            ),
+            Self::Cores => (
+                "rapl_cores_uj_per_op",
+                "rapl_cores_joules",
+                "rapl_cores_watts",
+            ),
+            Self::Dram => ("rapl_dram_uj_per_op", "rapl_dram_joules", "rapl_dram_watts"),
+            Self::Gpu => ("rapl_gpu_uj_per_op", "rapl_gpu_joules", "rapl_gpu_watts"),
+            Self::Platform => (
+                "rapl_platform_uj_per_op",
+                "rapl_platform_joules",
+                "rapl_platform_watts",
+            ),
+            Self::Core => ("rapl_core_uj_per_op", "rapl_core_joules", "rapl_core_watts"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct RaplEventSpec {
+    pmu: &'static str,
+    event: &'static str,
+    domain: RaplDomain,
+}
+
+#[cfg(target_os = "linux")]
+const RAPL_PACKAGE_EVENTS: &[RaplEventSpec] = &[
+    RaplEventSpec {
+        pmu: "power",
+        event: "energy-pkg",
+        domain: RaplDomain::Package,
+    },
+    RaplEventSpec {
+        pmu: "power",
+        event: "energy-cores",
+        domain: RaplDomain::Cores,
+    },
+    RaplEventSpec {
+        pmu: "power",
+        event: "energy-ram",
+        domain: RaplDomain::Dram,
+    },
+    RaplEventSpec {
+        pmu: "power",
+        event: "energy-gpu",
+        domain: RaplDomain::Gpu,
+    },
+    RaplEventSpec {
+        pmu: "power",
+        event: "energy-psys",
+        domain: RaplDomain::Platform,
+    },
+];
+
+#[cfg(target_os = "linux")]
+const RAPL_CORE_EVENTS: &[RaplEventSpec] = &[RaplEventSpec {
+    pmu: "power_core",
+    event: "energy-core",
+    domain: RaplDomain::Core,
+}];
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct RaplEventConfig {
+    domain: RaplDomain,
+    event: Dynamic,
+    scale_joules: f64,
+    cpus: Vec<usize>,
+}
+
+#[cfg(target_os = "linux")]
+struct RaplCounter {
+    domain: RaplDomain,
+    scale_joules: f64,
+    counter: perf_event::Counter,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct RaplMeasurement {
+    counters: Vec<RaplCounter>,
 }
 
 #[cfg(target_os = "linux")]
@@ -275,6 +649,31 @@ fn warn_partial_perf_once() {
     }
 
     eprintln!("⚠️  Some PMU counters are unavailable; omitted metrics will not be shown.");
+}
+
+#[cfg(target_os = "linux")]
+fn warn_rapl_unavailable_once() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    eprintln!("⚠️  RAPL energy counters unavailable; continuing without system energy metrics.");
+    eprintln!(
+        "   Check for /sys/bus/event_source/devices/power and system-wide perf access (CAP_PERFMON/CAP_SYS_ADMIN or kernel.perf_event_paranoid < 1)."
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn warn_rapl_core_unavailable_once() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    eprintln!(
+        "⚠️  Per-core RAPL counters unavailable; package/die energy domains will still be measured."
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -721,6 +1120,11 @@ pub struct LinuxPerfBackend {
     scope: PerfScope,
     measurements: Vec<TargetMeasurement>,
     prefer_individual: bool,
+    energy_scope: crate::EnergyScope,
+    rapl_configs: Option<Vec<RaplEventConfig>>,
+    rapl_measurement: Option<RaplMeasurement>,
+    rapl_observed: bool,
+    rapl_core_observed: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -737,6 +1141,11 @@ impl LinuxPerfBackend {
             scope: PerfScope::CurrentThread,
             measurements: Vec::new(),
             prefer_individual: false,
+            energy_scope: crate::EnergyScope::None,
+            rapl_configs: None,
+            rapl_measurement: None,
+            rapl_observed: false,
+            rapl_core_observed: false,
         }
     }
 
@@ -748,6 +1157,11 @@ impl LinuxPerfBackend {
             scope: PerfScope::ProcessThreads,
             measurements: Vec::new(),
             prefer_individual: true,
+            energy_scope: crate::EnergyScope::None,
+            rapl_configs: None,
+            rapl_measurement: None,
+            rapl_observed: false,
+            rapl_core_observed: false,
         }
     }
 
@@ -757,7 +1171,44 @@ impl LinuxPerfBackend {
             scope: PerfScope::RegisteredThreads(threads),
             measurements: Vec::new(),
             prefer_individual: true,
+            energy_scope: crate::EnergyScope::None,
+            rapl_configs: None,
+            rapl_measurement: None,
+            rapl_observed: false,
+            rapl_core_observed: false,
         }
+    }
+
+    /// Add system-wide Linux RAPL energy measurement for every package/die
+    /// domain exposed by the `power` PMU. This commonly includes whole-package
+    /// energy and may also include cores, DRAM, integrated GPU, or platform
+    /// energy depending on the processor.
+    ///
+    /// Energy is measured around each complete sample and reported as gross
+    /// microjoules per operation, Joules per sample, and average Watts. It is
+    /// not attributable to the benchmark process: unrelated activity on the
+    /// measured package is included. Because the scope is system-wide, work
+    /// dispatched to an existing Rayon or other external worker pool is
+    /// included without registering those threads.
+    #[must_use]
+    pub fn with_rapl_energy(mut self) -> Self {
+        self.energy_scope = crate::EnergyScope::RaplPackageDomains;
+        self.rapl_configs = None;
+        self
+    }
+
+    /// Add package/die RAPL domains plus the per-core `power_core` counters
+    /// available on some AMD processors.
+    ///
+    /// This opens one additional event for every CPU listed by the
+    /// `power_core` PMU and sums them into a `Per-core total` metric. Prefer
+    /// [`with_rapl_energy`](Self::with_rapl_energy) unless that extra
+    /// attribution is useful, especially on high-core-count systems.
+    #[must_use]
+    pub fn with_rapl_core_energy(mut self) -> Self {
+        self.energy_scope = crate::EnergyScope::RaplPackageAndCore;
+        self.rapl_configs = None;
+        self
     }
 
     fn targets(&self) -> Vec<PerfTarget> {
@@ -846,6 +1297,7 @@ impl LinuxPerfBackend {
     /// Open all perf-event handles for a future sample without enabling them.
     pub(super) fn prepare(&mut self) {
         self.measurements.clear();
+        self.rapl_measurement = None;
         let targets = self.targets();
         if targets.is_empty() {
             record_perf_issue("PMU scope contains no live threads".to_string());
@@ -857,6 +1309,28 @@ impl LinuxPerfBackend {
                 Self::try_prepare_group(target).unwrap_or_else(|| Self::prepare_individual(target))
             };
             self.measurements.push(TargetMeasurement { target, mode });
+        }
+
+        if self.energy_scope != crate::EnergyScope::None {
+            let configs = self
+                .rapl_configs
+                .get_or_insert_with(|| discover_rapl_events(self.energy_scope));
+            if configs.is_empty() {
+                warn_rapl_unavailable_once();
+            } else {
+                if self.energy_scope == crate::EnergyScope::RaplPackageAndCore
+                    && !configs
+                        .iter()
+                        .any(|config| config.domain == RaplDomain::Core)
+                {
+                    warn_rapl_core_unavailable_once();
+                }
+                let measurement = prepare_rapl_measurement(configs);
+                if measurement.counters.is_empty() {
+                    warn_rapl_unavailable_once();
+                }
+                self.rapl_measurement = Some(measurement);
+            }
         }
     }
 
@@ -900,6 +1374,12 @@ impl LinuxPerfBackend {
                 self.prefer_individual = true;
                 measurement.mode = Self::prepare_individual(measurement.target);
                 let _ = Self::enable_prepared(&mut measurement.mode);
+            }
+        }
+        if let Some(rapl) = &mut self.rapl_measurement {
+            rapl.begin();
+            if rapl.counters.is_empty() {
+                warn_rapl_unavailable_once();
             }
         }
     }
@@ -1140,6 +1620,9 @@ impl MeasurementBackend for LinuxPerfBackend {
                 PerfMode::None | PerfMode::Idle => {}
             }
         }
+        if let Some(rapl) = &mut self.rapl_measurement {
+            rapl.end();
+        }
     }
 
     fn collect(
@@ -1148,7 +1631,7 @@ impl MeasurementBackend for LinuxPerfBackend {
         ops: u64,
         _chunk_index: usize,
         results: &mut Results,
-        _metrics: &mut Vec<MetricValue>,
+        metrics: &mut Vec<MetricValue>,
     ) {
         let mut aggregate = Results::default();
         let mut prefer_individual = self.prefer_individual;
@@ -1172,15 +1655,30 @@ impl MeasurementBackend for LinuxPerfBackend {
         *results = aggregate;
         self.prefer_individual = prefer_individual;
 
+        if let Some(rapl) = &mut self.rapl_measurement {
+            let joules = rapl.collect();
+            if !joules.is_empty() {
+                self.rapl_observed = true;
+                self.rapl_core_observed |= joules.contains_key(&RaplDomain::Core);
+                push_rapl_metrics(&joules, ops, host_elapsed, metrics);
+            }
+        }
+
         // Reset for the next sample window.
         self.measurements.clear();
+        self.rapl_measurement = None;
     }
 
     fn measurement_label(&self) -> &'static str {
-        match self.scope {
-            PerfScope::CurrentThread => "timing + PMU",
-            PerfScope::ProcessThreads => "timing + process-thread PMU",
-            PerfScope::RegisteredThreads(_) => "timing + registered-thread PMU",
+        match (&self.scope, self.rapl_observed) {
+            (PerfScope::CurrentThread, false) => "timing + PMU",
+            (PerfScope::ProcessThreads, false) => "timing + process-thread PMU",
+            (PerfScope::RegisteredThreads(_), false) => "timing + registered-thread PMU",
+            (PerfScope::CurrentThread, true) => "timing + PMU + RAPL energy",
+            (PerfScope::ProcessThreads, true) => "timing + process-thread PMU + RAPL energy",
+            (PerfScope::RegisteredThreads(_), true) => {
+                "timing + registered-thread PMU + RAPL energy"
+            }
         }
     }
 
@@ -1192,6 +1690,20 @@ impl MeasurementBackend for LinuxPerfBackend {
         }
     }
 
+    fn energy_scope(&self) -> crate::EnergyScope {
+        if self.rapl_observed {
+            if self.energy_scope == crate::EnergyScope::RaplPackageAndCore
+                && !self.rapl_core_observed
+            {
+                crate::EnergyScope::RaplPackageDomains
+            } else {
+                self.energy_scope
+            }
+        } else {
+            crate::EnergyScope::None
+        }
+    }
+
     fn emits_cpu_diagnostics(&self) -> bool {
         true
     }
@@ -1200,10 +1712,11 @@ impl MeasurementBackend for LinuxPerfBackend {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{
-        LinuxPerfBackend, LinuxPerfThreadSet, PerfMode, PerfTarget, TargetMeasurement,
-        current_thread_id, process_thread_ids, timing_window,
+        LinuxPerfBackend, LinuxPerfThreadSet, PerfMode, PerfTarget, RaplDomain, TargetMeasurement,
+        current_thread_id, parse_cpu_list, process_thread_ids, push_rapl_metrics, timing_window,
     };
-    use crate::MeasurementBackend;
+    use crate::{EnergyScope, MeasurementBackend};
+    use std::{collections::BTreeMap, time::Duration};
 
     #[test]
     fn prepared_activation_failure_attempts_individual_fallback() {
@@ -1250,6 +1763,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_rapl_cpu_lists() {
+        assert_eq!(parse_cpu_list("0").unwrap(), vec![0]);
+        assert_eq!(
+            parse_cpu_list("0-2,4,8-9\n").unwrap(),
+            vec![0, 1, 2, 4, 8, 9]
+        );
+        assert!(parse_cpu_list("").is_err());
+        assert!(parse_cpu_list("3-1").is_err());
+        assert!(parse_cpu_list("0-1-2").is_err());
+    }
+
+    #[test]
+    fn rapl_metrics_are_normalized_per_operation_and_time() {
+        let mut joules = BTreeMap::new();
+        joules.insert(RaplDomain::Package, 0.25);
+        let mut metrics = Vec::new();
+        push_rapl_metrics(&joules, 100_000, Duration::from_millis(50), &mut metrics);
+
+        let value = |name| {
+            metrics
+                .iter()
+                .find(|metric| metric.name == name)
+                .map(|metric| metric.value)
+                .unwrap()
+        };
+        assert!((value("rapl_package_uj_per_op") - 2.5).abs() < f64::EPSILON);
+        assert!((value("rapl_package_joules") - 0.25).abs() < f64::EPSILON);
+        assert!((value("rapl_package_watts") - 5.0).abs() < f64::EPSILON);
+        assert!(metrics.iter().all(|metric| metric.section == "RAPL energy"));
+    }
+
+    #[test]
     fn public_scopes_have_distinct_persisted_identity() {
         let current = LinuxPerfBackend::new();
         let process = LinuxPerfBackend::process_threads();
@@ -1260,5 +1805,20 @@ mod tests {
         assert_eq!(registered.pmu_scope(), crate::PmuScope::RegisteredThreads);
         assert_ne!(current.measurement_label(), process.measurement_label());
         assert_ne!(process.measurement_label(), registered.measurement_label());
+    }
+
+    #[test]
+    fn public_rapl_builders_have_distinct_persisted_identity() {
+        let package = LinuxPerfBackend::new().with_rapl_energy();
+        let mut core = LinuxPerfBackend::new().with_rapl_core_energy();
+
+        assert_eq!(package.energy_scope, EnergyScope::RaplPackageDomains);
+        assert_eq!(core.energy_scope, EnergyScope::RaplPackageAndCore);
+        assert_eq!(package.energy_scope(), EnergyScope::None);
+        assert_eq!(core.energy_scope(), EnergyScope::None);
+        core.rapl_observed = true;
+        assert_eq!(core.energy_scope(), EnergyScope::RaplPackageDomains);
+        core.rapl_core_observed = true;
+        assert_eq!(core.energy_scope(), EnergyScope::RaplPackageAndCore);
     }
 }

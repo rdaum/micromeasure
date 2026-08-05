@@ -67,6 +67,73 @@ The PMU `scheduled` line reports `time_running / time_enabled` as a percentage. 
 
 Counters with no usable scheduled window are omitted rather than rendered as meaningful zeroes.
 
+## RAPL energy measurement
+
+On supported Intel and AMD processors, Linux exposes Running Average Power
+Limit (RAPL) energy estimates as system-wide perf PMUs. Opt an ordinary
+benchmark into every package/die-scoped domain exposed by the `power` PMU:
+
+```rust,ignore
+use micromeasure::LinuxPerfBackend;
+
+g.backend(|| Box::new(LinuxPerfBackend::new().with_rapl_energy()))
+    .bench("parse record", parse_record);
+```
+
+Micromeasure enables the energy counters around the complete sample, converts
+the kernel count using its advertised Joule scale, and divides by the sample's
+operation count. Each available domain produces three metrics:
+
+- gross energy per operation in `µJ/op`
+- gross energy for the sample in Joules
+- average power during the sample in Watts
+
+Hardware decides which domains exist. `energy-pkg` is the most common;
+`energy-cores`, `energy-ram`, `energy-gpu`, and `energy-psys` appear only on
+processors that implement them. `with_rapl_core_energy()` requests all of the
+package/die domains and additionally sums the per-core `power_core` counters
+available on some AMD systems. Because that needs one extra file descriptor
+per advertised core, prefer `with_rapl_energy()` unless the core total is
+useful.
+
+RAPL is system-wide, not process-attributed. Package energy includes the
+benchmark, other processes, kernel work, and the package's baseline idle
+energy. The reported `µJ/op` is therefore a gross amortized estimate, not an
+exclusive charge to the benchmark process. Use a quiet machine, keep workers
+on the intended packages, and choose samples long enough for the workload's
+energy delta to dominate counter quantization and background noise.
+
+Unlike calling-thread PMU counters, RAPL naturally includes computation sent
+to an existing Rayon or other external worker pool. A normal `bench(...)`
+using `with_rapl_energy()` therefore covers the workers' package energy without
+thread registration. It still cannot attribute that energy to individual
+threads, roles, or even exclusively to the benchmark process.
+
+For a coordinated concurrent group, the backend brackets the complete worker
+window:
+
+```rust,ignore
+g.backend(|| Box::new(LinuxPerfBackend::new().with_rapl_energy()))
+    .sample_duration(Duration::from_millis(100))
+    .bench("readers and writers", &workers);
+```
+
+CPU PMU counters remain sourced from micromeasure's managed workers. RAPL
+energy is reported only on the combined scenario result and is divided by the
+total operations across those workers. For heterogeneous roles, interpret
+that number only when a combined operation has a useful meaning; Joules per
+sample and Watts remain valid regardless.
+
+RAPL events require system-wide perf access, which is usually stricter than
+calling-thread PMU access. Expect to need `CAP_PERFMON`, `CAP_SYS_ADMIN`, or a
+`kernel.perf_event_paranoid` value below `1`. Missing PMUs or insufficient
+permissions produce a one-time warning and the benchmark continues without
+energy metrics.
+
+The selected [`EnergyScope`](https://docs.rs/micromeasure/latest/micromeasure/enum.EnergyScope.html)
+is persisted independently of `PmuScope`. Runs with no energy, package/die
+RAPL, and package-plus-core RAPL are not treated as comparison-compatible.
+
 ## Benchmarks that dispatch to existing worker pools
 
 The default [`LinuxPerfBackend`](https://docs.rs/micromeasure/latest/micromeasure/struct.LinuxPerfBackend.html) measures only the calling benchmark thread. If the measured function dispatches its real work to an already initialized Rayon or other worker pool, choose one of the explicit multi-thread scopes.

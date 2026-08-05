@@ -52,8 +52,8 @@ use std::{
 };
 
 pub use backend::{
-    DiagnosticError, DiagnosticResult, MeasurementBackend, MeasurementDomain, MetricFormat,
-    MetricValue, PmuScope, WallClockBackend,
+    DiagnosticError, DiagnosticResult, EnergyScope, MeasurementBackend, MeasurementDomain,
+    MetricFormat, MetricValue, PmuScope, WallClockBackend,
 };
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaError, CudaEvent, CudaEventBackend, CudaResult};
@@ -688,6 +688,24 @@ fn render_result_section(
 }
 
 fn effective_measurement_label(stats: &crate::BenchmarkStats, has_perf: bool) -> String {
+    let has_rapl_energy = stats.energy_scope != EnergyScope::None
+        && stats
+            .metrics
+            .iter()
+            .any(|metric| metric.name.starts_with("rapl_"));
+    if has_rapl_energy {
+        if !has_perf {
+            return "timing + RAPL energy".to_string();
+        }
+        let pmu = match stats.pmu_scope {
+            PmuScope::CallingThread => "PMU",
+            PmuScope::ProcessThreads => "process-thread PMU",
+            PmuScope::RegisteredThreads => "registered-thread PMU",
+            PmuScope::ManagedWorkers => "managed-worker PMU",
+        };
+        return format!("timing + {pmu} + RAPL energy");
+    }
+
     if !stats.measurement_label.is_empty() {
         if !has_perf
             && matches!(
@@ -1172,12 +1190,8 @@ fn execute_concurrent_timing_only_measurement(
 }
 
 /// Sample execution path for `bench(...)` benchmarks. The bench function
-/// returns no metrics; any metrics pushed by the backend via
-/// [`MeasurementBackend::collect`] are **dropped** here intentionally.
-///
-/// To capture backend-pushed metrics (e.g. `cuda_event_ms` from a CUDA
-/// event backend), use [`execute_standard_sample_with_metrics`] instead,
-/// which is the execution path behind `bench_sample(...)`.
+/// returns no metrics, but metrics pushed by the backend via
+/// [`MeasurementBackend::collect`] are retained.
 fn execute_standard_sample<T: BenchContext>(
     f: &BenchFunction<T>,
     prepared: &mut T,
@@ -1185,7 +1199,7 @@ fn execute_standard_sample<T: BenchContext>(
     chunk_num: usize,
     ops: u64,
     backend: &mut dyn MeasurementBackend,
-) -> Results {
+) -> (Results, Vec<MetricValue>) {
     backend.begin();
     let start = Instant::now();
     black_box(|| f(prepared, chunk_size, chunk_num))();
@@ -1195,11 +1209,7 @@ fn execute_standard_sample<T: BenchContext>(
     let mut results = Results::default();
     let mut metrics = Vec::new();
     backend.collect(host_elapsed, ops, chunk_num, &mut results, &mut metrics);
-    // Intentionally dropped: bench() does not capture per-sample custom
-    // metrics. Use bench_sample() to capture both bench-function metrics
-    // (from BenchSampleResult) and backend-pushed metrics.
-    drop(metrics);
-    results
+    (results, metrics)
 }
 
 /// Sample execution path for `bench_sample` benchmarks whose function
@@ -1444,8 +1454,10 @@ fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
 }
 
 /// A concurrent backend owns the scenario timing window while worker-local
-/// PMU measurements remain the source of host-orchestration counters. Replace
-/// only fields the backend explicitly populated.
+/// PMU measurements remain the source of CPU counters. Only timing and
+/// operation bookkeeping may be replaced here; backend-specific observations
+/// flow through `MetricValue`. This prevents a coordinator-thread backend from
+/// overwriting the counters collected on the managed workers.
 fn apply_concurrent_backend_results(results: &mut Results, backend: Results) {
     if backend.duration > Duration::ZERO {
         results.duration = backend.duration;
@@ -1455,30 +1467,6 @@ fn apply_concurrent_backend_results(results: &mut Results, backend: Results) {
     }
     if backend.chunks_executed > 0 {
         results.chunks_executed = backend.chunks_executed;
-    }
-
-    macro_rules! replace_counter {
-        ($has:ident, $value:ident) => {
-            if backend.$has {
-                results.$has = true;
-                results.$value = backend.$value;
-            }
-        };
-    }
-    replace_counter!(has_cycles, cycles);
-    replace_counter!(has_instructions, instructions);
-    replace_counter!(has_cache_references, cache_references);
-    replace_counter!(has_l1i_misses, l1i_misses);
-    replace_counter!(has_branches, branches);
-    replace_counter!(has_branch_misses, branch_misses);
-    replace_counter!(has_cache_misses, cache_misses);
-    replace_counter!(has_stalled_cycles_frontend, stalled_cycles_frontend);
-    replace_counter!(has_stalled_cycles_backend, stalled_cycles_backend);
-    if backend.pmu_time_enabled_ns > 0 {
-        results.pmu_time_enabled_ns = backend.pmu_time_enabled_ns;
-    }
-    if backend.pmu_time_running_ns > 0 {
-        results.pmu_time_running_ns = backend.pmu_time_running_ns;
     }
 }
 
@@ -1752,12 +1740,12 @@ impl BenchmarkRunner {
         let mut all_results = Vec::with_capacity(config.target_samples);
         let mut summed_results = Results::default();
         let mut running_throughput = config.estimated_throughput_per_sec;
-        let mut all_metrics: Vec<Vec<MetricValue>> = vec![Vec::new(); config.target_samples];
+        let mut all_metrics: Vec<Vec<MetricValue>> = Vec::with_capacity(config.target_samples);
 
         for sample in 0..config.target_samples {
             let mut prepared = factory(config.chunk_size);
             let ops = T::operations_per_chunk().unwrap_or(config.chunk_size as u64);
-            let sample_result = execute_standard_sample(
+            let (sample_result, sample_metrics) = execute_standard_sample(
                 &f,
                 &mut prepared,
                 config.chunk_size,
@@ -1769,6 +1757,7 @@ impl BenchmarkRunner {
             update_running_throughput(&mut running_throughput, &sample_result, &throughput);
             summed_results.add(&sample_result);
             all_results.push(sample_result);
+            all_metrics.push(sample_metrics);
 
             if sample % 2 == 0 || sample == config.target_samples - 1 {
                 update_progress_bar(
@@ -1803,6 +1792,7 @@ impl BenchmarkRunner {
             &throughput,
             measurement_domain,
             backend.pmu_scope(),
+            backend.energy_scope(),
             backend.measurement_label(),
             backend.emits_cpu_diagnostics(),
             &all_metrics,
@@ -1965,6 +1955,7 @@ impl BenchmarkRunner {
             &throughput,
             measurement_domain,
             backend.pmu_scope(),
+            backend.energy_scope(),
             backend.measurement_label(),
             backend.emits_cpu_diagnostics(),
             &all_metrics,
@@ -2189,6 +2180,18 @@ impl BenchmarkRunner {
         clear_line();
         println!("  samples complete: {}", config.target_samples);
 
+        let energy_scope = backend
+            .as_deref()
+            .map(MeasurementBackend::energy_scope)
+            .unwrap_or(EnergyScope::None);
+        let measurement_label = if energy_scope != EnergyScope::None {
+            "timing + managed-worker PMU + RAPL energy"
+        } else {
+            backend
+                .as_deref()
+                .map(MeasurementBackend::measurement_label)
+                .unwrap_or("")
+        };
         let stats = benchmark_stats_from_samples(
             &summed_results,
             &all_results,
@@ -2196,10 +2199,8 @@ impl BenchmarkRunner {
             &throughput,
             measurement_domain,
             PmuScope::ManagedWorkers,
-            backend
-                .as_deref()
-                .map(MeasurementBackend::measurement_label)
-                .unwrap_or(""),
+            energy_scope,
+            measurement_label,
             backend
                 .as_deref()
                 .map(MeasurementBackend::emits_cpu_diagnostics)
@@ -2220,6 +2221,7 @@ impl BenchmarkRunner {
                         &throughput,
                         measurement_domain,
                         PmuScope::ManagedWorkers,
+                        EnergyScope::None,
                         "",
                         true,
                         &[],
@@ -3127,7 +3129,7 @@ mod tests {
     use super::stats::{median, median_absolute_deviation, percentile, tukey_outlier_count};
     use super::{DiagnosticError, DiagnosticResult, MeasurementDomain, MetricValue, Throughput};
 
-    use crate::{BenchmarkStats, PmuScope, ReportContext};
+    use crate::{BenchmarkStats, EnergyScope, PmuScope, ReportContext};
 
     fn stats_with_domain(domain: MeasurementDomain) -> BenchmarkStats {
         // A benchmark whose CPU PMU fields would normally trigger the
@@ -3177,6 +3179,7 @@ mod tests {
             measurement_domain: domain,
             measurement_label: String::new(),
             pmu_scope: PmuScope::CallingThread,
+            energy_scope: EnergyScope::None,
             emits_cpu_diagnostics: true,
             metrics: Vec::new(),
             sample_metrics: Vec::new(),
@@ -3202,6 +3205,41 @@ mod tests {
             super::effective_measurement_label(&stats, false),
             "timing only"
         );
+    }
+
+    #[test]
+    fn concurrent_backend_does_not_replace_worker_pmu_counters() {
+        use std::time::Duration;
+
+        let mut workers = super::Results {
+            cycles: 100,
+            instructions: 50,
+            has_cycles: true,
+            has_instructions: true,
+            pmu_time_enabled_ns: 1_000,
+            pmu_time_running_ns: 800,
+            ..super::Results::default()
+        };
+        let backend = super::Results {
+            duration: Duration::from_millis(50),
+            iterations: 10,
+            chunks_executed: 1,
+            cycles: 9_999,
+            instructions: 9_999,
+            has_cycles: true,
+            has_instructions: true,
+            pmu_time_enabled_ns: 2_000,
+            pmu_time_running_ns: 2_000,
+            ..super::Results::default()
+        };
+
+        super::apply_concurrent_backend_results(&mut workers, backend);
+        assert_eq!(workers.cycles, 100);
+        assert_eq!(workers.instructions, 50);
+        assert_eq!(workers.pmu_time_enabled_ns, 1_000);
+        assert_eq!(workers.pmu_time_running_ns, 800);
+        assert_eq!(workers.duration, Duration::from_millis(50));
+        assert_eq!(workers.iterations, 10);
     }
 
     #[test]
@@ -3839,6 +3877,55 @@ mod tests {
             "expected cuda_event_ms in {names:?}"
         );
         assert!(names.contains(&"tflops"), "expected tflops in {names:?}");
+    }
+
+    #[test]
+    fn plain_bench_retains_backend_metrics() {
+        use std::time::Duration;
+
+        struct DummyCtx;
+        struct MetricBackend;
+
+        impl crate::BenchContext for DummyCtx {
+            fn prepare(_chunk_size: usize) -> Self {
+                Self
+            }
+        }
+
+        impl crate::MeasurementBackend for MetricBackend {
+            fn begin(&mut self) {}
+
+            fn end(&mut self) {}
+
+            fn collect(
+                &mut self,
+                host_elapsed: Duration,
+                operations: u64,
+                _sample_index: usize,
+                results: &mut super::Results,
+                metrics: &mut Vec<MetricValue>,
+            ) {
+                results.duration = host_elapsed;
+                results.iterations = operations;
+                results.chunks_executed = 1;
+                metrics.push(MetricValue::new("backend_energy", 2.5, "µJ/op"));
+            }
+        }
+
+        fn bench(_ctx: &mut DummyCtx, _chunk_size: usize, _chunk_num: usize) {}
+
+        let mut backend = MetricBackend;
+        let (results, metrics) = super::execute_standard_sample(
+            &(bench as super::BenchFunction<DummyCtx>),
+            &mut DummyCtx,
+            10,
+            0,
+            10,
+            &mut backend,
+        );
+        assert_eq!(results.iterations, 10);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, "backend_energy");
     }
 
     #[test]

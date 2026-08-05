@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    Alignment, MeasurementDomain, MetricFormat, PmuScope, ReportContext, TableFormatter,
-    Throughput, comparison::pair_results_one_to_one,
+    Alignment, EnergyScope, MeasurementDomain, MetricFormat, PmuScope, ReportContext,
+    TableFormatter, Throughput, comparison::pair_results_one_to_one,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -125,6 +125,10 @@ pub struct BenchmarkStats {
     /// calling-thread behavior when loading older reports.
     #[serde(default)]
     pub pmu_scope: PmuScope,
+    /// System energy scope used for energy metrics. RAPL is system-wide and
+    /// therefore separate from the thread-oriented `pmu_scope`.
+    #[serde(default)]
+    pub energy_scope: EnergyScope,
     /// When false, the backend has declared it does not emit CPU-PMU
     /// diagnostics (e.g. a GPU CUDA event backend). The runner suppresses
     /// CPU-PMU bottleneck diagnostics regardless of
@@ -141,9 +145,9 @@ pub struct BenchmarkStats {
     /// Aggregated custom per-sample metrics (mean, median, p95, min, max),
     /// one entry per `(name, unit)` pair reported by a
     /// [`crate::BenchSampleResult`]-returning benchmark. Empty for
-    /// benchmarks that use the plain `bench(...)` API; populated by
-    /// `bench_sample(...)`, concurrent lifecycle hooks/backends, and
-    /// diagnostic passes. Persisted to JSON and rendered as a
+    /// benchmarks that use the plain `bench(...)` API without a metric-emitting
+    /// backend; populated by `bench_sample(...)`, measurement backends,
+    /// concurrent lifecycle hooks, and diagnostic passes. Persisted to JSON and rendered as a
     /// `custom metrics:` table beneath the standard stats table.
     #[serde(default)]
     pub metrics: Vec<MetricSummary>,
@@ -1574,6 +1578,7 @@ mod tests {
                 measurement_domain: MeasurementDomain::Cpu,
                 measurement_label: String::new(),
                 pmu_scope: PmuScope::CallingThread,
+                energy_scope: EnergyScope::None,
                 emits_cpu_diagnostics: true,
                 metrics: Vec::new(),
                 sample_metrics: Vec::new(),

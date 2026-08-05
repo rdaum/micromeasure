@@ -375,6 +375,23 @@ pub enum PmuScope {
     ManagedWorkers,
 }
 
+/// System energy scope used for a persisted benchmark result.
+///
+/// RAPL counters are system-wide energy estimates rather than process- or
+/// thread-attributed PMU events. Results captured with different energy scopes
+/// are therefore not comparison-compatible.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnergyScope {
+    /// No system energy counters were requested.
+    #[default]
+    None,
+    /// Package/die-scoped domains exposed by Linux's `power` RAPL PMU.
+    RaplPackageDomains,
+    /// Package/die domains plus per-core counters from the `power_core` PMU.
+    RaplPackageAndCore,
+}
+
 /// Pluggable measurement window for one sample of one benchmark.
 ///
 /// A backend owns whatever domain-specific state it needs across a single
@@ -570,6 +587,12 @@ pub trait MeasurementBackend {
     /// being compared. Non-PMU backends may keep the calling-thread default.
     fn pmu_scope(&self) -> PmuScope {
         PmuScope::CallingThread
+    }
+
+    /// Persisted system-energy scope used to keep unlike measurements from
+    /// being compared. The default records that no energy source was enabled.
+    fn energy_scope(&self) -> EnergyScope {
+        EnergyScope::None
     }
 
     /// Hints the runner whether CPU-PMU bottleneck diagnostics derived from

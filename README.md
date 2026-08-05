@@ -21,6 +21,7 @@ questions were about tiny operations and internal data-structure mechanics. The 
 That means:
 
 - direct Linux perf counter (PMU) integration as a first-class feature
+- optional Linux RAPL energy measurement in Joules, Watts, and microjoules per operation
 - simple hand-written microbench drivers, not macro-heavy harness structure
 - output that emphasizes instruction count, branch behaviour, cache misses, and timing together
 - benchmark binaries that can be filtered and run directly during systems work
@@ -43,7 +44,7 @@ Quick orientation:
 - [Single-Threaded Benchmarks](./book/src/single-threaded.md)
 - [Concurrent Benchmarks](./book/src/concurrent.md)
 - [GPU Benchmarks](./book/src/gpu.md) — measurement domain, pluggable backend, custom metrics, GPU counters, diagnostic replay
-- [Linux PMU Setup](./book/src/linux-pmu.md) — `perf_event_paranoid`, capabilities, fallback
+- [Linux PMU Setup](./book/src/linux-pmu.md) — PMU scopes, RAPL energy, permissions, and fallback
 - [Persisted Reports & Comparison](./book/src/reports.md)
 - [External Sample Series](./book/src/series-reports.md) — portable raw samples, dimensions, provenance, and validity
 - [Regression Policy & Rendering](./book/src/policy-and-rendering.md) — material-change policy, stability findings, terminal/Markdown/JSON output, and exit status

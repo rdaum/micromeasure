@@ -17,6 +17,7 @@
   - [factory_builder](./examples/factory-builder.md)
   - [concurrent_scenario](./examples/concurrent-scenario.md)
   - [concurrent_counters](./examples/concurrent-counters.md)
+  - [rapl_energy](./examples/rapl-energy.md)
   - [gpu_domain](./examples/gpu-domain.md)
   - [mixed_domain](./examples/mixed-domain.md)
   - [custom_metrics](./examples/custom-metrics.md)

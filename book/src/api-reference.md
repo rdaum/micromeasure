@@ -90,12 +90,13 @@ Throughput::per_operation(amount, unit)    // arbitrary unit
 
 | Type | Purpose | Source |
 |---|---|---|
-| `MeasurementBackend` | Object-safe trait: `begin`, `end`, `collect`, `measurement_label`, `pmu_scope`, `energy_scope`, `emits_cpu_diagnostics`. | `src/bench/backend.rs` |
+| `MeasurementBackend` | Object-safe trait: `begin`, `end`, `collect`, `measurement_label`, `pmu_scope`, `pmu_counter_profile`, `energy_scope`, `emits_cpu_diagnostics`. | `src/bench/backend.rs` |
 | `MeasurementDomain` | `Cpu` / `Gpu` / `Io` / `Mixed`. | `src/bench/backend.rs` |
 | `PmuScope` | Persisted PMU identity: `CallingThread`, `ProcessThreads`, `RegisteredThreads`, or `ManagedWorkers`. | `src/bench/backend.rs` |
+| `PmuCounterProfile` | CPU event set: `Full`, `Compact` (cycles, instructions, branches, branch misses), or `None`. | `src/bench/backend.rs` |
 | `EnergyScope` | Persisted system-energy identity: `None`, `RaplPackageDomains`, or `RaplPackageAndCore`. | `src/bench/backend.rs` |
 | `WallClockBackend` | Timing-only fallback. | `src/bench/backend.rs` |
-| `LinuxPerfBackend` | Linux default. Calling-thread scope by default; `process_threads()` and `registered_threads(...)` cover existing external workers. `with_rapl_energy()` adds package/die domains and `with_rapl_core_energy()` also requests per-core energy. Linux only. | `src/bench/perf.rs` |
+| `LinuxPerfBackend` | Linux default. Calling-thread scope by default; `process_threads()` and `registered_threads(...)` cover existing external workers. `with_compact_counters()` reduces the CPU event set, while `without_cpu_counters()` supports timing/RAPL-only runs. `with_rapl_energy()` adds package/die domains and `with_rapl_core_energy()` also requests per-core energy. Linux only. | `src/bench/perf.rs` |
 | `LinuxPerfThreadSet` | Reusable registered worker set; `register_current`, `unregister_current`, `len`, `is_empty`. Linux only. | `src/bench/perf.rs` |
 | `PerfCounters` | Low-level perf counter handle. Linux only. | `src/bench/perf.rs` |
 | `CudaEventBackend` | CUDA event timing on default stream. `cuda` feature. | `src/bench/cuda.rs` |

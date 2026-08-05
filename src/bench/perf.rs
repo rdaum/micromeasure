@@ -2,7 +2,7 @@ use super::{
     ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorkerMeasurement,
     ConcurrentWorkerResult, Results, safe_ratio_f64,
 };
-use crate::bench::backend::{MeasurementBackend, MetricValue};
+use crate::bench::backend::{MeasurementBackend, MetricValue, PmuCounterProfile};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
@@ -20,7 +20,16 @@ use perf_event::{Builder, Group};
 #[cfg(target_os = "linux")]
 use std::sync::{Mutex, OnceLock};
 
-const MIN_PMU_SCHEDULED_PERCENT: f64 = 90.0;
+const DIRECT_PMU_SCHEDULED_PERCENT: f64 = 90.0;
+const MIN_RELIABLE_PMU_SCHEDULED_PERCENT: f64 = 25.0;
+const MIN_RELIABLE_PMU_RUNNING_TIME: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PmuQuality {
+    Direct,
+    Multiplexed,
+    Unreliable,
+}
 
 /// A reusable set of Linux thread IDs for targeted PMU measurement.
 ///
@@ -519,11 +528,34 @@ struct PerfGroupCounters {
     stalled_cycles_backend: Option<perf_event::Counter>,
 }
 
+impl PmuCounterProfile {
+    fn collects_cpu_counters(self) -> bool {
+        self != Self::None
+    }
+
+    fn collects_extended_counters(self) -> bool {
+        self == Self::Full
+    }
+}
+
 pub(super) fn pmu_scheduled_percent(results: &Results) -> f64 {
     safe_ratio_f64(
         results.pmu_time_running_ns as f64,
         results.pmu_time_enabled_ns as f64,
     ) * 100.0
+}
+
+fn pmu_quality(results: &Results) -> PmuQuality {
+    let scheduled_percent = pmu_scheduled_percent(results);
+    if scheduled_percent >= DIRECT_PMU_SCHEDULED_PERCENT {
+        PmuQuality::Direct
+    } else if scheduled_percent < MIN_RELIABLE_PMU_SCHEDULED_PERCENT
+        || results.pmu_time_running_ns < MIN_RELIABLE_PMU_RUNNING_TIME.as_nanos() as u64
+    {
+        PmuQuality::Unreliable
+    } else {
+        PmuQuality::Multiplexed
+    }
 }
 
 pub(super) fn enforce_pmu_quality(name: &str, has_perf_counters: bool, results: &Results) {
@@ -532,10 +564,15 @@ pub(super) fn enforce_pmu_quality(name: &str, has_perf_counters: bool, results: 
     }
 
     let scheduled_percent = pmu_scheduled_percent(results);
-    if scheduled_percent < MIN_PMU_SCHEDULED_PERCENT {
-        eprintln!(
-            "⚠️ PMU counters were scheduled too little for benchmark '{name}': {scheduled_percent:.1}% < {MIN_PMU_SCHEDULED_PERCENT:.1}%; scaled values may be unreliable"
-        );
+    let running_ms = results.pmu_time_running_ns as f64 / 1_000_000.0;
+    match pmu_quality(results) {
+        PmuQuality::Direct => {}
+        PmuQuality::Multiplexed => eprintln!(
+            "ℹ️ PMU counters were multiplexed for benchmark '{name}': {scheduled_percent:.1}% scheduled ({running_ms:.1} ms least-counter running time per sample); values were scaled"
+        ),
+        PmuQuality::Unreliable => eprintln!(
+            "⚠️ PMU counter coverage was too low for benchmark '{name}': {scheduled_percent:.1}% scheduled ({running_ms:.1} ms least-counter running time per sample); scaled values may be unreliable"
+        ),
     }
 }
 
@@ -760,7 +797,13 @@ fn try_build_l1i_counter(target: PerfTarget) -> Option<perf_event::Counter> {
 }
 
 #[cfg(target_os = "linux")]
-fn build_perf_counter_group(target: PerfTarget) -> Option<PerfGroupCounters> {
+fn build_perf_counter_group(
+    target: PerfTarget,
+    profile: PmuCounterProfile,
+) -> Option<PerfGroupCounters> {
+    if !profile.collects_cpu_counters() {
+        return None;
+    }
     let mut group_builder = Group::builder();
     target.configure(&mut group_builder);
     let mut group = match group_builder.build_group() {
@@ -774,13 +817,21 @@ fn build_perf_counter_group(target: PerfTarget) -> Option<PerfGroupCounters> {
     let cycles = try_add_group_counter(&mut group, Hardware::CPU_CYCLES, "cycles", target);
     let instructions =
         try_add_group_counter(&mut group, Hardware::INSTRUCTIONS, "instructions", target);
-    let cache_references = try_add_group_counter(
-        &mut group,
-        Hardware::CACHE_REFERENCES,
-        "cache-references",
-        target,
-    );
-    let l1i_misses = try_add_l1i_group_counter(&mut group, target);
+    let cache_references = if profile.collects_extended_counters() {
+        try_add_group_counter(
+            &mut group,
+            Hardware::CACHE_REFERENCES,
+            "cache-references",
+            target,
+        )
+    } else {
+        None
+    };
+    let l1i_misses = if profile.collects_extended_counters() {
+        try_add_l1i_group_counter(&mut group, target)
+    } else {
+        None
+    };
     let branches = try_add_group_counter(
         &mut group,
         Hardware::BRANCH_INSTRUCTIONS,
@@ -789,20 +840,31 @@ fn build_perf_counter_group(target: PerfTarget) -> Option<PerfGroupCounters> {
     );
     let branch_misses =
         try_add_group_counter(&mut group, Hardware::BRANCH_MISSES, "branch-misses", target);
-    let cache_misses =
-        try_add_group_counter(&mut group, Hardware::CACHE_MISSES, "cache-misses", target);
-    let stalled_cycles_frontend = try_add_group_counter(
-        &mut group,
-        Hardware::STALLED_CYCLES_FRONTEND,
-        "stalled-cycles-frontend",
-        target,
-    );
-    let stalled_cycles_backend = try_add_group_counter(
-        &mut group,
-        Hardware::STALLED_CYCLES_BACKEND,
-        "stalled-cycles-backend",
-        target,
-    );
+    let cache_misses = if profile.collects_extended_counters() {
+        try_add_group_counter(&mut group, Hardware::CACHE_MISSES, "cache-misses", target)
+    } else {
+        None
+    };
+    let stalled_cycles_frontend = if profile.collects_extended_counters() {
+        try_add_group_counter(
+            &mut group,
+            Hardware::STALLED_CYCLES_FRONTEND,
+            "stalled-cycles-frontend",
+            target,
+        )
+    } else {
+        None
+    };
+    let stalled_cycles_backend = if profile.collects_extended_counters() {
+        try_add_group_counter(
+            &mut group,
+            Hardware::STALLED_CYCLES_BACKEND,
+            "stalled-cycles-backend",
+            target,
+        )
+    } else {
+        None
+    };
 
     if cycles.is_none()
         && instructions.is_none()
@@ -920,8 +982,10 @@ fn timing_window(timing_candidates: &[(u64, u64)]) -> (u64, u64) {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn prepare_concurrent_worker_measurement() -> LinuxPerfBackend {
-    let mut backend = LinuxPerfBackend::new();
+pub(super) fn prepare_concurrent_worker_measurement(
+    profile: PmuCounterProfile,
+) -> LinuxPerfBackend {
+    let mut backend = LinuxPerfBackend::new().with_counter_profile(profile);
     // Concurrent workers are recreated for every sample, so they cannot
     // remember that an oversized group was unschedulable on a prior sample.
     // Start directly with independently multiplexed counters.
@@ -1118,6 +1182,7 @@ struct IndividualCounters {
 #[cfg(target_os = "linux")]
 pub struct LinuxPerfBackend {
     scope: PerfScope,
+    counter_profile: PmuCounterProfile,
     measurements: Vec<TargetMeasurement>,
     prefer_individual: bool,
     energy_scope: crate::EnergyScope,
@@ -1139,6 +1204,7 @@ impl LinuxPerfBackend {
     pub fn new() -> Self {
         Self {
             scope: PerfScope::CurrentThread,
+            counter_profile: PmuCounterProfile::Full,
             measurements: Vec::new(),
             prefer_individual: false,
             energy_scope: crate::EnergyScope::None,
@@ -1155,6 +1221,7 @@ impl LinuxPerfBackend {
     pub fn process_threads() -> Self {
         Self {
             scope: PerfScope::ProcessThreads,
+            counter_profile: PmuCounterProfile::Full,
             measurements: Vec::new(),
             prefer_individual: true,
             energy_scope: crate::EnergyScope::None,
@@ -1169,6 +1236,7 @@ impl LinuxPerfBackend {
     pub fn registered_threads(threads: LinuxPerfThreadSet) -> Self {
         Self {
             scope: PerfScope::RegisteredThreads(threads),
+            counter_profile: PmuCounterProfile::Full,
             measurements: Vec::new(),
             prefer_individual: true,
             energy_scope: crate::EnergyScope::None,
@@ -1179,17 +1247,45 @@ impl LinuxPerfBackend {
         }
     }
 
+    /// Select the CPU performance-counter set independently of RAPL energy.
+    ///
+    /// [`PmuCounterProfile::Compact`] requests cycles, instructions, branches,
+    /// and branch misses so the set can fit common four-counter PMUs without
+    /// permanent multiplexing. [`PmuCounterProfile::None`] provides a
+    /// timing/RAPL-only backend.
+    #[must_use]
+    pub fn with_counter_profile(mut self, profile: PmuCounterProfile) -> Self {
+        self.counter_profile = profile;
+        self.measurements.clear();
+        self
+    }
+
+    /// Select the four-event compact CPU-counter profile.
+    #[must_use]
+    pub fn with_compact_counters(self) -> Self {
+        self.with_counter_profile(PmuCounterProfile::Compact)
+    }
+
+    /// Disable CPU counters while retaining timing and any configured RAPL
+    /// energy measurement.
+    #[must_use]
+    pub fn without_cpu_counters(self) -> Self {
+        self.with_counter_profile(PmuCounterProfile::None)
+    }
+
     /// Add system-wide Linux RAPL energy measurement for every package/die
     /// domain exposed by the `power` PMU. This commonly includes whole-package
     /// energy and may also include cores, DRAM, integrated GPU, or platform
     /// energy depending on the processor.
     ///
     /// Energy is measured around each complete sample and reported as gross
-    /// microjoules per operation, Joules per sample, and average Watts. It is
-    /// not attributable to the benchmark process: unrelated activity on the
-    /// measured package is included. Because the scope is system-wide, work
-    /// dispatched to an existing Rayon or other external worker pool is
-    /// included without registering those threads.
+    /// microjoules per operation, Joules per sample, and average Watts. The
+    /// runner also sums sample energy, operations, and active measurement time
+    /// before calculating a higher-signal aggregate. It is not attributable
+    /// to the benchmark process: unrelated activity on the measured package
+    /// is included. Because the scope is system-wide, work dispatched to an
+    /// existing Rayon or other external worker pool is included without
+    /// registering those threads.
     #[must_use]
     pub fn with_rapl_energy(mut self) -> Self {
         self.energy_scope = crate::EnergyScope::RaplPackageDomains;
@@ -1230,12 +1326,15 @@ impl LinuxPerfBackend {
     }
 
     /// Try to build grouped perf counters without activating them.
-    fn try_prepare_group(target: PerfTarget) -> Option<PerfMode> {
-        build_perf_counter_group(target).map(PerfMode::Group)
+    fn try_prepare_group(target: PerfTarget, profile: PmuCounterProfile) -> Option<PerfMode> {
+        build_perf_counter_group(target, profile).map(PerfMode::Group)
     }
 
     /// Build individual counters without activating them.
-    fn prepare_individual(target: PerfTarget) -> PerfMode {
+    fn prepare_individual(target: PerfTarget, profile: PmuCounterProfile) -> PerfMode {
+        if !profile.collects_cpu_counters() {
+            return PerfMode::None;
+        }
         let ind = IndividualCounters {
             cycles: try_build_individual_counter(Hardware::CPU_CYCLES, "cycles", target),
             instructions: try_build_individual_counter(
@@ -1243,12 +1342,16 @@ impl LinuxPerfBackend {
                 "instructions",
                 target,
             ),
-            cache_references: try_build_individual_counter(
-                Hardware::CACHE_REFERENCES,
-                "cache-references",
-                target,
-            ),
-            l1i_misses: try_build_l1i_counter(target),
+            cache_references: if profile.collects_extended_counters() {
+                try_build_individual_counter(Hardware::CACHE_REFERENCES, "cache-references", target)
+            } else {
+                None
+            },
+            l1i_misses: if profile.collects_extended_counters() {
+                try_build_l1i_counter(target)
+            } else {
+                None
+            },
             branches: try_build_individual_counter(
                 Hardware::BRANCH_INSTRUCTIONS,
                 "branches",
@@ -1259,21 +1362,29 @@ impl LinuxPerfBackend {
                 "branch-misses",
                 target,
             ),
-            cache_misses: try_build_individual_counter(
-                Hardware::CACHE_MISSES,
-                "cache-misses",
-                target,
-            ),
-            stalled_cycles_frontend: try_build_individual_counter(
-                Hardware::STALLED_CYCLES_FRONTEND,
-                "stalled-cycles-frontend",
-                target,
-            ),
-            stalled_cycles_backend: try_build_individual_counter(
-                Hardware::STALLED_CYCLES_BACKEND,
-                "stalled-cycles-backend",
-                target,
-            ),
+            cache_misses: if profile.collects_extended_counters() {
+                try_build_individual_counter(Hardware::CACHE_MISSES, "cache-misses", target)
+            } else {
+                None
+            },
+            stalled_cycles_frontend: if profile.collects_extended_counters() {
+                try_build_individual_counter(
+                    Hardware::STALLED_CYCLES_FRONTEND,
+                    "stalled-cycles-frontend",
+                    target,
+                )
+            } else {
+                None
+            },
+            stalled_cycles_backend: if profile.collects_extended_counters() {
+                try_build_individual_counter(
+                    Hardware::STALLED_CYCLES_BACKEND,
+                    "stalled-cycles-backend",
+                    target,
+                )
+            } else {
+                None
+            },
         };
 
         let all_none = ind.cycles.is_none()
@@ -1298,17 +1409,20 @@ impl LinuxPerfBackend {
     pub(super) fn prepare(&mut self) {
         self.measurements.clear();
         self.rapl_measurement = None;
-        let targets = self.targets();
-        if targets.is_empty() {
-            record_perf_issue("PMU scope contains no live threads".to_string());
-        }
-        for target in targets {
-            let mode = if self.prefer_individual {
-                Self::prepare_individual(target)
-            } else {
-                Self::try_prepare_group(target).unwrap_or_else(|| Self::prepare_individual(target))
-            };
-            self.measurements.push(TargetMeasurement { target, mode });
+        if self.counter_profile.collects_cpu_counters() {
+            let targets = self.targets();
+            if targets.is_empty() {
+                record_perf_issue("PMU scope contains no live threads".to_string());
+            }
+            for target in targets {
+                let mode = if self.prefer_individual {
+                    Self::prepare_individual(target, self.counter_profile)
+                } else {
+                    Self::try_prepare_group(target, self.counter_profile)
+                        .unwrap_or_else(|| Self::prepare_individual(target, self.counter_profile))
+                };
+                self.measurements.push(TargetMeasurement { target, mode });
+            }
         }
 
         if self.energy_scope != crate::EnergyScope::None {
@@ -1372,7 +1486,8 @@ impl LinuxPerfBackend {
         for measurement in &mut self.measurements {
             if !Self::enable_prepared(&mut measurement.mode) {
                 self.prefer_individual = true;
-                measurement.mode = Self::prepare_individual(measurement.target);
+                measurement.mode =
+                    Self::prepare_individual(measurement.target, self.counter_profile);
                 let _ = Self::enable_prepared(&mut measurement.mode);
             }
         }
@@ -1516,7 +1631,7 @@ impl LinuxPerfBackend {
 
         !usable_timing
             || safe_ratio_f64(running_ns as f64, enabled_ns as f64) * 100.0
-                < MIN_PMU_SCHEDULED_PERCENT
+                < DIRECT_PMU_SCHEDULED_PERCENT
     }
 
     fn collect_individual(
@@ -1670,14 +1785,40 @@ impl MeasurementBackend for LinuxPerfBackend {
     }
 
     fn measurement_label(&self) -> &'static str {
-        match (&self.scope, self.rapl_observed) {
-            (PerfScope::CurrentThread, false) => "timing + PMU",
-            (PerfScope::ProcessThreads, false) => "timing + process-thread PMU",
-            (PerfScope::RegisteredThreads(_), false) => "timing + registered-thread PMU",
-            (PerfScope::CurrentThread, true) => "timing + PMU + RAPL energy",
-            (PerfScope::ProcessThreads, true) => "timing + process-thread PMU + RAPL energy",
-            (PerfScope::RegisteredThreads(_), true) => {
+        match (&self.scope, self.counter_profile, self.rapl_observed) {
+            (_, PmuCounterProfile::None, false) => "timing only",
+            (_, PmuCounterProfile::None, true) => "timing + RAPL energy",
+            (PerfScope::CurrentThread, PmuCounterProfile::Full, false) => "timing + PMU",
+            (PerfScope::ProcessThreads, PmuCounterProfile::Full, false) => {
+                "timing + process-thread PMU"
+            }
+            (PerfScope::RegisteredThreads(_), PmuCounterProfile::Full, false) => {
+                "timing + registered-thread PMU"
+            }
+            (PerfScope::CurrentThread, PmuCounterProfile::Compact, false) => "timing + compact PMU",
+            (PerfScope::ProcessThreads, PmuCounterProfile::Compact, false) => {
+                "timing + compact process-thread PMU"
+            }
+            (PerfScope::RegisteredThreads(_), PmuCounterProfile::Compact, false) => {
+                "timing + compact registered-thread PMU"
+            }
+            (PerfScope::CurrentThread, PmuCounterProfile::Full, true) => {
+                "timing + PMU + RAPL energy"
+            }
+            (PerfScope::ProcessThreads, PmuCounterProfile::Full, true) => {
+                "timing + process-thread PMU + RAPL energy"
+            }
+            (PerfScope::RegisteredThreads(_), PmuCounterProfile::Full, true) => {
                 "timing + registered-thread PMU + RAPL energy"
+            }
+            (PerfScope::CurrentThread, PmuCounterProfile::Compact, true) => {
+                "timing + compact PMU + RAPL energy"
+            }
+            (PerfScope::ProcessThreads, PmuCounterProfile::Compact, true) => {
+                "timing + compact process-thread PMU + RAPL energy"
+            }
+            (PerfScope::RegisteredThreads(_), PmuCounterProfile::Compact, true) => {
+                "timing + compact registered-thread PMU + RAPL energy"
             }
         }
     }
@@ -1688,6 +1829,10 @@ impl MeasurementBackend for LinuxPerfBackend {
             PerfScope::ProcessThreads => crate::PmuScope::ProcessThreads,
             PerfScope::RegisteredThreads(_) => crate::PmuScope::RegisteredThreads,
         }
+    }
+
+    fn pmu_counter_profile(&self) -> PmuCounterProfile {
+        self.counter_profile
     }
 
     fn energy_scope(&self) -> crate::EnergyScope {
@@ -1705,17 +1850,18 @@ impl MeasurementBackend for LinuxPerfBackend {
     }
 
     fn emits_cpu_diagnostics(&self) -> bool {
-        true
+        self.counter_profile != PmuCounterProfile::None
     }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{
-        LinuxPerfBackend, LinuxPerfThreadSet, PerfMode, PerfTarget, RaplDomain, TargetMeasurement,
-        current_thread_id, parse_cpu_list, process_thread_ids, push_rapl_metrics, timing_window,
+        LinuxPerfBackend, LinuxPerfThreadSet, PerfMode, PerfTarget, PmuQuality, RaplDomain,
+        TargetMeasurement, current_thread_id, parse_cpu_list, pmu_quality, process_thread_ids,
+        push_rapl_metrics, timing_window,
     };
-    use crate::{EnergyScope, MeasurementBackend};
+    use crate::{EnergyScope, MeasurementBackend, PmuCounterProfile};
     use std::{collections::BTreeMap, time::Duration};
 
     #[test]
@@ -1742,6 +1888,30 @@ mod tests {
             (1_000, 250)
         );
         assert_eq!(timing_window(&[(0, 0), (500, 0)]), (500, 0));
+    }
+
+    #[test]
+    fn pmu_quality_distinguishes_direct_scaled_and_unreliable_windows() {
+        let result = |enabled_ms, running_ms| crate::bench::Results {
+            pmu_time_enabled_ns: Duration::from_millis(enabled_ms).as_nanos() as u64,
+            pmu_time_running_ns: Duration::from_millis(running_ms).as_nanos() as u64,
+            ..crate::bench::Results::default()
+        };
+
+        assert_eq!(pmu_quality(&result(100, 95)), PmuQuality::Direct);
+        assert_eq!(pmu_quality(&result(100, 59)), PmuQuality::Multiplexed);
+        assert_eq!(pmu_quality(&result(100, 20)), PmuQuality::Unreliable);
+        assert_eq!(pmu_quality(&result(10, 6)), PmuQuality::Unreliable);
+    }
+
+    #[test]
+    fn compact_and_none_profiles_select_the_intended_event_classes() {
+        assert!(PmuCounterProfile::Compact.collects_cpu_counters());
+        assert!(!PmuCounterProfile::Compact.collects_extended_counters());
+        assert!(PmuCounterProfile::Full.collects_cpu_counters());
+        assert!(PmuCounterProfile::Full.collects_extended_counters());
+        assert!(!PmuCounterProfile::None.collects_cpu_counters());
+        assert!(!PmuCounterProfile::None.collects_extended_counters());
     }
 
     #[test]
@@ -1805,6 +1975,21 @@ mod tests {
         assert_eq!(registered.pmu_scope(), crate::PmuScope::RegisteredThreads);
         assert_ne!(current.measurement_label(), process.measurement_label());
         assert_ne!(process.measurement_label(), registered.measurement_label());
+    }
+
+    #[test]
+    fn public_counter_profile_builders_are_composable_with_rapl() {
+        let compact = LinuxPerfBackend::new().with_compact_counters();
+        let mut rapl_only = LinuxPerfBackend::new()
+            .without_cpu_counters()
+            .with_rapl_energy();
+
+        assert_eq!(compact.pmu_counter_profile(), PmuCounterProfile::Compact);
+        assert_eq!(compact.measurement_label(), "timing + compact PMU");
+        assert_eq!(rapl_only.pmu_counter_profile(), PmuCounterProfile::None);
+        rapl_only.rapl_observed = true;
+        assert_eq!(rapl_only.measurement_label(), "timing + RAPL energy");
+        assert!(!rapl_only.emits_cpu_diagnostics());
     }
 
     #[test]

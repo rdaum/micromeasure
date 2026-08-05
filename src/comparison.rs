@@ -16,8 +16,8 @@
 
 use crate::{
     BenchmarkKind, BenchmarkReport, BenchmarkResult, EnergyScope, MeasurementDomain, MetricFormat,
-    PmuScope, REPORT_SCHEMA_VERSION, SERIES_DOCUMENT_TYPE, SERIES_SCHEMA_VERSION, SeriesReport,
-    SeriesResult, Throughput, Validity, ValidityStatus,
+    PmuCounterProfile, PmuScope, REPORT_SCHEMA_VERSION, SERIES_DOCUMENT_TYPE,
+    SERIES_SCHEMA_VERSION, SeriesReport, SeriesResult, Throughput, Validity, ValidityStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -142,6 +142,10 @@ pub struct BenchmarkCaseIdentity {
     /// evidence from being treated as the same benchmark case.
     #[serde(default)]
     pub pmu_scope: PmuScope,
+    /// CPU event profile. Full and compact counter evidence is collected under
+    /// different multiplexing conditions and is not comparison-compatible.
+    #[serde(default)]
+    pub pmu_counter_profile: PmuCounterProfile,
     /// System energy scope. Package-wide RAPL evidence is not equivalent to a
     /// run that did not collect system energy.
     #[serde(default)]
@@ -158,6 +162,9 @@ impl BenchmarkCaseIdentity {
             throughput: result.stats.throughput.clone(),
             measurement_domain: result.stats.measurement_domain,
             pmu_scope: result.stats.pmu_scope,
+            pmu_counter_profile: PmuCounterProfile::from_measurement_label(
+                &result.stats.measurement_label,
+            ),
             energy_scope: result.stats.energy_scope,
             metadata: result.metadata.clone(),
         }
@@ -1630,6 +1637,8 @@ pub(crate) fn result_identity_matches(
         && current.stats.throughput == previous.stats.throughput
         && current.stats.measurement_domain == previous.stats.measurement_domain
         && current.stats.pmu_scope == previous.stats.pmu_scope
+        && PmuCounterProfile::from_measurement_label(&current.stats.measurement_label)
+            == PmuCounterProfile::from_measurement_label(&previous.stats.measurement_label)
         && current.stats.energy_scope == previous.stats.energy_scope
 }
 
@@ -1888,6 +1897,24 @@ mod tests {
         let mut baseline = report(&[("a", 100.0)]);
         current.results[0].stats.pmu_scope = PmuScope::ProcessThreads;
         baseline.results[0].stats.pmu_scope = PmuScope::CallingThread;
+
+        let comparison = current
+            .compare(
+                &baseline,
+                &ComparisonOptions::default().allow_partial_result_set(true),
+            )
+            .unwrap();
+        assert_eq!(comparison.summary.matched, 0);
+        assert_eq!(comparison.summary.added, 1);
+        assert_eq!(comparison.summary.removed, 1);
+    }
+
+    #[test]
+    fn pmu_counter_profiles_are_comparison_identity() {
+        let mut current = report(&[("a", 120.0)]);
+        let mut baseline = report(&[("a", 100.0)]);
+        current.results[0].stats.measurement_label = "timing + compact PMU".to_string();
+        baseline.results[0].stats.measurement_label = "timing + PMU".to_string();
 
         let comparison = current
             .compare(

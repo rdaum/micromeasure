@@ -375,6 +375,36 @@ pub enum PmuScope {
     ManagedWorkers,
 }
 
+/// CPU performance-counter set requested from the Linux PMU backend.
+///
+/// The compact profile is designed to fit common four-counter PMUs without
+/// permanent multiplexing. The full profile preserves micromeasure's historic
+/// nine-event measurement, while `None` allows timing and RAPL energy to be
+/// collected without opening CPU counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PmuCounterProfile {
+    /// Do not open CPU performance counters.
+    None,
+    /// Cycles, instructions, branches, and branch misses.
+    Compact,
+    /// All CPU events supported by micromeasure.
+    #[default]
+    Full,
+}
+
+impl PmuCounterProfile {
+    pub(crate) fn from_measurement_label(label: &str) -> Self {
+        if label.contains("compact") && label.contains("PMU") {
+            Self::Compact
+        } else if label.contains("PMU") || label.is_empty() {
+            Self::Full
+        } else {
+            Self::None
+        }
+    }
+}
+
 /// System energy scope used for a persisted benchmark result.
 ///
 /// RAPL counters are system-wide energy estimates rather than process- or
@@ -589,6 +619,15 @@ pub trait MeasurementBackend {
         PmuScope::CallingThread
     }
 
+    /// CPU-counter profile used by Linux managed-worker measurement.
+    ///
+    /// The default preserves the historic full counter set for existing
+    /// backends and concurrent groups. Backends that explicitly disable CPU
+    /// PMU collection should return [`PmuCounterProfile::None`].
+    fn pmu_counter_profile(&self) -> PmuCounterProfile {
+        PmuCounterProfile::Full
+    }
+
     /// Persisted system-energy scope used to keep unlike measurements from
     /// being compared. The default records that no energy source was enabled.
     fn energy_scope(&self) -> EnergyScope {
@@ -648,6 +687,10 @@ impl MeasurementBackend for WallClockBackend {
 
     fn measurement_label(&self) -> &'static str {
         "timing only"
+    }
+
+    fn pmu_counter_profile(&self) -> PmuCounterProfile {
+        PmuCounterProfile::None
     }
 
     fn emits_cpu_diagnostics(&self) -> bool {

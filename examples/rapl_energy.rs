@@ -56,8 +56,14 @@ benchmark_main!(|runner| {
         ..BenchmarkRuntimeOptions::default()
     });
     runner.group::<NoContext>("RAPL energy", |g| {
-        g.backend(|| Box::new(LinuxPerfBackend::new().with_rapl_energy()))
-            .bench("single-thread arithmetic", arithmetic);
+        g.backend(|| {
+            Box::new(
+                LinuxPerfBackend::new()
+                    .with_compact_counters()
+                    .with_rapl_energy(),
+            )
+        })
+        .bench("single-thread arithmetic", arithmetic);
     });
     runner.concurrent_group::<NoContext>("RAPL energy", |g| {
         let workers = [ConcurrentWorker {
@@ -65,9 +71,15 @@ benchmark_main!(|runner| {
             threads: 2,
             run: parallel_arithmetic,
         }];
-        g.backend(|| Box::new(LinuxPerfBackend::new().with_rapl_energy()))
-            .sample_duration(Duration::from_millis(50))
-            .bench("two-worker arithmetic", &workers);
+        g.backend(|| {
+            Box::new(
+                LinuxPerfBackend::new()
+                    .with_compact_counters()
+                    .with_rapl_energy(),
+            )
+        })
+        .sample_duration(Duration::from_millis(50))
+        .bench("two-worker arithmetic", &workers);
     });
 });
 

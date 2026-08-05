@@ -53,7 +53,7 @@ use std::{
 
 pub use backend::{
     DiagnosticError, DiagnosticResult, EnergyScope, MeasurementBackend, MeasurementDomain,
-    MetricFormat, MetricValue, PmuScope, WallClockBackend,
+    MetricFormat, MetricValue, PmuCounterProfile, PmuScope, WallClockBackend,
 };
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaError, CudaEvent, CudaEventBackend, CudaResult};
@@ -549,6 +549,19 @@ fn has_full_perf_counters(results: &Results) -> bool {
         && results.has_cache_misses
 }
 
+fn has_expected_perf_counters(results: &Results, profile: PmuCounterProfile) -> bool {
+    match profile {
+        PmuCounterProfile::None => true,
+        PmuCounterProfile::Compact => {
+            results.has_cycles
+                && results.has_instructions
+                && results.has_branches
+                && results.has_branch_misses
+        }
+        PmuCounterProfile::Full => has_full_perf_counters(results),
+    }
+}
+
 fn measurement_results_from_stats(stats: &crate::BenchmarkStats) -> Results {
     Results {
         has_cycles: stats.has_cycles,
@@ -688,6 +701,7 @@ fn render_result_section(
 }
 
 fn effective_measurement_label(stats: &crate::BenchmarkStats, has_perf: bool) -> String {
+    let counter_profile = PmuCounterProfile::from_measurement_label(&stats.measurement_label);
     let has_rapl_energy = stats.energy_scope != EnergyScope::None
         && stats
             .metrics
@@ -697,11 +711,17 @@ fn effective_measurement_label(stats: &crate::BenchmarkStats, has_perf: bool) ->
         if !has_perf {
             return "timing + RAPL energy".to_string();
         }
-        let pmu = match stats.pmu_scope {
-            PmuScope::CallingThread => "PMU",
-            PmuScope::ProcessThreads => "process-thread PMU",
-            PmuScope::RegisteredThreads => "registered-thread PMU",
-            PmuScope::ManagedWorkers => "managed-worker PMU",
+        let pmu = match (stats.pmu_scope, counter_profile) {
+            (PmuScope::CallingThread, PmuCounterProfile::Compact) => "compact PMU",
+            (PmuScope::ProcessThreads, PmuCounterProfile::Compact) => "compact process-thread PMU",
+            (PmuScope::RegisteredThreads, PmuCounterProfile::Compact) => {
+                "compact registered-thread PMU"
+            }
+            (PmuScope::ManagedWorkers, PmuCounterProfile::Compact) => "compact managed-worker PMU",
+            (PmuScope::CallingThread, _) => "PMU",
+            (PmuScope::ProcessThreads, _) => "process-thread PMU",
+            (PmuScope::RegisteredThreads, _) => "registered-thread PMU",
+            (PmuScope::ManagedWorkers, _) => "managed-worker PMU",
         };
         return format!("timing + {pmu} + RAPL energy");
     }
@@ -725,17 +745,35 @@ fn effective_measurement_label(stats: &crate::BenchmarkStats, has_perf: bool) ->
     }
 }
 
+fn managed_worker_measurement_label(
+    profile: PmuCounterProfile,
+    has_rapl_energy: bool,
+) -> &'static str {
+    match (profile, has_rapl_energy) {
+        (PmuCounterProfile::None, false) => "timing only",
+        (PmuCounterProfile::None, true) => "timing + RAPL energy",
+        (PmuCounterProfile::Compact, false) => "timing + compact managed-worker PMU",
+        (PmuCounterProfile::Compact, true) => "timing + compact managed-worker PMU + RAPL energy",
+        (PmuCounterProfile::Full, false) => "timing + managed-worker PMU",
+        (PmuCounterProfile::Full, true) => "timing + managed-worker PMU + RAPL energy",
+    }
+}
+
 fn render_standard_results(name: &str, stats: &crate::BenchmarkStats) {
     let results = measurement_results_from_stats(stats);
     let has_perf = has_perf_counters(&results);
+    let counter_profile = PmuCounterProfile::from_measurement_label(&stats.measurement_label);
 
     // For GPU-domain benchmarks, no CPU PMU is expected — the backend
     // intentionally leaves has_* false. Suppress the "PMU unavailable"
     // warning in that case; it is only relevant for CPU-domain benchmarks
     // that expected PMU but didn't get it.
     let suppress_perf_warning = stats.measurement_domain != MeasurementDomain::Cpu;
-    if !suppress_perf_warning {
-        warn_perf_status(has_perf, has_full_perf_counters(&results));
+    if !suppress_perf_warning && counter_profile != PmuCounterProfile::None {
+        warn_perf_status(
+            has_perf,
+            has_expected_perf_counters(&results, counter_profile),
+        );
     }
     enforce_pmu_quality(name, has_perf, &results);
 
@@ -755,9 +793,14 @@ fn render_concurrent_results(
 ) {
     let results = measurement_results_from_stats(combined_stats);
     let has_perf = has_perf_counters(&results);
+    let counter_profile =
+        PmuCounterProfile::from_measurement_label(&combined_stats.measurement_label);
     let suppress_perf_warning = combined_stats.measurement_domain != MeasurementDomain::Cpu;
-    if !suppress_perf_warning {
-        warn_perf_status(has_perf, has_full_perf_counters(&results));
+    if !suppress_perf_warning && counter_profile != PmuCounterProfile::None {
+        warn_perf_status(
+            has_perf,
+            has_expected_perf_counters(&results, counter_profile),
+        );
     }
     enforce_pmu_quality(name, has_perf, &results);
 
@@ -1074,6 +1117,8 @@ fn target_sample_count(
 }
 
 const MIN_REALIZED_BENCHMARK_DURATION_FRACTION: f64 = 0.8;
+const MIN_RELIABLE_RAPL_SAMPLE_DURATION: Duration = Duration::from_millis(10);
+const MIN_RELIABLE_RAPL_AGGREGATE_DURATION: Duration = Duration::from_millis(100);
 
 fn fixed_chunk_duration_shortfall(
     config: &BenchmarkConfig,
@@ -1095,6 +1140,66 @@ fn fixed_chunk_duration_shortfall(
         measured_duration.as_secs_f64() * 1_000.0,
         runtime.benchmark_duration.as_secs_f64() * 1_000.0,
     ))
+}
+
+fn rapl_window_quality_warnings(
+    all_results: &[Results],
+    per_sample_metrics: &[Vec<MetricValue>],
+    sample_count: usize,
+) -> Vec<String> {
+    let mut shortest = None::<Duration>;
+    let mut aggregate_duration = Duration::ZERO;
+    let mut contributing_samples = 0usize;
+
+    for (result, metrics) in all_results
+        .iter()
+        .zip(per_sample_metrics.iter())
+        .take(sample_count)
+    {
+        let has_rapl_delta = metrics.iter().any(|metric| {
+            metric.section == "RAPL energy"
+                && metric.name.starts_with("rapl_")
+                && metric.name.ends_with("_joules")
+                && metric.value.is_finite()
+                && metric.value >= 0.0
+        });
+        if !has_rapl_delta {
+            continue;
+        }
+        shortest = Some(shortest.map_or(result.duration, |current| current.min(result.duration)));
+        aggregate_duration += result.duration;
+        contributing_samples += 1;
+    }
+
+    if contributing_samples == 0 {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    if shortest.is_some_and(|duration| duration < MIN_RELIABLE_RAPL_SAMPLE_DURATION) {
+        warnings.push(format!(
+            "RAPL sample windows were as short as {:.3} ms; per-sample energy and power may be quantized. Prefer the RAPL aggregate metrics or increase the chunk/sample duration",
+            shortest.unwrap_or_default().as_secs_f64() * 1_000.0,
+        ));
+    }
+    if aggregate_duration < MIN_RELIABLE_RAPL_AGGREGATE_DURATION {
+        warnings.push(format!(
+            "RAPL aggregate covers only {:.3} ms across {contributing_samples} samples; increase the chunk/sample duration, benchmark duration, or max_samples for a stronger energy signal",
+            aggregate_duration.as_secs_f64() * 1_000.0,
+        ));
+    }
+    warnings
+}
+
+fn warn_rapl_window_quality(
+    name: &str,
+    all_results: &[Results],
+    per_sample_metrics: &[Vec<MetricValue>],
+    sample_count: usize,
+) {
+    for warning in rapl_window_quality_warnings(all_results, per_sample_metrics, sample_count) {
+        println!("  ⚠️ RAPL quality for benchmark '{name}': {warning}");
+    }
 }
 
 fn total_worker_threads<T>(workers: &[ConcurrentWorker<T>]) -> usize {
@@ -1302,6 +1407,7 @@ fn execute_concurrent_timing_only<T: ConcurrentBenchContext + Sync>(
         #[cfg(target_os = "linux")]
         &[],
         false,
+        PmuCounterProfile::None,
         &mut backend,
     )
 }
@@ -1311,6 +1417,7 @@ fn execute_concurrent_sample<T: ConcurrentBenchContext + Sync>(
     sample_duration: Duration,
     workers: &[ConcurrentWorker<T>],
     #[cfg(target_os = "linux")] pin_cores: &[usize],
+    counter_profile: PmuCounterProfile,
     backend: &mut Option<Box<dyn MeasurementBackend>>,
 ) -> ConcurrentSampleResult {
     execute_concurrent_sample_inner(
@@ -1320,6 +1427,7 @@ fn execute_concurrent_sample<T: ConcurrentBenchContext + Sync>(
         #[cfg(target_os = "linux")]
         pin_cores,
         true,
+        counter_profile,
         backend,
     )
 }
@@ -1330,6 +1438,7 @@ fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
     workers: &[ConcurrentWorker<T>],
     #[cfg(target_os = "linux")] pin_cores: &[usize],
     use_perf_counters: bool,
+    counter_profile: PmuCounterProfile,
     backend: &mut Option<Box<dyn MeasurementBackend>>,
 ) -> ConcurrentSampleResult {
     let total_threads = total_worker_threads(workers);
@@ -1364,8 +1473,8 @@ fn execute_concurrent_sample_inner<T: ConcurrentBenchContext + Sync>(
                     }
 
                     #[cfg(target_os = "linux")]
-                    let mut perf_measurement =
-                        use_perf_counters.then(prepare_concurrent_worker_measurement);
+                    let mut perf_measurement = use_perf_counters
+                        .then(|| prepare_concurrent_worker_measurement(counter_profile));
 
                     ready_barrier.wait();
                     #[cfg(target_os = "linux")]
@@ -1776,6 +1885,7 @@ impl BenchmarkRunner {
         {
             println!("  ⚠️ warning: {warning}");
         }
+        warn_rapl_window_quality(name, &all_results, &all_metrics, config.target_samples);
 
         let diagnostic_metrics = execute_diagnostic_pass(
             diagnostic_pass,
@@ -1939,6 +2049,7 @@ impl BenchmarkRunner {
         {
             println!("  ⚠️ warning: {warning}");
         }
+        warn_rapl_window_quality(name, &all_results, &all_metrics, config.target_samples);
 
         let diagnostic_metrics = execute_diagnostic_pass(
             diagnostic_pass,
@@ -2078,6 +2189,10 @@ impl BenchmarkRunner {
 
         let mut lifecycle = lifecycle_factory.map(|factory| factory());
         let mut backend = backend_factory.map(|factory| factory());
+        let counter_profile = backend
+            .as_deref()
+            .map(MeasurementBackend::pmu_counter_profile)
+            .unwrap_or(PmuCounterProfile::Full);
 
         let config = warm_up_concurrent_engine(
             sample_duration,
@@ -2130,6 +2245,7 @@ impl BenchmarkRunner {
                 workers,
                 #[cfg(target_os = "linux")]
                 &pin_cores,
+                counter_profile,
                 &mut backend,
             );
 
@@ -2179,18 +2295,20 @@ impl BenchmarkRunner {
 
         clear_line();
         println!("  samples complete: {}", config.target_samples);
+        warn_rapl_window_quality(name, &all_results, &all_metrics, config.target_samples);
 
         let energy_scope = backend
             .as_deref()
             .map(MeasurementBackend::energy_scope)
             .unwrap_or(EnergyScope::None);
         let measurement_label = if energy_scope != EnergyScope::None {
-            "timing + managed-worker PMU + RAPL energy"
+            managed_worker_measurement_label(counter_profile, true)
         } else {
             backend
                 .as_deref()
                 .map(MeasurementBackend::measurement_label)
-                .unwrap_or("")
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| managed_worker_measurement_label(counter_profile, false))
         };
         let stats = benchmark_stats_from_samples(
             &summed_results,
@@ -2222,8 +2340,8 @@ impl BenchmarkRunner {
                         measurement_domain,
                         PmuScope::ManagedWorkers,
                         EnergyScope::None,
-                        "",
-                        true,
+                        managed_worker_measurement_label(counter_profile, false),
+                        counter_profile != PmuCounterProfile::None,
                         &[],
                     );
                     WorkerSummary {
@@ -3694,6 +3812,35 @@ mod tests {
         assert!(
             fixed_chunk_duration_shortfall(&config, &runtime, Duration::from_millis(12)).is_none()
         );
+    }
+
+    #[test]
+    fn rapl_quality_flags_quantized_samples_and_short_aggregate_windows() {
+        use super::rapl_window_quality_warnings;
+        use crate::MetricValue;
+
+        let all_results = vec![
+            super::Results {
+                duration: std::time::Duration::from_millis(2),
+                iterations: 100,
+                ..super::Results::default()
+            },
+            super::Results {
+                duration: std::time::Duration::from_millis(4),
+                iterations: 100,
+                ..super::Results::default()
+            },
+        ];
+        let metrics = vec![
+            vec![MetricValue::new("rapl_package_joules", 0.0, "J").with_section("RAPL energy")],
+            vec![MetricValue::new("rapl_package_joules", 0.02, "J").with_section("RAPL energy")],
+        ];
+
+        let warnings = rapl_window_quality_warnings(&all_results, &metrics, 2);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("as short as 2.000 ms"));
+        assert!(warnings[0].contains("quantized"));
+        assert!(warnings[1].contains("only 6.000 ms across 2 samples"));
     }
 
     #[test]

@@ -54,7 +54,43 @@ The crate degrades gracefully. When `perf_event_open` fails, the runner falls ba
 
 Throughput and latency statistics are still valid in this mode — they only depend on `Instant::now()` and the operation count.
 
-## Counter scheduling and fallback
+## Counter profiles, scheduling, and fallback
+
+The default `LinuxPerfBackend` requests the full nine-event counter profile.
+Many CPUs expose fewer programmable counters than that, so Linux must
+permanently multiplex the events: a long sample improves rotation and scaling,
+but cannot make the scheduled percentage approach 100% when nine events must
+share four or six physical slots.
+
+When cycles, instructions, branches, and branch misses are sufficient, select
+the compact four-event profile:
+
+```rust,ignore
+use micromeasure::LinuxPerfBackend;
+
+g.backend(|| Box::new(LinuxPerfBackend::new().with_compact_counters()))
+    .bench("dispatch", dispatch);
+```
+
+The compact profile commonly fits without multiplexing and still provides IPC
+and branch-miss statistics. It intentionally omits cache references, cache
+misses, L1I misses, and frontend/backend stall counters. Profile selection is
+independent of RAPL, so energy-capable runs can use compact counters or no CPU
+counters at all:
+
+```rust,ignore
+LinuxPerfBackend::new()
+    .with_compact_counters()
+    .with_rapl_energy();
+
+LinuxPerfBackend::new()
+    .without_cpu_counters()
+    .with_rapl_energy();
+```
+
+Full, compact, and no-counter results have distinct persisted comparison
+identities. Select a profile with `with_counter_profile(PmuCounterProfile)`
+when configuration needs to be data-driven.
 
 Even when PMU access is available, the kernel may let you open a perf-event **group** that is too large to schedule on the available hardware registers. Such a group reads as zero even though creation and activation succeeded. `LinuxPerfBackend` handles this:
 
@@ -63,7 +99,7 @@ Even when PMU access is available, the kernel may let you open a perf-event **gr
 3. Micromeasure-managed concurrent workers and external multi-thread scopes start with individual counters. Managed workers are recreated for every sample, and probing an oversized group independently on every external worker would waste the calibration window.
 4. Scale each multiplexed value using its own `time_running / time_enabled` values.
 
-The PMU `scheduled` line reports `time_running / time_enabled` as a percentage. Below 100% means the kernel multiplexed the counters because the PMU could not count all of them at once. It does **not** report what fraction of a multi-threaded workload was observed. For individual counters, micromeasure reports the least-scheduled available event as a conservative quality indicator. If it is low the runner emits a warning.
+The PMU `scheduled` line reports `time_running / time_enabled` as a percentage. Below 100% means the kernel multiplexed the counters because the PMU could not count all of them at once. It does **not** report what fraction of a multi-threaded workload was observed. For individual counters, micromeasure reports the least-scheduled available event as a conservative quality indicator. At least 90% is treated as direct measurement. A 25–90% window with at least 10 ms of counter running time is reported as a usable multiplexed/scaled estimate. A lower percentage or shorter running time produces an unreliability warning.
 
 Counters with no usable scheduled window are omitted rather than rendered as meaningful zeroes.
 
@@ -80,13 +116,30 @@ g.backend(|| Box::new(LinuxPerfBackend::new().with_rapl_energy()))
     .bench("parse record", parse_record);
 ```
 
-Micromeasure enables the energy counters around the complete sample, converts
-the kernel count using its advertised Joule scale, and divides by the sample's
-operation count. Each available domain produces three metrics:
+Micromeasure enables the energy counters around each complete sample and
+converts the kernel count using its advertised Joule scale. Each available
+domain produces three per-sample metrics:
 
 - gross energy per operation in `µJ/op`
 - gross energy for the sample in Joules
 - average power during the sample in Watts
+
+It also reports a `RAPL aggregate` section. Those values sum energy,
+operations, and active measurement time across all contributing samples before
+computing aggregate µJ/op and Watts. This preserves per-sample latency and
+throughput distributions while giving tiny operations a longer, higher-signal
+energy interval. It sums the measured sample windows; it does not include the
+unmeasured setup gaps between them.
+
+Very short energy windows can be smaller than the effective RAPL update
+resolution. They can therefore produce a zero delta, or an implausible power
+spike when one coarse energy increment is divided by a few milliseconds.
+Micromeasure warns when an observed RAPL sample is shorter than 10 ms, and when
+the aggregate contains less than 100 ms of active measurement. Prefer samples
+around 50–200 ms (100 ms is a good starting point) and enough samples to cover
+at least one second. For a fixed-chunk benchmark, increase the chunk size or
+`max_samples`; `benchmark_duration` remains a target and `max_samples` remains
+an explicit upper bound.
 
 Hardware decides which domains exist. `energy-pkg` is the most common;
 `energy-cores`, `energy-ram`, `energy-gpu`, and `energy-psys` appear only on
@@ -175,7 +228,7 @@ Linux perf inheritance is not used here: inheritance applies only to threads cre
 
 ## Which counters are collected
 
-`PerfCounters` collects:
+The full profile and the low-level `PerfCounters` type collect:
 
 - cycles
 - instructions

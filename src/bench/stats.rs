@@ -100,6 +100,13 @@ pub(super) fn benchmark_stats_from_samples(
     let mad_ns_per_op = median_absolute_deviation(&sorted_latency_samples, median_ns_per_op);
     let outlier_count = tukey_outlier_count(&sorted_latency_samples);
 
+    let mut metrics = aggregate_metrics(per_sample_metrics);
+    metrics.extend(rapl_aggregate_summaries(
+        all_results,
+        per_sample_metrics,
+        sample_count,
+    ));
+
     BenchmarkStats {
         throughput: throughput.clone(),
         throughput_per_sec,
@@ -145,7 +152,7 @@ pub(super) fn benchmark_stats_from_samples(
         pmu_scope,
         energy_scope,
         emits_cpu_diagnostics,
-        metrics: aggregate_metrics(per_sample_metrics),
+        metrics,
         sample_metrics: per_sample_metrics
             .iter()
             .take(sample_count)
@@ -166,6 +173,175 @@ pub(super) fn benchmark_stats_from_samples(
                     .collect(),
             })
             .collect(),
+    }
+}
+
+/// Combine per-sample RAPL deltas into one higher-signal result per energy
+/// domain. This is intentionally separate from the distribution of individual
+/// sample readings: summing energy, operations, and active measurement time
+/// before dividing prevents a quantized short sample from dominating the
+/// reported energy/op or power.
+fn rapl_aggregate_summaries(
+    all_results: &[Results],
+    per_sample_metrics: &[Vec<MetricValue>],
+    sample_count: usize,
+) -> Vec<MetricSummary> {
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Aggregate {
+        joules: f64,
+        operations: u64,
+        duration_secs: f64,
+        samples: usize,
+    }
+
+    let mut by_domain: HashMap<&'static str, Aggregate> = HashMap::new();
+    let mut order = Vec::new();
+
+    for (result, sample_metrics) in all_results
+        .iter()
+        .zip(per_sample_metrics.iter())
+        .take(sample_count)
+    {
+        for metric in sample_metrics {
+            if metric.section != "RAPL energy"
+                || !metric.name.starts_with("rapl_")
+                || !metric.name.ends_with("_joules")
+                || !metric.value.is_finite()
+                || metric.value < 0.0
+            {
+                continue;
+            }
+
+            if !by_domain.contains_key(metric.name) {
+                order.push(metric.name);
+            }
+            let aggregate = by_domain.entry(metric.name).or_default();
+            aggregate.joules += metric.value;
+            aggregate.operations = aggregate.operations.saturating_add(result.iterations);
+            aggregate.duration_secs += result.duration.as_secs_f64();
+            aggregate.samples += 1;
+        }
+    }
+
+    let mut summaries = Vec::new();
+    for joules_name in order {
+        let aggregate = &by_domain[joules_name];
+        let Some(names) = rapl_aggregate_metric_names(joules_name) else {
+            continue;
+        };
+        if aggregate.operations > 0 {
+            summaries.push(single_value_metric_summary(
+                names.0,
+                aggregate.joules * 1_000_000.0 / aggregate.operations as f64,
+                "µJ/op",
+                names.3,
+                aggregate.samples,
+            ));
+        }
+        summaries.push(single_value_metric_summary(
+            names.1,
+            aggregate.joules,
+            "J",
+            names.4,
+            aggregate.samples,
+        ));
+        if aggregate.duration_secs > 0.0 {
+            summaries.push(single_value_metric_summary(
+                names.2,
+                aggregate.joules / aggregate.duration_secs,
+                "W",
+                names.5,
+                aggregate.samples,
+            ));
+        }
+    }
+    summaries
+}
+
+type RaplAggregateMetricNames = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+fn rapl_aggregate_metric_names(name: &str) -> Option<RaplAggregateMetricNames> {
+    match name {
+        "rapl_package_joules" => Some((
+            "rapl_package_aggregate_uj_per_op",
+            "rapl_package_aggregate_joules",
+            "rapl_package_aggregate_watts",
+            "Package aggregate energy/op",
+            "Package aggregate energy",
+            "Package aggregate power",
+        )),
+        "rapl_cores_joules" => Some((
+            "rapl_cores_aggregate_uj_per_op",
+            "rapl_cores_aggregate_joules",
+            "rapl_cores_aggregate_watts",
+            "CPU cores aggregate energy/op",
+            "CPU cores aggregate energy",
+            "CPU cores aggregate power",
+        )),
+        "rapl_dram_joules" => Some((
+            "rapl_dram_aggregate_uj_per_op",
+            "rapl_dram_aggregate_joules",
+            "rapl_dram_aggregate_watts",
+            "DRAM aggregate energy/op",
+            "DRAM aggregate energy",
+            "DRAM aggregate power",
+        )),
+        "rapl_gpu_joules" => Some((
+            "rapl_gpu_aggregate_uj_per_op",
+            "rapl_gpu_aggregate_joules",
+            "rapl_gpu_aggregate_watts",
+            "Integrated GPU aggregate energy/op",
+            "Integrated GPU aggregate energy",
+            "Integrated GPU aggregate power",
+        )),
+        "rapl_platform_joules" => Some((
+            "rapl_platform_aggregate_uj_per_op",
+            "rapl_platform_aggregate_joules",
+            "rapl_platform_aggregate_watts",
+            "Platform aggregate energy/op",
+            "Platform aggregate energy",
+            "Platform aggregate power",
+        )),
+        "rapl_core_joules" => Some((
+            "rapl_core_aggregate_uj_per_op",
+            "rapl_core_aggregate_joules",
+            "rapl_core_aggregate_watts",
+            "Per-core total aggregate energy/op",
+            "Per-core total aggregate energy",
+            "Per-core total aggregate power",
+        )),
+        _ => None,
+    }
+}
+
+fn single_value_metric_summary(
+    name: &str,
+    value: f64,
+    unit: &str,
+    display_name: &str,
+    samples: usize,
+) -> MetricSummary {
+    MetricSummary {
+        name: name.to_string(),
+        unit: unit.to_string(),
+        section: "RAPL aggregate".to_string(),
+        display_name: display_name.to_string(),
+        format: MetricFormat::Number,
+        mean: value,
+        median: value,
+        p95: value,
+        min: value,
+        max: value,
+        samples,
     }
 }
 
@@ -894,5 +1070,44 @@ mod tests {
         assert_eq!(stats.sample_metrics[0].metrics[0].value, 3.0);
         assert_eq!(stats.sample_metrics[1].metrics[0].value, 1.0);
         assert_eq!(stats.sample_metrics[2].metrics[0].value, 2.0);
+    }
+
+    #[test]
+    fn rapl_aggregate_divides_after_summing_energy_operations_and_time() {
+        let all_results = vec![
+            Results {
+                duration: std::time::Duration::from_millis(2),
+                iterations: 100,
+                ..Results::default()
+            },
+            Results {
+                duration: std::time::Duration::from_millis(4),
+                iterations: 300,
+                ..Results::default()
+            },
+        ];
+        let per_sample = vec![
+            vec![MetricValue::new("rapl_package_joules", 0.01, "J").with_section("RAPL energy")],
+            vec![MetricValue::new("rapl_package_joules", 0.03, "J").with_section("RAPL energy")],
+        ];
+
+        let summaries = rapl_aggregate_summaries(&all_results, &per_sample, 2);
+        let value = |name: &str| {
+            summaries
+                .iter()
+                .find(|summary| summary.name == name)
+                .unwrap()
+                .mean
+        };
+
+        assert_eq!(summaries.len(), 3);
+        assert!((value("rapl_package_aggregate_uj_per_op") - 100.0).abs() < f64::EPSILON);
+        assert!((value("rapl_package_aggregate_joules") - 0.04).abs() < f64::EPSILON);
+        assert!((value("rapl_package_aggregate_watts") - (0.04 / 0.006)).abs() < 1e-12);
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| { summary.section == "RAPL aggregate" && summary.samples == 2 })
+        );
     }
 }

@@ -49,20 +49,62 @@ The crate degrades gracefully. When `perf_event_open` fails, the runner falls ba
 
 - The stats table will not have `instructions/op`, `branches/op`, `cache misses/op`, or stall counters.
 - The `Measurement` row reads `timing only` instead of `timing + PMU`.
-- The `host PMU (perf event group): coverage=...` byline is omitted.
+- The `PMU: scheduled=...` byline is omitted.
 - The `possible bottlenecks:` section is suppressed (it is derived from PMU counters).
 
 Throughput and latency statistics are still valid in this mode — they only depend on `Instant::now()` and the operation count.
 
-## The two-level perf fallback
+## Counter scheduling and fallback
 
-Even when PMU access is available, the kernel may not let you open a perf-event **group** (multiple counters in one leader) but will let you open **individual** counters. `LinuxPerfBackend` handles this:
+Even when PMU access is available, the kernel may let you open a perf-event **group** that is too large to schedule on the available hardware registers. Such a group reads as zero even though creation and activation succeeded. `LinuxPerfBackend` handles this:
 
-1. Try to open a perf-event group covering the full counter set.
-2. If that fails, fall back to opening individual counters one at a time.
-3. Whatever counters it gets, it records them and scales multiplexed values using `time_running / time_enabled` from the perf event's `time_enabled`/`time_running` fields.
+1. During standard benchmark calibration, try a perf-event group covering the full counter set.
+2. If creation or activation fails, or the group obtains no usable scheduled window, remember that result and use individual counters for subsequent samples.
+3. Micromeasure-managed concurrent workers and external multi-thread scopes start with individual counters. Managed workers are recreated for every sample, and probing an oversized group independently on every external worker would waste the calibration window.
+4. Scale each multiplexed value using its own `time_running / time_enabled` values.
 
-The PMU coverage line reports `time_running / time_enabled` as a percentage. Below 100% means the kernel multiplexed the counters (because the PMU can't count all of them at once on your CPU) and the values were scaled. If coverage is low the runner emits a warning.
+The PMU `scheduled` line reports `time_running / time_enabled` as a percentage. Below 100% means the kernel multiplexed the counters because the PMU could not count all of them at once. It does **not** report what fraction of a multi-threaded workload was observed. For individual counters, micromeasure reports the least-scheduled available event as a conservative quality indicator. If it is low the runner emits a warning.
+
+Counters with no usable scheduled window are omitted rather than rendered as meaningful zeroes.
+
+## Benchmarks that dispatch to existing worker pools
+
+The default [`LinuxPerfBackend`](https://docs.rs/micromeasure/latest/micromeasure/struct.LinuxPerfBackend.html) measures only the calling benchmark thread. If the measured function dispatches its real work to an already initialized Rayon or other worker pool, choose one of the explicit multi-thread scopes.
+
+The simplest option snapshots all threads currently in the process before each measurement window:
+
+```rust,ignore
+g.backend(|| Box::new(LinuxPerfBackend::process_threads()))
+    .bench("projection", projection_bench);
+```
+
+Initialize the pool before the measurement window. Threads created after `begin` are not included. Process-thread scope also counts unrelated runtime or service threads in the benchmark process, so keep the benchmark binary focused.
+
+Each target thread needs one file descriptor per available individual counter. Very large pools can therefore require a higher `RLIMIT_NOFILE`.
+
+For precise targeting, register only the worker threads. Rayon can run a registration closure once on every existing pool worker:
+
+```rust,ignore
+use micromeasure::{LinuxPerfBackend, LinuxPerfThreadSet};
+
+let pmu_threads = LinuxPerfThreadSet::new();
+pool.broadcast(|_| {
+    pmu_threads.register_current();
+});
+
+let backend_threads = pmu_threads.clone();
+runner.group::<ProjectionContext>("Projection", |g| {
+    let backend_threads = backend_threads.clone();
+    g.backend(move || {
+        Box::new(LinuxPerfBackend::registered_threads(backend_threads.clone()))
+    })
+    .bench("projection", projection_bench);
+});
+```
+
+Registered thread IDs are snapshotted before every sample. Stale IDs are ignored when counters cannot be opened. Calling-thread, process-thread, and registered-thread results use distinct measurement labels and are not comparison-compatible.
+
+Linux perf inheritance is not used here: inheritance applies only to threads created after an event is opened, so it does not cover an existing Rayon pool, and it is incompatible with the grouped read format used for atomic counter groups.
 
 ## Which counters are collected
 
@@ -95,11 +137,11 @@ On non-Linux targets the crate builds without the perf dependency and uses `Wall
 After running a benchmark, look for:
 
 ```text
-host PMU (perf event group): coverage=100.0%
+PMU: scheduled=100.0%
 ```
 
-- `coverage=100.0%` — full PMU group active, no multiplexing. Ideal.
-- `coverage=80.0%` (or any value < 100%) — counters were multiplexed; values were scaled. Numbers are still useful but check the warning.
-- No coverage line at all — PMU unavailable, timing-only fallback.
+- `scheduled=100.0%` — the representative PMU event was always scheduled. Ideal.
+- `scheduled=80.0%` (or any value below 100%) — counters were multiplexed and values were scaled. Check the warning when scheduling is low.
+- No scheduled line at all — PMU unavailable, timing-only fallback.
 
-For GPU-domain benchmarks, the byline reads `host PMU (orchestration): coverage=...` to remind you the CPU PMU describes the host thread, not the device. See [GPU Benchmarks](./gpu.md#measurement-domain).
+For GPU-domain benchmarks, the byline reads `host PMU (orchestration): scheduled=...` to remind you the CPU PMU describes the host thread, not the device. See [GPU Benchmarks](./gpu.md#measurement-domain).

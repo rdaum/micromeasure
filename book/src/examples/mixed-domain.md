@@ -39,7 +39,7 @@ benchmark_main!(|runner| {
 
 ## What to look for
 
-- The PMU coverage byline reads `host PMU (mixed workload): coverage=...`.
+- The PMU scheduling byline reads `host PMU (mixed workload): scheduled=...`.
 - If a bottleneck diagnostic fires, it appears with a `[host] ` prefix:
 
   ```text

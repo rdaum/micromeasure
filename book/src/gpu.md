@@ -17,7 +17,7 @@ These features are independent: you can use `MeasurementDomain::Gpu` with the de
 ```rust,ignore
 pub enum MeasurementDomain {
     Cpu,    // default: full PMU counters + historic diagnostics
-    Gpu,    // suppress CPU-PMU bottleneck diagnostics; relabel coverage line
+    Gpu,    // suppress CPU-PMU bottleneck diagnostics; relabel scheduling line
     Mixed,  // emit CPU-PMU diagnostics with a [host] prefix
 }
 ```
@@ -27,8 +27,8 @@ Set it on a group with `g.measurement_domain(MeasurementDomain::Gpu)`.
 ### What each domain does
 
 - **`Cpu`** (default): unchanged historic behaviour. Full PMU counters and the existing bottleneck diagnostics apply.
-- **`Gpu`**: CPU PMU data is treated as host-orchestration context, not as the primary bottleneck. CPU-PMU bottleneck diagnostics are **suppressed entirely**. The PMU coverage byline is relabelled to `host PMU (orchestration)`. Run-stability warnings (CV, outliers) are still emitted, because sample stability matters for any benchmark.
-- **`Mixed`**: CPU-PMU diagnostics are emitted but prefixed with `[host]`, so the reader knows the signal is host-side context (e.g. a GPU benchmark that does meaningful host-side data layout between kernel launches). The PMU coverage byline reads `host PMU (mixed workload)`.
+- **`Gpu`**: CPU PMU data is treated as host-orchestration context, not as the primary bottleneck. CPU-PMU bottleneck diagnostics are **suppressed entirely**. The PMU scheduling byline is relabelled to `host PMU (orchestration)`. Run-stability warnings (CV, outliers) are still emitted, because sample stability matters for any benchmark.
+- **`Mixed`**: CPU-PMU diagnostics are emitted but prefixed with `[host]`, so the reader knows the signal is host-side context (e.g. a GPU benchmark that does meaningful host-side data layout between kernel launches). The PMU scheduling byline reads `host PMU (mixed workload)`.
 
 ### Interaction with `emits_cpu_diagnostics`
 
@@ -263,7 +263,7 @@ benchmark_main!(|runner| {
 
 The pieces compose:
 
-- `MeasurementDomain::Gpu` suppresses CPU-PMU diagnostics and relabels the coverage line.
+- `MeasurementDomain::Gpu` suppresses CPU-PMU diagnostics and relabels the scheduling line.
 - `CudaEventBackend` provides device-side timing, sets `results.duration` to the device event time, and pushes `cuda_event_ms` / `host_overhead_ms` / `gpu_gib_s` / `gpu_tflops`.
 - `bench_sample` lets the bench add its own metrics (e.g. `selected_algo_id`, bench-specific TFLOP/s).
 - `diagnostic_pass` collects invasive counters in a separate run.

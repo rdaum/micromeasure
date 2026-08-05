@@ -26,7 +26,7 @@ That reads like a memory-latency problem in the measured work. It isn't — the 
 
 `MeasurementDomain` (`src/bench/backend.rs`) tags a group as `Cpu`, `Gpu`, `Io`, or `Mixed`. The diagnostics path (`diagnose_stats` in `src/bench.rs`) consults it:
 
-- `Gpu`: CPU-PMU bottleneck diagnostics are suppressed entirely. The PMU coverage byline is relabelled to `host PMU (orchestration): coverage=...`.
+- `Gpu`: CPU-PMU bottleneck diagnostics are suppressed entirely. The PMU scheduling byline is relabelled to `host PMU (orchestration): scheduled=...`.
 - `Mixed`: diagnostics are emitted but prefixed with `[host] `, so the reader knows the signal is host-side context. The byline reads `host PMU (mixed workload)`.
 - `Cpu`: unchanged historic behaviour.
 

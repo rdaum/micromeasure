@@ -25,7 +25,7 @@
 //     possible bottlenecks:
 //       - [host] Likely data-side memory latency: backend stall is 50.0% ...
 //
-// The PMU coverage byline also reads "host PMU (mixed workload)".
+// The PMU scheduling byline also reads "host PMU (mixed workload)".
 //
 // Run with:
 //   cargo run --example mixed_domain --release

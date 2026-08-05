@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    Alignment, MeasurementDomain, MetricFormat, ReportContext, TableFormatter, Throughput,
-    comparison::pair_results_one_to_one,
+    Alignment, MeasurementDomain, MetricFormat, PmuScope, ReportContext, TableFormatter,
+    Throughput, comparison::pair_results_one_to_one,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -121,6 +121,10 @@ pub struct BenchmarkStats {
     /// (`"timing + PMU"` or `"timing only"`).
     #[serde(default)]
     pub measurement_label: String,
+    /// Thread scope used for Linux PMU counters. Defaults to the historic
+    /// calling-thread behavior when loading older reports.
+    #[serde(default)]
+    pub pmu_scope: PmuScope,
     /// When false, the backend has declared it does not emit CPU-PMU
     /// diagnostics (e.g. a GPU CUDA event backend). The runner suppresses
     /// CPU-PMU bottleneck diagnostics regardless of
@@ -1569,6 +1573,7 @@ mod tests {
                 pmu_time_running_ns: 0,
                 measurement_domain: MeasurementDomain::Cpu,
                 measurement_label: String::new(),
+                pmu_scope: PmuScope::CallingThread,
                 emits_cpu_diagnostics: true,
                 metrics: Vec::new(),
                 sample_metrics: Vec::new(),

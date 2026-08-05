@@ -15,7 +15,7 @@
 //! Side-effect-free comparison of persisted benchmark evidence.
 
 use crate::{
-    BenchmarkKind, BenchmarkReport, BenchmarkResult, MeasurementDomain, MetricFormat,
+    BenchmarkKind, BenchmarkReport, BenchmarkResult, MeasurementDomain, MetricFormat, PmuScope,
     REPORT_SCHEMA_VERSION, SERIES_DOCUMENT_TYPE, SERIES_SCHEMA_VERSION, SeriesReport, SeriesResult,
     Throughput, Validity, ValidityStatus,
 };
@@ -138,6 +138,10 @@ pub struct BenchmarkCaseIdentity {
     pub kind: BenchmarkKind,
     pub throughput: Throughput,
     pub measurement_domain: MeasurementDomain,
+    /// PMU thread scope. This prevents calling-thread and process-thread
+    /// evidence from being treated as the same benchmark case.
+    #[serde(default)]
+    pub pmu_scope: PmuScope,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -149,6 +153,7 @@ impl BenchmarkCaseIdentity {
             kind: result.kind,
             throughput: result.stats.throughput.clone(),
             measurement_domain: result.stats.measurement_domain,
+            pmu_scope: result.stats.pmu_scope,
             metadata: result.metadata.clone(),
         }
     }
@@ -1619,6 +1624,7 @@ pub(crate) fn result_identity_matches(
         && current.metadata == previous.metadata
         && current.stats.throughput == previous.stats.throughput
         && current.stats.measurement_domain == previous.stats.measurement_domain
+        && current.stats.pmu_scope == previous.stats.pmu_scope
 }
 
 pub(crate) fn pair_results_one_to_one<'current, 'previous>(
@@ -1701,6 +1707,7 @@ mod tests {
                 pmu_time_running_ns: 0,
                 measurement_domain: MeasurementDomain::Cpu,
                 measurement_label: String::new(),
+                pmu_scope: PmuScope::CallingThread,
                 emits_cpu_diagnostics: true,
                 metrics: Vec::new(),
                 sample_metrics: Vec::new(),
@@ -1856,6 +1863,24 @@ mod tests {
             .metadata
             .insert("cache".to_string(), "cold".to_string());
         let baseline = report(&[("a", 100.0)]);
+
+        let comparison = current
+            .compare(
+                &baseline,
+                &ComparisonOptions::default().allow_partial_result_set(true),
+            )
+            .unwrap();
+        assert_eq!(comparison.summary.matched, 0);
+        assert_eq!(comparison.summary.added, 1);
+        assert_eq!(comparison.summary.removed, 1);
+    }
+
+    #[test]
+    fn pmu_scopes_are_comparison_identity() {
+        let mut current = report(&[("a", 120.0)]);
+        let mut baseline = report(&[("a", 100.0)]);
+        current.results[0].stats.pmu_scope = PmuScope::ProcessThreads;
+        baseline.results[0].stats.pmu_scope = PmuScope::CallingThread;
 
         let comparison = current
             .compare(

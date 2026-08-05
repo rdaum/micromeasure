@@ -15,7 +15,7 @@
 // Demonstrates Phase 1 of the GPU benchmarking work
 // (book/src/gpu-sharp-edges.md): declaring a benchmark group as
 // `MeasurementDomain::Gpu` so the runner suppresses CPU-PMU bottleneck
-// diagnostics and relabels the PMU coverage byline as
+// diagnostics and relabels the PMU scheduling byline as
 // "host PMU (orchestration)".
 //
 // The kernel here is a stand-in for one synchronized device operation
@@ -31,8 +31,8 @@
 // which is misleading for GPU work. With `MeasurementDomain::Gpu`:
 //
 //   - the "possible bottlenecks:" section is suppressed entirely
-//   - the PMU coverage byline reads:
-//       host PMU (orchestration): coverage=100.0% ...
+//   - the PMU scheduling byline reads:
+//       host PMU (orchestration): scheduled=100.0% ...
 //
 // Run with:
 //   cargo run --example gpu_domain --release

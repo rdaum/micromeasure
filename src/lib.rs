@@ -38,15 +38,13 @@ mod suite;
 pub mod table;
 mod threading;
 
-#[cfg(target_os = "linux")]
-pub use bench::LinuxPerfBackend;
 pub use bench::backend::BenchSampleResult;
 pub use bench::{
     BenchContext, BenchmarkCaseOrder, BenchmarkRunner, BenchmarkRuntimeOptions,
     ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentBenchmarkGroup, ConcurrentSampleInfo,
     ConcurrentSampleLifecycle, ConcurrentSamplePhase, ConcurrentWorker, ConcurrentWorkerResult,
     CounterValue, DiagnosticError, DiagnosticResult, MeasurementBackend, MeasurementDomain,
-    MetricFormat, MetricValue, NoContext, Throughput, WallClockBackend,
+    MetricFormat, MetricValue, NoContext, PmuScope, Throughput, WallClockBackend,
 };
 #[cfg(feature = "cuda")]
 pub use bench::{CudaError, CudaEvent, CudaEventBackend, CudaResult};
@@ -55,6 +53,8 @@ pub use bench::{
     DEFAULT_NVIDIA_GPU_COUNTERS, GpuCounterCollector, GpuCounterError, GpuCounterMetric,
     GpuCounterResult,
 };
+#[cfg(target_os = "linux")]
+pub use bench::{LinuxPerfBackend, LinuxPerfThreadSet};
 pub use comparison::{
     BenchmarkCaseIdentity, COMPARISON_SCHEMA_VERSION, ComparisonCaseIdentity,
     ComparisonCaseSnapshot, ComparisonError, ComparisonOptions, ComparisonReport, ComparisonSide,

@@ -92,8 +92,10 @@ Throughput::per_operation(amount, unit)    // arbitrary unit
 |---|---|---|
 | `MeasurementBackend` | Object-safe trait: `begin`, `end`, `collect`, `measurement_label`, `emits_cpu_diagnostics`. | `src/bench/backend.rs` |
 | `MeasurementDomain` | `Cpu` / `Gpu` / `Io` / `Mixed`. | `src/bench/backend.rs` |
+| `PmuScope` | Persisted PMU identity: `CallingThread`, `ProcessThreads`, `RegisteredThreads`, or `ManagedWorkers`. | `src/bench/backend.rs` |
 | `WallClockBackend` | Timing-only fallback. | `src/bench/backend.rs` |
-| `LinuxPerfBackend` | Linux default (perf-event group + fallback). Linux only. | `src/bench/perf.rs` |
+| `LinuxPerfBackend` | Linux default. Calling-thread scope by default; `process_threads()` and `registered_threads(...)` cover existing external workers. Linux only. | `src/bench/perf.rs` |
+| `LinuxPerfThreadSet` | Reusable registered worker set; `register_current`, `unregister_current`, `len`, `is_empty`. Linux only. | `src/bench/perf.rs` |
 | `PerfCounters` | Low-level perf counter handle. Linux only. | `src/bench/perf.rs` |
 | `CudaEventBackend` | CUDA event timing on default stream. `cuda` feature. | `src/bench/cuda.rs` |
 | `CudaEvent` / `CudaError` / `CudaResult` | CUDA runtime helpers. `cuda` feature. | `src/bench/cuda.rs` |
@@ -146,7 +148,7 @@ Register with `g.diagnostic_pass(f)` and `g.diagnostic_samples(n)` on a `Benchma
 | `ComparisonOptions` | Strict per-suite case comparison by default; `allow_partial_result_set(true)` reports matching, added, and removed cases, `require_same_suite_set(true)` rejects missing directory suites, and `with_environment_override(reason)` explicitly permits and records an environment mismatch. | `src/comparison.rs` |
 | `EnvironmentOverride` / `EnvironmentComparison` | Operator justification plus both original runner IDs and environment maps retained in the comparison artifact. | `src/comparison.rs` |
 | `ComparisonReport` | Versioned, serializable, policy-free comparison with report references, environment relationship, matched cases, unmatched cases, and summary counts. | `src/comparison.rs` |
-| `BenchmarkCaseIdentity` | Native case identity: group, name, kind, throughput configuration, measurement domain, and metadata. | `src/comparison.rs` |
+| `BenchmarkCaseIdentity` | Native case identity: group, name, kind, throughput configuration, measurement domain, PMU scope, and metadata. | `src/comparison.rs` |
 | `SeriesCaseIdentity` | External case identity: group, name, measurement, unit, direction, and comparison dimensions. | `src/comparison.rs` |
 | `ComparisonCaseIdentity` | Native-or-series identity retained on matched and unmatched comparison cases. | `src/comparison.rs` |
 | `PrimaryMeasurement` | Normalized measurement kind, unit, direction, chronological samples, and optional valid finite median. | `src/comparison.rs` |

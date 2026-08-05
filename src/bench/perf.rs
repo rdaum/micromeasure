@@ -4,8 +4,12 @@ use super::{
 };
 use crate::bench::backend::{MeasurementBackend, MetricValue};
 use std::{
-    io,
-    sync::atomic::{AtomicBool, Ordering},
+    collections::BTreeSet,
+    fs, io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -16,7 +20,116 @@ use perf_event::{Builder, Group};
 #[cfg(target_os = "linux")]
 use std::sync::{Mutex, OnceLock};
 
-const MIN_PMU_ACTIVE_PERCENT: f64 = 90.0;
+const MIN_PMU_SCHEDULED_PERCENT: f64 = 90.0;
+
+/// A reusable set of Linux thread IDs for targeted PMU measurement.
+///
+/// Register externally managed workers once (for example with
+/// `rayon::ThreadPool::broadcast`) and pass the set to
+/// [`LinuxPerfBackend::registered_threads`]. Stale thread IDs are ignored
+/// when a sample opens its counters.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+pub struct LinuxPerfThreadSet {
+    tids: Arc<Mutex<BTreeSet<libc::pid_t>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPerfThreadSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add the calling thread to this measurement set.
+    pub fn register_current(&self) -> libc::pid_t {
+        let tid = current_thread_id();
+        let lock = self.tids.lock();
+        let mut tids = match lock {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tids.insert(tid);
+        tid
+    }
+
+    /// Remove the calling thread from this measurement set.
+    pub fn unregister_current(&self) -> bool {
+        let tid = current_thread_id();
+        let lock = self.tids.lock();
+        let mut tids = match lock {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tids.remove(&tid)
+    }
+
+    pub fn len(&self) -> usize {
+        let lock = self.tids.lock();
+        match lock {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn snapshot(&self) -> Vec<libc::pid_t> {
+        let lock = self.tids.lock();
+        match lock {
+            Ok(guard) => guard.iter().copied().collect(),
+            Err(poisoned) => poisoned.into_inner().iter().copied().collect(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_thread_id() -> libc::pid_t {
+    // Linux gettid has no libc wrapper on all supported libc versions.
+    unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
+}
+
+#[cfg(target_os = "linux")]
+fn process_thread_ids() -> io::Result<Vec<libc::pid_t>> {
+    let mut tids = Vec::new();
+    for entry in fs::read_dir("/proc/self/task")? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Ok(tid) = name.parse::<libc::pid_t>() {
+            tids.push(tid);
+        }
+    }
+    tids.sort_unstable();
+    tids.dedup();
+    Ok(tids)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+enum PerfScope {
+    CurrentThread,
+    ProcessThreads,
+    RegisteredThreads(LinuxPerfThreadSet),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum PerfTarget {
+    CurrentThread,
+    Thread(libc::pid_t),
+}
+
+#[cfg(target_os = "linux")]
+impl PerfTarget {
+    fn configure(self, builder: &mut Builder<'_>) {
+        if let Self::Thread(tid) = self {
+            builder.observe_pid(tid);
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 struct PerfGroupCounters {
@@ -32,7 +145,7 @@ struct PerfGroupCounters {
     stalled_cycles_backend: Option<perf_event::Counter>,
 }
 
-pub(super) fn pmu_active_percent(results: &Results) -> f64 {
+pub(super) fn pmu_scheduled_percent(results: &Results) -> f64 {
     safe_ratio_f64(
         results.pmu_time_running_ns as f64,
         results.pmu_time_enabled_ns as f64,
@@ -44,10 +157,10 @@ pub(super) fn enforce_pmu_quality(name: &str, has_perf_counters: bool, results: 
         return;
     }
 
-    let active_percent = pmu_active_percent(results);
-    if active_percent < MIN_PMU_ACTIVE_PERCENT {
+    let scheduled_percent = pmu_scheduled_percent(results);
+    if scheduled_percent < MIN_PMU_SCHEDULED_PERCENT {
         eprintln!(
-            "⚠️ PMU counters were multiplexed too heavily for benchmark '{name}': active {active_percent:.1}% < {MIN_PMU_ACTIVE_PERCENT:.1}%"
+            "⚠️ PMU counters were scheduled too little for benchmark '{name}': {scheduled_percent:.1}% < {MIN_PMU_SCHEDULED_PERCENT:.1}%; scaled values may be unreliable"
         );
     }
 }
@@ -200,8 +313,11 @@ fn try_add_group_counter(
     group: &mut Group,
     event: Hardware,
     name: &str,
+    target: PerfTarget,
 ) -> Option<perf_event::Counter> {
-    match group.add(&Builder::new(event)) {
+    let mut builder = Builder::new(event);
+    target.configure(&mut builder);
+    match group.add(&builder) {
         Ok(counter) => Some(counter),
         Err(error) => {
             record_perf_issue(format!("perf event '{name}' unavailable: {error}"));
@@ -211,12 +327,14 @@ fn try_add_group_counter(
 }
 
 #[cfg(target_os = "linux")]
-fn try_add_l1i_group_counter(group: &mut Group) -> Option<perf_event::Counter> {
-    match group.add(&Builder::new(Cache {
+fn try_add_l1i_group_counter(group: &mut Group, target: PerfTarget) -> Option<perf_event::Counter> {
+    let mut builder = Builder::new(Cache {
         which: CacheId::L1I,
         operation: CacheOp::READ,
         result: CacheResult::MISS,
-    })) {
+    });
+    target.configure(&mut builder);
+    match group.add(&builder) {
         Ok(counter) => Some(counter),
         Err(error) => {
             record_perf_issue(format!("perf event 'l1i-misses' unavailable: {error}"));
@@ -226,14 +344,14 @@ fn try_add_l1i_group_counter(group: &mut Group) -> Option<perf_event::Counter> {
 }
 
 #[cfg(target_os = "linux")]
-fn try_build_l1i_counter() -> Option<perf_event::Counter> {
-    match Builder::new(Cache {
+fn try_build_l1i_counter(target: PerfTarget) -> Option<perf_event::Counter> {
+    let mut builder = Builder::new(Cache {
         which: CacheId::L1I,
         operation: CacheOp::READ,
         result: CacheResult::MISS,
-    })
-    .build()
-    {
+    });
+    target.configure(&mut builder);
+    match builder.build() {
         Ok(counter) => Some(counter),
         Err(error) => {
             record_perf_issue(format!("perf event 'l1i-misses' unavailable: {error}"));
@@ -243,8 +361,10 @@ fn try_build_l1i_counter() -> Option<perf_event::Counter> {
 }
 
 #[cfg(target_os = "linux")]
-fn build_perf_counter_group() -> Option<PerfGroupCounters> {
-    let mut group = match Group::new() {
+fn build_perf_counter_group(target: PerfTarget) -> Option<PerfGroupCounters> {
+    let mut group_builder = Group::builder();
+    target.configure(&mut group_builder);
+    let mut group = match group_builder.build_group() {
         Ok(group) => group,
         Err(error) => {
             record_perf_issue(format!("perf group unavailable: {error}"));
@@ -252,23 +372,37 @@ fn build_perf_counter_group() -> Option<PerfGroupCounters> {
         }
     };
 
-    let cycles = try_add_group_counter(&mut group, Hardware::CPU_CYCLES, "cycles");
-    let instructions = try_add_group_counter(&mut group, Hardware::INSTRUCTIONS, "instructions");
-    let cache_references =
-        try_add_group_counter(&mut group, Hardware::CACHE_REFERENCES, "cache-references");
-    let l1i_misses = try_add_l1i_group_counter(&mut group);
-    let branches = try_add_group_counter(&mut group, Hardware::BRANCH_INSTRUCTIONS, "branches");
-    let branch_misses = try_add_group_counter(&mut group, Hardware::BRANCH_MISSES, "branch-misses");
-    let cache_misses = try_add_group_counter(&mut group, Hardware::CACHE_MISSES, "cache-misses");
+    let cycles = try_add_group_counter(&mut group, Hardware::CPU_CYCLES, "cycles", target);
+    let instructions =
+        try_add_group_counter(&mut group, Hardware::INSTRUCTIONS, "instructions", target);
+    let cache_references = try_add_group_counter(
+        &mut group,
+        Hardware::CACHE_REFERENCES,
+        "cache-references",
+        target,
+    );
+    let l1i_misses = try_add_l1i_group_counter(&mut group, target);
+    let branches = try_add_group_counter(
+        &mut group,
+        Hardware::BRANCH_INSTRUCTIONS,
+        "branches",
+        target,
+    );
+    let branch_misses =
+        try_add_group_counter(&mut group, Hardware::BRANCH_MISSES, "branch-misses", target);
+    let cache_misses =
+        try_add_group_counter(&mut group, Hardware::CACHE_MISSES, "cache-misses", target);
     let stalled_cycles_frontend = try_add_group_counter(
         &mut group,
         Hardware::STALLED_CYCLES_FRONTEND,
         "stalled-cycles-frontend",
+        target,
     );
     let stalled_cycles_backend = try_add_group_counter(
         &mut group,
         Hardware::STALLED_CYCLES_BACKEND,
         "stalled-cycles-backend",
+        target,
     );
 
     if cycles.is_none()
@@ -300,8 +434,14 @@ fn build_perf_counter_group() -> Option<PerfGroupCounters> {
 }
 
 #[cfg(target_os = "linux")]
-fn try_build_individual_counter(event: Hardware, name: &str) -> Option<perf_event::Counter> {
-    match Builder::new(event).build() {
+fn try_build_individual_counter(
+    event: Hardware,
+    name: &str,
+    target: PerfTarget,
+) -> Option<perf_event::Counter> {
+    let mut builder = Builder::new(event);
+    target.configure(&mut builder);
+    match builder.build() {
         Ok(counter) => Some(counter),
         Err(error) => {
             record_perf_issue(format!("perf event '{name}' unavailable: {error}"));
@@ -318,10 +458,11 @@ fn read_scaled_counter(counter: &mut Option<perf_event::Counter>, name: &str) ->
 
     match counter.read_count_and_time() {
         Ok(cat) => {
-            if cat.count > 0 && (cat.time_enabled == 0 || cat.time_running == 0) {
+            if cat.time_enabled == 0 || cat.time_running == 0 {
                 record_perf_issue(format!(
-                    "perf event '{name}' missing timing metadata (enabled/running); using raw count"
+                    "perf event '{name}' has no usable scheduled window; omitting it"
                 ));
+                return (0, cat.time_enabled, cat.time_running);
             }
             (
                 scale_multiplexed_count(cat.count, cat.time_enabled, cat.time_running),
@@ -366,19 +507,26 @@ fn timing_window(timing_candidates: &[(u64, u64)]) -> (u64, u64) {
     timing_candidates
         .iter()
         .copied()
-        .find(|(_, running)| *running > 0)
-        .or_else(|| {
-            timing_candidates
-                .iter()
-                .copied()
-                .find(|(enabled, _)| *enabled > 0)
-        })
+        .filter(|(enabled, _)| *enabled > 0)
+        .min_by(
+            |(left_enabled, left_running), (right_enabled, right_running)| {
+                // Compare running/enabled without losing precision to floating
+                // point. The least-scheduled event is the conservative quality
+                // indicator for independently multiplexed counters.
+                ((*left_running as u128) * (*right_enabled as u128))
+                    .cmp(&((*right_running as u128) * (*left_enabled as u128)))
+            },
+        )
         .unwrap_or((0, 0))
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn prepare_concurrent_worker_measurement() -> LinuxPerfBackend {
     let mut backend = LinuxPerfBackend::new();
+    // Concurrent workers are recreated for every sample, so they cannot
+    // remember that an oversized group was unschedulable on a prior sample.
+    // Start directly with independently multiplexed counters.
+    backend.prefer_individual = true;
     backend.prepare();
     backend
 }
@@ -529,6 +677,12 @@ enum PerfMode {
     None,
 }
 
+#[cfg(target_os = "linux")]
+struct TargetMeasurement {
+    target: PerfTarget,
+    mode: PerfMode,
+}
+
 /// Standalone (ungrouped) perf counters, used when the grouped path is
 /// unavailable. Extracted from the historic `run_with_individual_counters`
 /// function so the counter handles can live across `begin` / `end` /
@@ -556,20 +710,17 @@ struct IndividualCounters {
 /// [`Results`]. Concurrent workers use the internal prepare/activate split.
 ///
 /// This backend is the default on Linux; on other platforms
-/// [`WallClockBackend`] is the default.
+/// [`crate::WallClockBackend`] is the default.
 ///
-/// ## Behavioural note
-///
-/// The historic `execute_standard` path re-ran the bench closure with
-/// individual counters if the perf group produced all-zero data after a
-/// successful run. This backend does NOT re-run the closure — if the
-/// perf group produces zero data, the sample is reported with empty PMU
-/// fields (effectively timing-only). This avoids the surprising
-/// double-execution of the bench closure and is the correct behaviour for
-/// a measurement backend that owns the sample window.
+/// By default only the calling thread is measured. [`process_threads`](Self::process_threads)
+/// snapshots all existing threads before every sample, while
+/// [`registered_threads`](Self::registered_threads) targets a caller-managed
+/// set such as the workers of an existing Rayon pool.
 #[cfg(target_os = "linux")]
 pub struct LinuxPerfBackend {
-    mode: PerfMode,
+    scope: PerfScope,
+    measurements: Vec<TargetMeasurement>,
+    prefer_individual: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -583,39 +734,94 @@ impl Default for LinuxPerfBackend {
 impl LinuxPerfBackend {
     pub fn new() -> Self {
         Self {
-            mode: PerfMode::Idle,
+            scope: PerfScope::CurrentThread,
+            measurements: Vec::new(),
+            prefer_individual: false,
+        }
+    }
+
+    /// Measure every thread that exists in the calling process when a sample
+    /// begins. Threads created during the sample are not inherited; initialize
+    /// long-lived worker pools before entering the benchmark window.
+    pub fn process_threads() -> Self {
+        Self {
+            scope: PerfScope::ProcessThreads,
+            measurements: Vec::new(),
+            prefer_individual: true,
+        }
+    }
+
+    /// Measure only threads contained in `threads`.
+    pub fn registered_threads(threads: LinuxPerfThreadSet) -> Self {
+        Self {
+            scope: PerfScope::RegisteredThreads(threads),
+            measurements: Vec::new(),
+            prefer_individual: true,
+        }
+    }
+
+    fn targets(&self) -> Vec<PerfTarget> {
+        match &self.scope {
+            PerfScope::CurrentThread => vec![PerfTarget::CurrentThread],
+            PerfScope::ProcessThreads => match process_thread_ids() {
+                Ok(tids) => tids.into_iter().map(PerfTarget::Thread).collect(),
+                Err(error) => {
+                    record_perf_issue(format!("could not enumerate process threads: {error}"));
+                    Vec::new()
+                }
+            },
+            PerfScope::RegisteredThreads(threads) => threads
+                .snapshot()
+                .into_iter()
+                .map(PerfTarget::Thread)
+                .collect(),
         }
     }
 
     /// Try to build grouped perf counters without activating them.
-    fn try_prepare_group(&mut self) -> bool {
-        let Some(perf) = build_perf_counter_group() else {
-            return false;
-        };
-        self.mode = PerfMode::Group(perf);
-        true
+    fn try_prepare_group(target: PerfTarget) -> Option<PerfMode> {
+        build_perf_counter_group(target).map(PerfMode::Group)
     }
 
     /// Build individual counters without activating them.
-    fn prepare_individual(&mut self) {
+    fn prepare_individual(target: PerfTarget) -> PerfMode {
         let ind = IndividualCounters {
-            cycles: try_build_individual_counter(Hardware::CPU_CYCLES, "cycles"),
-            instructions: try_build_individual_counter(Hardware::INSTRUCTIONS, "instructions"),
+            cycles: try_build_individual_counter(Hardware::CPU_CYCLES, "cycles", target),
+            instructions: try_build_individual_counter(
+                Hardware::INSTRUCTIONS,
+                "instructions",
+                target,
+            ),
             cache_references: try_build_individual_counter(
                 Hardware::CACHE_REFERENCES,
                 "cache-references",
+                target,
             ),
-            l1i_misses: try_build_l1i_counter(),
-            branches: try_build_individual_counter(Hardware::BRANCH_INSTRUCTIONS, "branches"),
-            branch_misses: try_build_individual_counter(Hardware::BRANCH_MISSES, "branch-misses"),
-            cache_misses: try_build_individual_counter(Hardware::CACHE_MISSES, "cache-misses"),
+            l1i_misses: try_build_l1i_counter(target),
+            branches: try_build_individual_counter(
+                Hardware::BRANCH_INSTRUCTIONS,
+                "branches",
+                target,
+            ),
+            branch_misses: try_build_individual_counter(
+                Hardware::BRANCH_MISSES,
+                "branch-misses",
+                target,
+            ),
+            cache_misses: try_build_individual_counter(
+                Hardware::CACHE_MISSES,
+                "cache-misses",
+                target,
+            ),
             stalled_cycles_frontend: try_build_individual_counter(
                 Hardware::STALLED_CYCLES_FRONTEND,
                 "stalled-cycles-frontend",
+                target,
             ),
             stalled_cycles_backend: try_build_individual_counter(
                 Hardware::STALLED_CYCLES_BACKEND,
                 "stalled-cycles-backend",
+                target,
             ),
         };
 
@@ -630,33 +836,38 @@ impl LinuxPerfBackend {
             && ind.stalled_cycles_backend.is_none();
 
         if all_none {
-            // No counters at all — fall through to timing-only mode.
-            // Preserve the historical timing-only fallback when no event can
-            // be opened.
-            self.mode = PerfMode::None;
-            return;
+            return PerfMode::None;
         }
 
         record_perf_issue("using ungrouped perf counters fallback".to_string());
-        self.mode = PerfMode::Individual(ind);
+        PerfMode::Individual(ind)
     }
 
     /// Open all perf-event handles for a future sample without enabling them.
     pub(super) fn prepare(&mut self) {
-        self.mode = PerfMode::Idle;
-        if !self.try_prepare_group() {
-            self.prepare_individual();
+        self.measurements.clear();
+        let targets = self.targets();
+        if targets.is_empty() {
+            record_perf_issue("PMU scope contains no live threads".to_string());
+        }
+        for target in targets {
+            let mode = if self.prefer_individual {
+                Self::prepare_individual(target)
+            } else {
+                Self::try_prepare_group(target).unwrap_or_else(|| Self::prepare_individual(target))
+            };
+            self.measurements.push(TargetMeasurement { target, mode });
         }
     }
 
     /// Activate handles previously opened by [`Self::prepare`]. Returns false
     /// only when a prepared group cannot be enabled or no state was prepared.
-    fn enable_prepared(&mut self) -> bool {
-        match &mut self.mode {
+    fn enable_prepared(mode: &mut PerfMode) -> bool {
+        match mode {
             PerfMode::Group(perf) => {
                 if let Err(error) = perf.group.enable() {
                     record_perf_issue(format!("perf group enable failed: {error}"));
-                    self.mode = PerfMode::Idle;
+                    *mode = PerfMode::Idle;
                     false
                 } else {
                     true
@@ -684,9 +895,12 @@ impl LinuxPerfBackend {
     /// this before their measurement-ready barrier, so the fallback remains
     /// outside the workload deadline.
     pub(super) fn begin_prepared(&mut self) {
-        if !self.enable_prepared() {
-            self.prepare_individual();
-            let _ = self.enable_prepared();
+        for measurement in &mut self.measurements {
+            if !Self::enable_prepared(&mut measurement.mode) {
+                self.prefer_individual = true;
+                measurement.mode = Self::prepare_individual(measurement.target);
+                let _ = Self::enable_prepared(&mut measurement.mode);
+            }
         }
     }
 
@@ -713,7 +927,7 @@ impl LinuxPerfBackend {
         host_elapsed: Duration,
         ops: u64,
         results: &mut Results,
-    ) {
+    ) -> bool {
         let counts = match perf.group.read() {
             Ok(counts) => counts,
             Err(error) => {
@@ -721,7 +935,7 @@ impl LinuxPerfBackend {
                 results.duration = host_elapsed;
                 results.iterations = ops;
                 results.chunks_executed = 1;
-                return;
+                return true;
             }
         };
 
@@ -780,54 +994,49 @@ impl LinuxPerfBackend {
             .and_then(|counter| counts.get(counter).map(|entry| entry.value()))
             .unwrap_or(0);
 
-        if (enabled_ns == 0 || running_ns == 0)
-            && cycles_raw == 0
-            && instructions_raw == 0
-            && cache_references_raw == 0
-            && l1i_misses_raw == 0
-            && branches_raw == 0
-            && branch_misses_raw == 0
-            && cache_misses_raw == 0
-            && stalled_cycles_frontend_raw == 0
-            && stalled_cycles_backend_raw == 0
-        {
+        let usable_timing = enabled_ns > 0 && running_ns > 0;
+        if !usable_timing {
             record_perf_issue(
-                "perf counters reported unusable timing window (enabled/running)".to_string(),
+                "perf group was opened but never scheduled; switching to ungrouped counters"
+                    .to_string(),
             );
         }
 
-        if enabled_ns == 0 || running_ns == 0 {
-            record_perf_issue(
-                "perf counters reported unusable timing window (enabled/running)".to_string(),
-            );
+        if usable_timing {
+            results.cycles = scale_multiplexed_count(cycles_raw, enabled_ns, running_ns);
+            results.instructions =
+                scale_multiplexed_count(instructions_raw, enabled_ns, running_ns);
+            results.cache_references =
+                scale_multiplexed_count(cache_references_raw, enabled_ns, running_ns);
+            results.l1i_misses = scale_multiplexed_count(l1i_misses_raw, enabled_ns, running_ns);
+            results.branches = scale_multiplexed_count(branches_raw, enabled_ns, running_ns);
+            results.branch_misses =
+                scale_multiplexed_count(branch_misses_raw, enabled_ns, running_ns);
+            results.cache_misses =
+                scale_multiplexed_count(cache_misses_raw, enabled_ns, running_ns);
+            results.stalled_cycles_frontend =
+                scale_multiplexed_count(stalled_cycles_frontend_raw, enabled_ns, running_ns);
+            results.stalled_cycles_backend =
+                scale_multiplexed_count(stalled_cycles_backend_raw, enabled_ns, running_ns);
+            results.has_cycles = perf.cycles.is_some();
+            results.has_instructions = perf.instructions.is_some();
+            results.has_cache_references = perf.cache_references.is_some();
+            results.has_l1i_misses = perf.l1i_misses.is_some();
+            results.has_branches = perf.branches.is_some();
+            results.has_branch_misses = perf.branch_misses.is_some();
+            results.has_cache_misses = perf.cache_misses.is_some();
+            results.has_stalled_cycles_frontend = perf.stalled_cycles_frontend.is_some();
+            results.has_stalled_cycles_backend = perf.stalled_cycles_backend.is_some();
         }
-
-        results.cycles = scale_multiplexed_count(cycles_raw, enabled_ns, running_ns);
-        results.instructions = scale_multiplexed_count(instructions_raw, enabled_ns, running_ns);
-        results.cache_references =
-            scale_multiplexed_count(cache_references_raw, enabled_ns, running_ns);
-        results.l1i_misses = scale_multiplexed_count(l1i_misses_raw, enabled_ns, running_ns);
-        results.branches = scale_multiplexed_count(branches_raw, enabled_ns, running_ns);
-        results.branch_misses = scale_multiplexed_count(branch_misses_raw, enabled_ns, running_ns);
-        results.cache_misses = scale_multiplexed_count(cache_misses_raw, enabled_ns, running_ns);
-        results.stalled_cycles_frontend =
-            scale_multiplexed_count(stalled_cycles_frontend_raw, enabled_ns, running_ns);
-        results.stalled_cycles_backend =
-            scale_multiplexed_count(stalled_cycles_backend_raw, enabled_ns, running_ns);
-        results.has_cycles = perf.cycles.is_some();
-        results.has_instructions = perf.instructions.is_some();
-        results.has_cache_references = perf.cache_references.is_some();
-        results.has_l1i_misses = perf.l1i_misses.is_some();
-        results.has_branches = perf.branches.is_some();
-        results.has_branch_misses = perf.branch_misses.is_some();
-        results.has_cache_misses = perf.cache_misses.is_some();
-        results.has_stalled_cycles_frontend = perf.stalled_cycles_frontend.is_some();
-        results.has_stalled_cycles_backend = perf.stalled_cycles_backend.is_some();
         results.pmu_time_enabled_ns = enabled_ns;
         results.pmu_time_running_ns = running_ns;
         results.duration = host_elapsed;
         results.iterations = ops;
         results.chunks_executed = 1;
+
+        !usable_timing
+            || safe_ratio_f64(running_ns as f64, enabled_ns as f64) * 100.0
+                < MIN_PMU_SCHEDULED_PERCENT
     }
 
     fn collect_individual(
@@ -888,15 +1097,26 @@ impl LinuxPerfBackend {
         results.cache_misses = cache_misses;
         results.stalled_cycles_frontend = stalled_cycles_frontend;
         results.stalled_cycles_backend = stalled_cycles_backend;
-        results.has_cycles = ind.cycles.is_some();
-        results.has_instructions = ind.instructions.is_some();
-        results.has_cache_references = ind.cache_references.is_some();
-        results.has_l1i_misses = ind.l1i_misses.is_some();
-        results.has_branches = ind.branches.is_some();
-        results.has_branch_misses = ind.branch_misses.is_some();
-        results.has_cache_misses = ind.cache_misses.is_some();
-        results.has_stalled_cycles_frontend = ind.stalled_cycles_frontend.is_some();
-        results.has_stalled_cycles_backend = ind.stalled_cycles_backend.is_some();
+        results.has_cycles = ind.cycles.is_some() && cycles_enabled > 0 && cycles_running > 0;
+        results.has_instructions =
+            ind.instructions.is_some() && instructions_enabled > 0 && instructions_running > 0;
+        results.has_cache_references = ind.cache_references.is_some()
+            && cache_references_enabled > 0
+            && cache_references_running > 0;
+        results.has_l1i_misses =
+            ind.l1i_misses.is_some() && l1i_misses_enabled > 0 && l1i_misses_running > 0;
+        results.has_branches =
+            ind.branches.is_some() && branches_enabled > 0 && branches_running > 0;
+        results.has_branch_misses =
+            ind.branch_misses.is_some() && branch_misses_enabled > 0 && branch_misses_running > 0;
+        results.has_cache_misses =
+            ind.cache_misses.is_some() && cache_misses_enabled > 0 && cache_misses_running > 0;
+        results.has_stalled_cycles_frontend = ind.stalled_cycles_frontend.is_some()
+            && stalled_cycles_frontend_enabled > 0
+            && stalled_cycles_frontend_running > 0;
+        results.has_stalled_cycles_backend = ind.stalled_cycles_backend.is_some()
+            && stalled_cycles_backend_enabled > 0
+            && stalled_cycles_backend_running > 0;
         results.pmu_time_enabled_ns = pmu_time_enabled_ns;
         results.pmu_time_running_ns = pmu_time_running_ns;
         results.duration = host_elapsed;
@@ -913,10 +1133,12 @@ impl MeasurementBackend for LinuxPerfBackend {
     }
 
     fn end(&mut self) {
-        match &mut self.mode {
-            PerfMode::Group(perf) => Self::disable_group(perf),
-            PerfMode::Individual(ind) => Self::disable_individual(ind),
-            PerfMode::None | PerfMode::Idle => {}
+        for measurement in &mut self.measurements {
+            match &mut measurement.mode {
+                PerfMode::Group(perf) => Self::disable_group(perf),
+                PerfMode::Individual(ind) => Self::disable_individual(ind),
+                PerfMode::None | PerfMode::Idle => {}
+            }
         }
     }
 
@@ -928,23 +1150,46 @@ impl MeasurementBackend for LinuxPerfBackend {
         results: &mut Results,
         _metrics: &mut Vec<MetricValue>,
     ) {
-        match &mut self.mode {
-            PerfMode::Group(perf) => Self::collect_group(perf, host_elapsed, ops, results),
-            PerfMode::Individual(ind) => Self::collect_individual(ind, host_elapsed, ops, results),
-            PerfMode::None | PerfMode::Idle => {
-                // No PMU counters — write timing only.
-                results.duration = host_elapsed;
-                results.iterations = ops;
-                results.chunks_executed = 1;
+        let mut aggregate = Results::default();
+        let mut prefer_individual = self.prefer_individual;
+        for measurement in &mut self.measurements {
+            let mut thread_results = Results::default();
+            match &mut measurement.mode {
+                PerfMode::Group(perf) => {
+                    prefer_individual |=
+                        Self::collect_group(perf, Duration::ZERO, 0, &mut thread_results);
+                }
+                PerfMode::Individual(ind) => {
+                    Self::collect_individual(ind, Duration::ZERO, 0, &mut thread_results)
+                }
+                PerfMode::None | PerfMode::Idle => {}
             }
+            aggregate.add(&thread_results);
         }
+        aggregate.duration = host_elapsed;
+        aggregate.iterations = ops;
+        aggregate.chunks_executed = 1;
+        *results = aggregate;
+        self.prefer_individual = prefer_individual;
 
         // Reset for the next sample window.
-        self.mode = PerfMode::Idle;
+        self.measurements.clear();
     }
 
     fn measurement_label(&self) -> &'static str {
-        "timing + PMU"
+        match self.scope {
+            PerfScope::CurrentThread => "timing + PMU",
+            PerfScope::ProcessThreads => "timing + process-thread PMU",
+            PerfScope::RegisteredThreads(_) => "timing + registered-thread PMU",
+        }
+    }
+
+    fn pmu_scope(&self) -> crate::PmuScope {
+        match self.scope {
+            PerfScope::CurrentThread => crate::PmuScope::CallingThread,
+            PerfScope::ProcessThreads => crate::PmuScope::ProcessThreads,
+            PerfScope::RegisteredThreads(_) => crate::PmuScope::RegisteredThreads,
+        }
     }
 
     fn emits_cpu_diagnostics(&self) -> bool {
@@ -954,20 +1199,66 @@ impl MeasurementBackend for LinuxPerfBackend {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{LinuxPerfBackend, PerfMode};
+    use super::{
+        LinuxPerfBackend, LinuxPerfThreadSet, PerfMode, PerfTarget, TargetMeasurement,
+        current_thread_id, process_thread_ids, timing_window,
+    };
     use crate::MeasurementBackend;
 
     #[test]
     fn prepared_activation_failure_attempts_individual_fallback() {
         let mut backend = LinuxPerfBackend::new();
-        assert!(matches!(backend.mode, PerfMode::Idle));
+        backend.measurements.push(TargetMeasurement {
+            target: PerfTarget::CurrentThread,
+            mode: PerfMode::Idle,
+        });
 
         // Idle is the state left by a grouped-counter activation failure.
         backend.begin_prepared();
         assert!(matches!(
-            backend.mode,
+            backend.measurements[0].mode,
             PerfMode::Individual(_) | PerfMode::None
         ));
         backend.end();
+    }
+
+    #[test]
+    fn timing_window_reports_least_scheduled_counter() {
+        assert_eq!(
+            timing_window(&[(1_000, 800), (1_000, 250), (1_000, 600)]),
+            (1_000, 250)
+        );
+        assert_eq!(timing_window(&[(0, 0), (500, 0)]), (500, 0));
+    }
+
+    #[test]
+    fn registered_thread_set_is_idempotent() {
+        let threads = LinuxPerfThreadSet::new();
+        assert!(threads.is_empty());
+        let tid = threads.register_current();
+        assert_eq!(tid, current_thread_id());
+        threads.register_current();
+        assert_eq!(threads.len(), 1);
+        assert!(threads.unregister_current());
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn process_thread_snapshot_contains_caller() {
+        let tids = process_thread_ids().expect("/proc/self/task should be readable on Linux");
+        assert!(tids.contains(&current_thread_id()));
+    }
+
+    #[test]
+    fn public_scopes_have_distinct_persisted_identity() {
+        let current = LinuxPerfBackend::new();
+        let process = LinuxPerfBackend::process_threads();
+        let registered = LinuxPerfBackend::registered_threads(LinuxPerfThreadSet::new());
+
+        assert_eq!(current.pmu_scope(), crate::PmuScope::CallingThread);
+        assert_eq!(process.pmu_scope(), crate::PmuScope::ProcessThreads);
+        assert_eq!(registered.pmu_scope(), crate::PmuScope::RegisteredThreads);
+        assert_ne!(current.measurement_label(), process.measurement_label());
+        assert_ne!(process.measurement_label(), registered.measurement_label());
     }
 }

@@ -152,6 +152,9 @@ of what it is designed for. When PMU access is unavailable, the crate falls back
 you that it has done so.
 
 See [Linux PMU Setup](./book/src/linux-pmu.md) for `perf_event_paranoid` settings, capabilities, and the fallback chain.
+Benchmarks that dispatch into an existing Rayon or other worker pool can opt
+into process-thread PMU measurement or register the exact worker threads; see
+[Benchmarks that dispatch to existing worker pools](./book/src/linux-pmu.md#benchmarks-that-dispatch-to-existing-worker-pools).
 
 ## What this crate is not
 

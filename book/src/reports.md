@@ -55,7 +55,7 @@ toolchain in `context.provenance` when those values are available. The legacy
 short `git_commit` field remains for compatibility. Provenance describes the
 evidence but never controls whether two reports may be compared.
 
-`BenchmarkStats` (the per-benchmark payload) carries the aggregated numbers: throughput median/p95, latency median/p95, MAD, CV, outlier count, sample count, all the PMU-derived per-op counts, the PMU coverage fields, the `measurement_label`, `measurement_domain`, `emits_cpu_diagnostics`, custom `metrics: Vec<MetricSummary>` (mean/median/p95/min/max/sample count per `(section, name, unit)`), and chronological `sample_metrics`.
+`BenchmarkStats` (the per-benchmark payload) carries the aggregated numbers: throughput median/p95, latency median/p95, MAD, CV, outlier count, sample count, all the PMU-derived per-op counts, the PMU scheduling fields, `pmu_scope`, the `measurement_label`, `measurement_domain`, `emits_cpu_diagnostics`, custom `metrics: Vec<MetricSummary>` (mean/median/p95/min/max/sample count per `(section, name, unit)`), and chronological `sample_metrics`.
 
 ## Supplying report context
 

@@ -361,6 +361,20 @@ pub enum MeasurementDomain {
     Mixed,
 }
 
+/// Linux PMU thread scope used for a persisted benchmark result.
+///
+/// The default preserves the historic calling-thread measurement. Results
+/// captured from different scopes are not comparison-compatible.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PmuScope {
+    #[default]
+    CallingThread,
+    ProcessThreads,
+    RegisteredThreads,
+    ManagedWorkers,
+}
+
 /// Pluggable measurement window for one sample of one benchmark.
 ///
 /// A backend owns whatever domain-specific state it needs across a single
@@ -550,6 +564,12 @@ pub trait MeasurementBackend {
     /// string falls back to the runner default.
     fn measurement_label(&self) -> &'static str {
         ""
+    }
+
+    /// Persisted PMU thread scope used to keep unlike counter evidence from
+    /// being compared. Non-PMU backends may keep the calling-thread default.
+    fn pmu_scope(&self) -> PmuScope {
+        PmuScope::CallingThread
     }
 
     /// Hints the runner whether CPU-PMU bottleneck diagnostics derived from

@@ -15,6 +15,8 @@ Use concurrent benchmarks when the thing you care about only shows up under cont
 
 Do not use it for "run the same CPU bench on N threads and sum the throughput" — that's better expressed as N independent single-threaded benchmarks.
 
+This API owns and measures the worker loops it creates. If one benchmark function instead dispatches into an existing Rayon or other thread pool, keep the standard benchmark API and select `LinuxPerfBackend::process_threads()` or a `LinuxPerfThreadSet`; see [Benchmarks that dispatch to existing worker pools](./linux-pmu.md#benchmarks-that-dispatch-to-existing-worker-pools).
+
 ## The API surface
 
 | Type | Role |

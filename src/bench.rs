@@ -53,7 +53,7 @@ use std::{
 
 pub use backend::{
     DiagnosticError, DiagnosticResult, MeasurementBackend, MeasurementDomain, MetricFormat,
-    MetricValue, WallClockBackend,
+    MetricValue, PmuScope, WallClockBackend,
 };
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaError, CudaEvent, CudaEventBackend, CudaResult};
@@ -65,7 +65,7 @@ pub use gpu_counters::{
 #[cfg(target_os = "linux")]
 pub use perf::LinuxPerfBackend;
 #[cfg(target_os = "linux")]
-pub use perf::PerfCounters;
+pub use perf::{LinuxPerfThreadSet, PerfCounters};
 
 /// Construct the platform-default [`MeasurementBackend`].
 ///
@@ -689,6 +689,18 @@ fn render_result_section(
 
 fn effective_measurement_label(stats: &crate::BenchmarkStats, has_perf: bool) -> String {
     if !stats.measurement_label.is_empty() {
+        if !has_perf
+            && matches!(
+                stats.pmu_scope,
+                PmuScope::CallingThread
+                    | PmuScope::ProcessThreads
+                    | PmuScope::RegisteredThreads
+                    | PmuScope::ManagedWorkers
+            )
+            && stats.measurement_label.contains("PMU")
+        {
+            return "timing only".to_string();
+        }
         stats.measurement_label.clone()
     } else {
         measurement_label(has_perf).to_string()
@@ -1790,6 +1802,7 @@ impl BenchmarkRunner {
             config.target_samples,
             &throughput,
             measurement_domain,
+            backend.pmu_scope(),
             backend.measurement_label(),
             backend.emits_cpu_diagnostics(),
             &all_metrics,
@@ -1951,6 +1964,7 @@ impl BenchmarkRunner {
             config.target_samples,
             &throughput,
             measurement_domain,
+            backend.pmu_scope(),
             backend.measurement_label(),
             backend.emits_cpu_diagnostics(),
             &all_metrics,
@@ -2181,6 +2195,7 @@ impl BenchmarkRunner {
             config.target_samples,
             &throughput,
             measurement_domain,
+            PmuScope::ManagedWorkers,
             backend
                 .as_deref()
                 .map(MeasurementBackend::measurement_label)
@@ -2204,6 +2219,7 @@ impl BenchmarkRunner {
                         config.target_samples,
                         &throughput,
                         measurement_domain,
+                        PmuScope::ManagedWorkers,
                         "",
                         true,
                         &[],
@@ -3111,7 +3127,7 @@ mod tests {
     use super::stats::{median, median_absolute_deviation, percentile, tukey_outlier_count};
     use super::{DiagnosticError, DiagnosticResult, MeasurementDomain, MetricValue, Throughput};
 
-    use crate::{BenchmarkStats, ReportContext};
+    use crate::{BenchmarkStats, PmuScope, ReportContext};
 
     fn stats_with_domain(domain: MeasurementDomain) -> BenchmarkStats {
         // A benchmark whose CPU PMU fields would normally trigger the
@@ -3160,10 +3176,32 @@ mod tests {
             pmu_time_running_ns: 1_000_000_000,
             measurement_domain: domain,
             measurement_label: String::new(),
+            pmu_scope: PmuScope::CallingThread,
             emits_cpu_diagnostics: true,
             metrics: Vec::new(),
             sample_metrics: Vec::new(),
         }
+    }
+
+    #[test]
+    fn unusable_linux_pmu_scope_renders_as_timing_only() {
+        let mut stats = stats_with_domain(MeasurementDomain::Cpu);
+        stats.measurement_label = "timing + process-thread PMU".to_string();
+        stats.pmu_scope = PmuScope::ProcessThreads;
+        stats.has_cycles = false;
+        stats.has_instructions = false;
+        stats.has_cache_references = false;
+        stats.has_l1i_misses = false;
+        stats.has_branches = false;
+        stats.has_branch_misses = false;
+        stats.has_cache_misses = false;
+        stats.has_stalled_cycles_frontend = false;
+        stats.has_stalled_cycles_backend = false;
+
+        assert_eq!(
+            super::effective_measurement_label(&stats, false),
+            "timing only"
+        );
     }
 
     #[test]

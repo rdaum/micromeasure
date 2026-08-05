@@ -37,7 +37,7 @@ benchmark_main!(|runner| {
 With `MeasurementDomain::Gpu`:
 
 - The `possible bottlenecks:` section is suppressed entirely (no "data-side memory latency" diagnostic, even though the host thread's PMU counters would otherwise trigger it).
-- The PMU coverage byline reads `host PMU (orchestration): coverage=...` instead of the default `host PMU (perf event group): coverage=...`.
+- The PMU scheduling byline reads `host PMU (orchestration): scheduled=...` instead of the default `PMU: scheduled=...`.
 - Run-stability warnings (CV, outliers) are **still emitted** if the run is noisy — domain suppression is for CPU-PMU bottleneck diagnostics only.
 
 The example's leading comment records the actual before/after output so you can see the difference without editing the file: with `Cpu` you get `Likely data-side memory latency: backend stall is 89.99% ...`; with `Gpu` that line disappears.

@@ -1,7 +1,7 @@
 use super::{Results, Throughput, safe_ratio_f64, throughput_ops_per_sec};
 use crate::bench::backend::{MetricFormat, MetricValue};
 use crate::session::{MetricSummary, SampleMetric, SampleMetricSet};
-use crate::{Alignment, BenchmarkStats, BorderColor, MeasurementDomain, TableFormatter};
+use crate::{Alignment, BenchmarkStats, BorderColor, MeasurementDomain, PmuScope, TableFormatter};
 use std::io::IsTerminal;
 
 pub(super) fn colorize_label(text: &str) -> String {
@@ -39,6 +39,7 @@ pub(super) fn benchmark_stats_from_samples(
     sample_count: usize,
     throughput: &Throughput,
     measurement_domain: MeasurementDomain,
+    pmu_scope: PmuScope,
     measurement_label: &str,
     emits_cpu_diagnostics: bool,
     per_sample_metrics: &[Vec<MetricValue>],
@@ -137,6 +138,7 @@ pub(super) fn benchmark_stats_from_samples(
         pmu_time_running_ns: results.pmu_time_running_ns,
         measurement_domain,
         measurement_label: measurement_label.to_string(),
+        pmu_scope,
         emits_cpu_diagnostics,
         metrics: aggregate_metrics(per_sample_metrics),
         sample_metrics: per_sample_metrics
@@ -610,7 +612,7 @@ fn pmu_byline(stats: &BenchmarkStats) -> Option<String> {
     };
 
     Some(format!(
-        "  {label}: coverage={} avg_running={:.3}s avg_enabled={:.3}s total_running={:.3}s total_enabled={:.3}s",
+        "  {label}: scheduled={} avg_counter_running={:.3}s avg_counter_enabled={:.3}s total_counter_running={:.3}s total_counter_enabled={:.3}s",
         colorize_value(&format!(
             "{:.1}%",
             safe_ratio_f64(
@@ -867,6 +869,7 @@ mod tests {
             all_results.len(),
             &Throughput::ops(),
             MeasurementDomain::Cpu,
+            PmuScope::CallingThread,
             "",
             true,
             &[

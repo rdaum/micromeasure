@@ -1,6 +1,6 @@
 # Single-Threaded Benchmarks
 
-This is the historic core of `micromeasure`: one function on one thread, measured with PMU counters when available.
+This is the historic core of `micromeasure`: one function on one thread, measured with PMU counters when available. By default the PMU scope is the calling benchmark thread; work dispatched internally to an existing worker pool requires an explicit process-thread or registered-thread backend as described in [Linux PMU Setup](./linux-pmu.md#benchmarks-that-dispatch-to-existing-worker-pools).
 
 ## The minimal shape
 
@@ -138,10 +138,10 @@ bench: add_loop
     │ branches   │             │ 1.00 /op      │ ... │
     │ cache misses │           │ 0.0000 /op    │ ... │
     └────────────┴─────────────┴───────────────┴ ... ┘
-  host PMU (perf event group): coverage=100.0%
+  PMU: scheduled=100.0%
 ```
 
-The PMU coverage line reports `time_running / time_enabled` from the perf event group — below 100% means the counters were multiplexed by the kernel and the PMU numbers were scaled. If coverage is low the runner emits a warning; if PMU is unavailable it falls back to timing-only and says so.
+The PMU scheduled line reports `time_running / time_enabled` — below 100% means the counters were multiplexed by the kernel and the PMU numbers were scaled. It is a counter-scheduling quality indicator, not multi-thread workload coverage. If scheduling is low the runner emits a warning; if PMU is unavailable it falls back to timing-only and says so.
 
 After the table, a `possible bottlenecks:` block may appear, derived from the PMU counters (data-side memory latency, branch predictor disruption, instruction-cache pressure, low IPC). These are heuristics, not proofs — see the note at the bottom of every report: *"I am not a professional statistician. It's possible my code is lying to you."*
 

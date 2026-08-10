@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "micromeasure"
-version = "0.14.1"
+version = "0.15.0"
 dependencies = [
  "libc",
  "perf-event2",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "micromeasure-cli"
-version = "0.14.1"
+version = "0.15.0"
 dependencies = [
  "clap",
  "micromeasure",

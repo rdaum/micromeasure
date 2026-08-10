@@ -187,6 +187,67 @@ The selected [`EnergyScope`](https://docs.rs/micromeasure/latest/micromeasure/en
 is persisted independently of `PmuScope`. Runs with no energy, package/die
 RAPL, and package-plus-core RAPL are not treated as comparison-compatible.
 
+## System memory bandwidth
+
+Some Intel server processors expose integrated memory-controller counters as
+Linux `uncore_imc_*` perf PMUs. The Linux backend automatically probes for
+symbolic `cas_count_read` and `cas_count_write` events and collects gross
+system memory bandwidth when every advertised target is usable:
+
+```rust,ignore
+use micromeasure::LinuxPerfBackend;
+
+g.backend(|| Box::new(LinuxPerfBackend::registered_threads(worker_threads.clone())))
+.bench("streaming transform", streaming_transform);
+```
+
+An unsupported or permission-restricted automatic probe is quiet and runs
+only once per backend. Use `.with_memory_bandwidth()` to make the request
+explicit and receive unavailable/partial diagnostics, or
+`.without_memory_bandwidth()` to skip discovery entirely.
+
+The option composes with calling-thread, process-thread, registered-thread,
+compact-counter, no-CPU-counter, and RAPL modes. IMC events use separate
+uncore hardware and do not consume the programmable slots used by the normal
+CPU PMU profile.
+
+Micromeasure enumerates every `uncore_imc_*` directory and opens one read/write
+event pair for every CPU in that PMU's advertised `cpumask`. On multi-socket
+machines those CPUs are the kernel's representative CPUs for each package;
+opening the Cartesian product of PMU directories and advertised CPUs covers
+every exposed channel/package instance without duplicating the event on every
+ordinary CPU. Each event's own sysfs `scale` and `unit` are converted to bytes,
+and each raw count is adjusted by its own `time_enabled / time_running` ratio.
+
+A complete sample reports these custom metrics:
+
+- `dram_read_bytes_per_op`, `dram_write_bytes_per_op`, and
+  `dram_total_bytes_per_op`
+- `dram_read_gib_s`, `dram_write_gib_s`, and `dram_total_gib_s`
+- `dram_pmu_scheduled_percent`, using the least-scheduled read or write event
+- `dram_imc_coverage_percent`
+
+The counters measure all memory-controller traffic during the sample window:
+benchmark workers, other processes, and the kernel. The byte-per-operation
+values are therefore gross amortized traffic, not process-exclusive traffic.
+Use a quiet machine and samples long enough for the benchmark's traffic to
+dominate background activity.
+
+Whole-system byte and bandwidth metrics are emitted only when all advertised
+IMC targets return both usable read and write counters. If a PMU, symbolic
+event, scale/unit, CPU target, permission, or scheduled window is missing,
+micromeasure warns once and continues. Partial samples retain coverage and
+scheduling metrics but omit the partial byte sum so it cannot be mistaken for
+a system total. A zero-running-time event is unavailable, not zero bandwidth.
+
+[`MemoryBandwidthScope`](https://docs.rs/micromeasure/latest/micromeasure/enum.MemoryBandwidthScope.html)
+is persisted as `none`, `system_unavailable`, `system_partial`, or
+`system_complete`. Automatic probe misses remain `none`; an explicit request
+records `system_unavailable`. These states are distinct comparison identities. Richer
+PCM features such as per-channel/rank output, persistent-memory traffic,
+partial writes, and theoretical peak bandwidth are outside this portable
+symbolic-event mode.
+
 ## Benchmarks that dispatch to existing worker pools
 
 The default [`LinuxPerfBackend`](https://docs.rs/micromeasure/latest/micromeasure/struct.LinuxPerfBackend.html) measures only the calling benchmark thread. If the measured function dispatches its real work to an already initialized Rayon or other worker pool, choose one of the explicit multi-thread scopes.

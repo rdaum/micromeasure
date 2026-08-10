@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    Alignment, EnergyScope, MeasurementDomain, MetricFormat, PmuScope, ReportContext,
-    TableFormatter, Throughput, comparison::pair_results_one_to_one,
+    Alignment, EnergyScope, MeasurementDomain, MemoryBandwidthScope, MetricFormat, PmuScope,
+    ReportContext, TableFormatter, Throughput, comparison::pair_results_one_to_one,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -129,6 +129,11 @@ pub struct BenchmarkStats {
     /// therefore separate from the thread-oriented `pmu_scope`.
     #[serde(default)]
     pub energy_scope: EnergyScope,
+    /// System-wide memory-controller counter coverage. This is separate from
+    /// thread-oriented PMU scope because uncore IMC counters include all
+    /// traffic observed during the benchmark window.
+    #[serde(default)]
+    pub memory_bandwidth_scope: MemoryBandwidthScope,
     /// When false, the backend has declared it does not emit CPU-PMU
     /// diagnostics (e.g. a GPU CUDA event backend). The runner suppresses
     /// CPU-PMU bottleneck diagnostics regardless of
@@ -1579,6 +1584,7 @@ mod tests {
                 measurement_label: String::new(),
                 pmu_scope: PmuScope::CallingThread,
                 energy_scope: EnergyScope::None,
+                memory_bandwidth_scope: MemoryBandwidthScope::None,
                 emits_cpu_diagnostics: true,
                 metrics: Vec::new(),
                 sample_metrics: Vec::new(),

@@ -19,6 +19,8 @@ mod cuda;
 #[cfg(feature = "gpu-counters")]
 mod gpu_counters;
 mod perf;
+#[cfg(target_os = "linux")]
+mod perf_memory;
 mod stats;
 
 use crate::session::BenchmarkSession;
@@ -53,7 +55,7 @@ use std::{
 
 pub use backend::{
     DiagnosticError, DiagnosticResult, EnergyScope, MeasurementBackend, MeasurementDomain,
-    MetricFormat, MetricValue, PmuCounterProfile, PmuScope, WallClockBackend,
+    MemoryBandwidthScope, MetricFormat, MetricValue, PmuCounterProfile, PmuScope, WallClockBackend,
 };
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaError, CudaEvent, CudaEventBackend, CudaResult};
@@ -1903,6 +1905,7 @@ impl BenchmarkRunner {
             measurement_domain,
             backend.pmu_scope(),
             backend.energy_scope(),
+            backend.memory_bandwidth_scope(),
             backend.measurement_label(),
             backend.emits_cpu_diagnostics(),
             &all_metrics,
@@ -2067,6 +2070,7 @@ impl BenchmarkRunner {
             measurement_domain,
             backend.pmu_scope(),
             backend.energy_scope(),
+            backend.memory_bandwidth_scope(),
             backend.measurement_label(),
             backend.emits_cpu_diagnostics(),
             &all_metrics,
@@ -2301,6 +2305,10 @@ impl BenchmarkRunner {
             .as_deref()
             .map(MeasurementBackend::energy_scope)
             .unwrap_or(EnergyScope::None);
+        let memory_bandwidth_scope = backend
+            .as_deref()
+            .map(MeasurementBackend::memory_bandwidth_scope)
+            .unwrap_or(MemoryBandwidthScope::None);
         let measurement_label = if energy_scope != EnergyScope::None {
             managed_worker_measurement_label(counter_profile, true)
         } else {
@@ -2318,6 +2326,7 @@ impl BenchmarkRunner {
             measurement_domain,
             PmuScope::ManagedWorkers,
             energy_scope,
+            memory_bandwidth_scope,
             measurement_label,
             backend
                 .as_deref()
@@ -2340,6 +2349,7 @@ impl BenchmarkRunner {
                         measurement_domain,
                         PmuScope::ManagedWorkers,
                         EnergyScope::None,
+                        MemoryBandwidthScope::None,
                         managed_worker_measurement_label(counter_profile, false),
                         counter_profile != PmuCounterProfile::None,
                         &[],
@@ -3247,7 +3257,7 @@ mod tests {
     use super::stats::{median, median_absolute_deviation, percentile, tukey_outlier_count};
     use super::{DiagnosticError, DiagnosticResult, MeasurementDomain, MetricValue, Throughput};
 
-    use crate::{BenchmarkStats, EnergyScope, PmuScope, ReportContext};
+    use crate::{BenchmarkStats, EnergyScope, MemoryBandwidthScope, PmuScope, ReportContext};
 
     fn stats_with_domain(domain: MeasurementDomain) -> BenchmarkStats {
         // A benchmark whose CPU PMU fields would normally trigger the
@@ -3298,6 +3308,7 @@ mod tests {
             measurement_label: String::new(),
             pmu_scope: PmuScope::CallingThread,
             energy_scope: EnergyScope::None,
+            memory_bandwidth_scope: MemoryBandwidthScope::None,
             emits_cpu_diagnostics: true,
             metrics: Vec::new(),
             sample_metrics: Vec::new(),

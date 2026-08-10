@@ -3,6 +3,12 @@ use super::{
     ConcurrentWorkerResult, Results, safe_ratio_f64,
 };
 use crate::bench::backend::{MeasurementBackend, MetricValue, PmuCounterProfile};
+#[cfg(target_os = "linux")]
+use crate::bench::perf_memory::{
+    MemoryBandwidthDiscovery, MemoryBandwidthMeasurement, discover_memory_bandwidth,
+    prepare_memory_bandwidth, push_memory_bandwidth_metrics, warn_memory_bandwidth_partial_once,
+    warn_memory_bandwidth_unavailable_once,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
@@ -117,7 +123,7 @@ fn process_thread_ids() -> io::Result<Vec<libc::pid_t>> {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_cpu_list(value: &str) -> Result<Vec<usize>, String> {
+pub(super) fn parse_cpu_list(value: &str) -> Result<Vec<usize>, String> {
     let mut cpus = BTreeSet::new();
     for part in value.trim().split(',').filter(|part| !part.is_empty()) {
         let mut bounds = part.split('-');
@@ -396,6 +402,17 @@ enum PerfScope {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryBandwidthMode {
+    /// Probe once and collect only when complete coverage is usable.
+    Auto,
+    /// Explicitly requested; preserve unavailable/partial identity and warn.
+    Requested,
+    /// Do not discover or open memory-controller counters.
+    Disabled,
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 enum PerfTarget {
     CurrentThread,
@@ -583,7 +600,7 @@ fn perf_issues() -> &'static Mutex<Vec<String>> {
 }
 
 #[cfg(target_os = "linux")]
-fn record_perf_issue(message: impl Into<String>) {
+pub(super) fn record_perf_issue(message: impl Into<String>) {
     let message = message.into();
     let lock = perf_issues().lock();
     let mut issues = match lock {
@@ -733,7 +750,7 @@ pub(super) fn measurement_label(has_perf_counters: bool) -> &'static str {
     }
 }
 
-fn scale_multiplexed_count(raw: u64, enabled_ns: u64, running_ns: u64) -> u64 {
+pub(super) fn scale_multiplexed_count(raw: u64, enabled_ns: u64, running_ns: u64) -> u64 {
     if raw == 0 {
         return 0;
     }
@@ -1190,6 +1207,13 @@ pub struct LinuxPerfBackend {
     rapl_measurement: Option<RaplMeasurement>,
     rapl_observed: bool,
     rapl_core_observed: bool,
+    memory_bandwidth_mode: MemoryBandwidthMode,
+    memory_bandwidth_auto_disabled: bool,
+    memory_bandwidth_discovery: Option<MemoryBandwidthDiscovery>,
+    memory_bandwidth_measurement: Option<MemoryBandwidthMeasurement>,
+    memory_bandwidth_complete_observed: bool,
+    memory_bandwidth_partial_observed: bool,
+    memory_bandwidth_unavailable_observed: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1212,6 +1236,13 @@ impl LinuxPerfBackend {
             rapl_measurement: None,
             rapl_observed: false,
             rapl_core_observed: false,
+            memory_bandwidth_mode: MemoryBandwidthMode::Auto,
+            memory_bandwidth_auto_disabled: false,
+            memory_bandwidth_discovery: None,
+            memory_bandwidth_measurement: None,
+            memory_bandwidth_complete_observed: false,
+            memory_bandwidth_partial_observed: false,
+            memory_bandwidth_unavailable_observed: false,
         }
     }
 
@@ -1229,6 +1260,13 @@ impl LinuxPerfBackend {
             rapl_measurement: None,
             rapl_observed: false,
             rapl_core_observed: false,
+            memory_bandwidth_mode: MemoryBandwidthMode::Auto,
+            memory_bandwidth_auto_disabled: false,
+            memory_bandwidth_discovery: None,
+            memory_bandwidth_measurement: None,
+            memory_bandwidth_complete_observed: false,
+            memory_bandwidth_partial_observed: false,
+            memory_bandwidth_unavailable_observed: false,
         }
     }
 
@@ -1244,6 +1282,13 @@ impl LinuxPerfBackend {
             rapl_measurement: None,
             rapl_observed: false,
             rapl_core_observed: false,
+            memory_bandwidth_mode: MemoryBandwidthMode::Auto,
+            memory_bandwidth_auto_disabled: false,
+            memory_bandwidth_discovery: None,
+            memory_bandwidth_measurement: None,
+            memory_bandwidth_complete_observed: false,
+            memory_bandwidth_partial_observed: false,
+            memory_bandwidth_unavailable_observed: false,
         }
     }
 
@@ -1304,6 +1349,45 @@ impl LinuxPerfBackend {
     pub fn with_rapl_core_energy(mut self) -> Self {
         self.energy_scope = crate::EnergyScope::RaplPackageAndCore;
         self.rapl_configs = None;
+        self
+    }
+
+    /// Explicitly request gross system-wide DRAM read/write bandwidth using
+    /// Linux `uncore_imc_*` PMUs that expose symbolic `cas_count_read` and
+    /// `cas_count_write` events.
+    ///
+    /// Every IMC PMU is opened once for each CPU in its advertised `cpumask`,
+    /// which covers every package without duplicating events across ordinary
+    /// CPUs. Event-specific kernel `scale` and `unit` metadata are normalized
+    /// to bytes. Complete samples report read, write, and total bytes per
+    /// operation plus GiB/s. Since these counters are system-wide, the values
+    /// include kernel and unrelated-process traffic during the sample window.
+    ///
+    /// The default backend already probes for this event set and enables it
+    /// when complete coverage is usable. This method makes the request
+    /// explicit, so unsupported or partial coverage is persisted and emits a
+    /// diagnostic instead of being treated as a quiet auto-probe miss.
+    /// Unsupported, permission-denied, and partially covered systems continue
+    /// without whole-system bandwidth values. Their persisted
+    /// [`crate::MemoryBandwidthScope`] remains distinct from complete results.
+    #[must_use]
+    pub fn with_memory_bandwidth(mut self) -> Self {
+        self.memory_bandwidth_mode = MemoryBandwidthMode::Requested;
+        self.memory_bandwidth_auto_disabled = false;
+        self.memory_bandwidth_discovery = None;
+        self
+    }
+
+    /// Disable the default best-effort system memory-bandwidth probe.
+    ///
+    /// Use this when benchmark startup/file-descriptor minimization matters
+    /// more than collecting compatible uncore IMC metrics.
+    #[must_use]
+    pub fn without_memory_bandwidth(mut self) -> Self {
+        self.memory_bandwidth_mode = MemoryBandwidthMode::Disabled;
+        self.memory_bandwidth_auto_disabled = false;
+        self.memory_bandwidth_discovery = None;
+        self.memory_bandwidth_measurement = None;
         self
     }
 
@@ -1409,6 +1493,7 @@ impl LinuxPerfBackend {
     pub(super) fn prepare(&mut self) {
         self.measurements.clear();
         self.rapl_measurement = None;
+        self.memory_bandwidth_measurement = None;
         if self.counter_profile.collects_cpu_counters() {
             let targets = self.targets();
             if targets.is_empty() {
@@ -1444,6 +1529,28 @@ impl LinuxPerfBackend {
                     warn_rapl_unavailable_once();
                 }
                 self.rapl_measurement = Some(measurement);
+            }
+        }
+
+        if self.memory_bandwidth_mode != MemoryBandwidthMode::Disabled
+            && !self.memory_bandwidth_auto_disabled
+        {
+            let discovery = self
+                .memory_bandwidth_discovery
+                .get_or_insert_with(discover_memory_bandwidth);
+            let measurement = prepare_memory_bandwidth(discovery);
+            if self.memory_bandwidth_mode == MemoryBandwidthMode::Auto && !measurement.is_complete()
+            {
+                // Auto mode is deliberately quiet and one-shot on machines
+                // without a complete usable event set.
+                self.memory_bandwidth_auto_disabled = true;
+            } else {
+                if measurement.is_empty() {
+                    warn_memory_bandwidth_unavailable_once();
+                } else if !measurement.is_complete() {
+                    warn_memory_bandwidth_partial_once();
+                }
+                self.memory_bandwidth_measurement = Some(measurement);
             }
         }
     }
@@ -1496,6 +1603,19 @@ impl LinuxPerfBackend {
             if rapl.counters.is_empty() {
                 warn_rapl_unavailable_once();
             }
+        }
+        if let Some(memory) = &mut self.memory_bandwidth_measurement {
+            memory.begin();
+            if self.memory_bandwidth_mode == MemoryBandwidthMode::Auto && !memory.is_complete() {
+                self.memory_bandwidth_auto_disabled = true;
+            } else if memory.is_empty() {
+                warn_memory_bandwidth_unavailable_once();
+            } else if !memory.is_complete() {
+                warn_memory_bandwidth_partial_once();
+            }
+        }
+        if self.memory_bandwidth_auto_disabled {
+            self.memory_bandwidth_measurement = None;
         }
     }
 
@@ -1738,6 +1858,9 @@ impl MeasurementBackend for LinuxPerfBackend {
         if let Some(rapl) = &mut self.rapl_measurement {
             rapl.end();
         }
+        if let Some(memory) = &mut self.memory_bandwidth_measurement {
+            memory.end();
+        }
     }
 
     fn collect(
@@ -1779,12 +1902,87 @@ impl MeasurementBackend for LinuxPerfBackend {
             }
         }
 
+        if let Some(memory) = &mut self.memory_bandwidth_measurement {
+            let sample = memory.collect();
+            if self.memory_bandwidth_mode == MemoryBandwidthMode::Auto
+                && sample.scope != crate::MemoryBandwidthScope::SystemComplete
+            {
+                self.memory_bandwidth_auto_disabled = true;
+                if self.memory_bandwidth_complete_observed {
+                    self.memory_bandwidth_partial_observed = true;
+                    warn_memory_bandwidth_partial_once();
+                }
+                self.measurements.clear();
+                self.rapl_measurement = None;
+                self.memory_bandwidth_measurement = None;
+                return;
+            }
+            match sample.scope {
+                crate::MemoryBandwidthScope::SystemComplete => {
+                    self.memory_bandwidth_complete_observed = true;
+                }
+                crate::MemoryBandwidthScope::SystemPartial => {
+                    self.memory_bandwidth_partial_observed = true;
+                    warn_memory_bandwidth_partial_once();
+                }
+                crate::MemoryBandwidthScope::SystemUnavailable => {
+                    self.memory_bandwidth_unavailable_observed = true;
+                    warn_memory_bandwidth_unavailable_once();
+                }
+                crate::MemoryBandwidthScope::None => {}
+            }
+            push_memory_bandwidth_metrics(sample, ops, host_elapsed, metrics);
+        }
+
         // Reset for the next sample window.
         self.measurements.clear();
         self.rapl_measurement = None;
+        self.memory_bandwidth_measurement = None;
     }
 
     fn measurement_label(&self) -> &'static str {
+        if self.memory_bandwidth_scope() == crate::MemoryBandwidthScope::SystemComplete {
+            return match (&self.scope, self.counter_profile, self.rapl_observed) {
+                (_, PmuCounterProfile::None, false) => "timing + DRAM bandwidth",
+                (_, PmuCounterProfile::None, true) => "timing + RAPL energy + DRAM bandwidth",
+                (PerfScope::CurrentThread, PmuCounterProfile::Full, false) => {
+                    "timing + PMU + DRAM bandwidth"
+                }
+                (PerfScope::ProcessThreads, PmuCounterProfile::Full, false) => {
+                    "timing + process-thread PMU + DRAM bandwidth"
+                }
+                (PerfScope::RegisteredThreads(_), PmuCounterProfile::Full, false) => {
+                    "timing + registered-thread PMU + DRAM bandwidth"
+                }
+                (PerfScope::CurrentThread, PmuCounterProfile::Compact, false) => {
+                    "timing + compact PMU + DRAM bandwidth"
+                }
+                (PerfScope::ProcessThreads, PmuCounterProfile::Compact, false) => {
+                    "timing + compact process-thread PMU + DRAM bandwidth"
+                }
+                (PerfScope::RegisteredThreads(_), PmuCounterProfile::Compact, false) => {
+                    "timing + compact registered-thread PMU + DRAM bandwidth"
+                }
+                (PerfScope::CurrentThread, PmuCounterProfile::Full, true) => {
+                    "timing + PMU + RAPL energy + DRAM bandwidth"
+                }
+                (PerfScope::ProcessThreads, PmuCounterProfile::Full, true) => {
+                    "timing + process-thread PMU + RAPL energy + DRAM bandwidth"
+                }
+                (PerfScope::RegisteredThreads(_), PmuCounterProfile::Full, true) => {
+                    "timing + registered-thread PMU + RAPL energy + DRAM bandwidth"
+                }
+                (PerfScope::CurrentThread, PmuCounterProfile::Compact, true) => {
+                    "timing + compact PMU + RAPL energy + DRAM bandwidth"
+                }
+                (PerfScope::ProcessThreads, PmuCounterProfile::Compact, true) => {
+                    "timing + compact process-thread PMU + RAPL energy + DRAM bandwidth"
+                }
+                (PerfScope::RegisteredThreads(_), PmuCounterProfile::Compact, true) => {
+                    "timing + compact registered-thread PMU + RAPL energy + DRAM bandwidth"
+                }
+            };
+        }
         match (&self.scope, self.counter_profile, self.rapl_observed) {
             (_, PmuCounterProfile::None, false) => "timing only",
             (_, PmuCounterProfile::None, true) => "timing + RAPL energy",
@@ -1849,6 +2047,23 @@ impl MeasurementBackend for LinuxPerfBackend {
         }
     }
 
+    fn memory_bandwidth_scope(&self) -> crate::MemoryBandwidthScope {
+        if self.memory_bandwidth_mode == MemoryBandwidthMode::Disabled {
+            crate::MemoryBandwidthScope::None
+        } else if self.memory_bandwidth_partial_observed
+            || (self.memory_bandwidth_complete_observed
+                && self.memory_bandwidth_unavailable_observed)
+        {
+            crate::MemoryBandwidthScope::SystemPartial
+        } else if self.memory_bandwidth_complete_observed {
+            crate::MemoryBandwidthScope::SystemComplete
+        } else if self.memory_bandwidth_mode == MemoryBandwidthMode::Requested {
+            crate::MemoryBandwidthScope::SystemUnavailable
+        } else {
+            crate::MemoryBandwidthScope::None
+        }
+    }
+
     fn emits_cpu_diagnostics(&self) -> bool {
         self.counter_profile != PmuCounterProfile::None
     }
@@ -1857,11 +2072,11 @@ impl MeasurementBackend for LinuxPerfBackend {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{
-        LinuxPerfBackend, LinuxPerfThreadSet, PerfMode, PerfTarget, PmuQuality, RaplDomain,
-        TargetMeasurement, current_thread_id, parse_cpu_list, pmu_quality, process_thread_ids,
-        push_rapl_metrics, timing_window,
+        LinuxPerfBackend, LinuxPerfThreadSet, MemoryBandwidthMode, PerfMode, PerfTarget,
+        PmuQuality, RaplDomain, TargetMeasurement, current_thread_id, parse_cpu_list, pmu_quality,
+        process_thread_ids, push_rapl_metrics, timing_window,
     };
-    use crate::{EnergyScope, MeasurementBackend, PmuCounterProfile};
+    use crate::{EnergyScope, MeasurementBackend, MemoryBandwidthScope, PmuCounterProfile};
     use std::{collections::BTreeMap, time::Duration};
 
     #[test]
@@ -2005,5 +2220,38 @@ mod tests {
         assert_eq!(core.energy_scope(), EnergyScope::RaplPackageDomains);
         core.rapl_core_observed = true;
         assert_eq!(core.energy_scope(), EnergyScope::RaplPackageAndCore);
+    }
+
+    #[test]
+    fn memory_bandwidth_builder_tracks_unavailable_partial_and_complete_identity() {
+        let automatic = LinuxPerfBackend::new();
+        assert_eq!(automatic.memory_bandwidth_mode, MemoryBandwidthMode::Auto);
+        assert_eq!(
+            automatic.memory_bandwidth_scope(),
+            MemoryBandwidthScope::None
+        );
+        let disabled = LinuxPerfBackend::new().without_memory_bandwidth();
+        assert_eq!(
+            disabled.memory_bandwidth_mode,
+            MemoryBandwidthMode::Disabled
+        );
+
+        let mut backend = LinuxPerfBackend::new().with_memory_bandwidth();
+        assert_eq!(
+            backend.memory_bandwidth_scope(),
+            MemoryBandwidthScope::SystemUnavailable
+        );
+
+        backend.memory_bandwidth_complete_observed = true;
+        assert_eq!(
+            backend.memory_bandwidth_scope(),
+            MemoryBandwidthScope::SystemComplete
+        );
+
+        backend.memory_bandwidth_unavailable_observed = true;
+        assert_eq!(
+            backend.memory_bandwidth_scope(),
+            MemoryBandwidthScope::SystemPartial
+        );
     }
 }

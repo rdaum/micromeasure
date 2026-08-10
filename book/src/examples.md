@@ -1,6 +1,6 @@
 # Examples
 
-`micromeasure` ships twelve runnable examples in [`examples/`](https://github.com/rdaum/micromeasure/tree/main/examples). Each demonstrates one feature in isolation so you can copy the shape that matches your workload.
+`micromeasure` ships thirteen runnable examples in [`examples/`](https://github.com/rdaum/micromeasure/tree/main/examples). Each demonstrates one feature in isolation so you can copy the shape that matches your workload.
 
 Run any of them from the repo root. Add `--release` for realistic numbers.
 
@@ -12,6 +12,7 @@ Run any of them from the repo root. Add `--release` for realistic numbers.
 | [concurrent_scenario](./examples/concurrent-scenario.md) | Reader/writer contention, `concurrent_group`, `sample_duration` |
 | [concurrent_counters](./examples/concurrent-counters.md) | Same, plus a `read_misses` event counter via `with_counter` |
 | [rapl_energy](./examples/rapl-energy.md) | Linux RAPL package energy for single-threaded and concurrent samples |
+| [memory_bandwidth](./examples/memory-bandwidth.md) | Linux uncore IMC read/write/total DRAM bandwidth |
 | [gpu_domain](./examples/gpu-domain.md) | `MeasurementDomain::Gpu` suppresses CPU-PMU diagnostics |
 | [mixed_domain](./examples/mixed-domain.md) | `MeasurementDomain::Mixed` emits diagnostics with `[host]` prefix |
 | [custom_metrics](./examples/custom-metrics.md) | `bench_sample` returning `BenchSampleResult` with `MetricValue`s |

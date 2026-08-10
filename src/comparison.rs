@@ -15,9 +15,10 @@
 //! Side-effect-free comparison of persisted benchmark evidence.
 
 use crate::{
-    BenchmarkKind, BenchmarkReport, BenchmarkResult, EnergyScope, MeasurementDomain, MetricFormat,
-    PmuCounterProfile, PmuScope, REPORT_SCHEMA_VERSION, SERIES_DOCUMENT_TYPE,
-    SERIES_SCHEMA_VERSION, SeriesReport, SeriesResult, Throughput, Validity, ValidityStatus,
+    BenchmarkKind, BenchmarkReport, BenchmarkResult, EnergyScope, MeasurementDomain,
+    MemoryBandwidthScope, MetricFormat, PmuCounterProfile, PmuScope, REPORT_SCHEMA_VERSION,
+    SERIES_DOCUMENT_TYPE, SERIES_SCHEMA_VERSION, SeriesReport, SeriesResult, Throughput, Validity,
+    ValidityStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -150,6 +151,10 @@ pub struct BenchmarkCaseIdentity {
     /// run that did not collect system energy.
     #[serde(default)]
     pub energy_scope: EnergyScope,
+    /// System-wide IMC coverage. Missing, partial, and complete memory
+    /// bandwidth evidence are intentionally different identities.
+    #[serde(default)]
+    pub memory_bandwidth_scope: MemoryBandwidthScope,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -166,6 +171,7 @@ impl BenchmarkCaseIdentity {
                 &result.stats.measurement_label,
             ),
             energy_scope: result.stats.energy_scope,
+            memory_bandwidth_scope: result.stats.memory_bandwidth_scope,
             metadata: result.metadata.clone(),
         }
     }
@@ -1640,6 +1646,7 @@ pub(crate) fn result_identity_matches(
         && PmuCounterProfile::from_measurement_label(&current.stats.measurement_label)
             == PmuCounterProfile::from_measurement_label(&previous.stats.measurement_label)
         && current.stats.energy_scope == previous.stats.energy_scope
+        && current.stats.memory_bandwidth_scope == previous.stats.memory_bandwidth_scope
 }
 
 pub(crate) fn pair_results_one_to_one<'current, 'previous>(
@@ -1724,6 +1731,7 @@ mod tests {
                 measurement_label: String::new(),
                 pmu_scope: PmuScope::CallingThread,
                 energy_scope: EnergyScope::None,
+                memory_bandwidth_scope: MemoryBandwidthScope::None,
                 emits_cpu_diagnostics: true,
                 metrics: Vec::new(),
                 sample_metrics: Vec::new(),
@@ -1932,6 +1940,23 @@ mod tests {
         let mut current = report(&[("a", 120.0)]);
         let baseline = report(&[("a", 100.0)]);
         current.results[0].stats.energy_scope = EnergyScope::RaplPackageDomains;
+
+        let comparison = current
+            .compare(
+                &baseline,
+                &ComparisonOptions::default().allow_partial_result_set(true),
+            )
+            .unwrap();
+        assert_eq!(comparison.summary.matched, 0);
+        assert_eq!(comparison.summary.added, 1);
+        assert_eq!(comparison.summary.removed, 1);
+    }
+
+    #[test]
+    fn memory_bandwidth_scopes_are_comparison_identity() {
+        let mut current = report(&[("a", 120.0)]);
+        let baseline = report(&[("a", 100.0)]);
+        current.results[0].stats.memory_bandwidth_scope = MemoryBandwidthScope::SystemComplete;
 
         let comparison = current
             .compare(

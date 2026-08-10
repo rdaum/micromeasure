@@ -22,6 +22,7 @@ That means:
 
 - direct Linux perf counter (PMU) integration with selectable full and compact event sets
 - optional Linux RAPL energy measurement with per-sample and higher-signal aggregate results
+- automatic Linux uncore IMC read/write bandwidth measurement when a complete usable event set is available
 - simple hand-written microbench drivers, not macro-heavy harness structure
 - output that emphasizes instruction count, branch behaviour, cache misses, and timing together
 - benchmark binaries that can be filtered and run directly during systems work

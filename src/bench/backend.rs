@@ -422,6 +422,28 @@ pub enum EnergyScope {
     RaplPackageAndCore,
 }
 
+/// System memory-controller coverage for a persisted benchmark result.
+///
+/// Linux uncore IMC counters observe gross system traffic rather than traffic
+/// attributable to a process or thread. The state is persisted so results
+/// collected without IMC counters, with incomplete coverage, and with a
+/// complete system-wide event set are not comparison-compatible.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBandwidthScope {
+    /// No memory-bandwidth evidence was requested, or the automatic probe did
+    /// not find a complete usable IMC event set.
+    #[default]
+    None,
+    /// Measurement was explicitly requested, but no usable IMC event pair was
+    /// observed.
+    SystemUnavailable,
+    /// Some, but not all, advertised IMC targets produced usable event pairs.
+    SystemPartial,
+    /// Every advertised IMC target produced usable read and write events.
+    SystemComplete,
+}
+
 /// Pluggable measurement window for one sample of one benchmark.
 ///
 /// A backend owns whatever domain-specific state it needs across a single
@@ -632,6 +654,13 @@ pub trait MeasurementBackend {
     /// being compared. The default records that no energy source was enabled.
     fn energy_scope(&self) -> EnergyScope {
         EnergyScope::None
+    }
+
+    /// Persisted system memory-controller coverage used to keep unlike
+    /// bandwidth evidence from being compared. The default records that
+    /// memory bandwidth measurement was not requested.
+    fn memory_bandwidth_scope(&self) -> MemoryBandwidthScope {
+        MemoryBandwidthScope::None
     }
 
     /// Hints the runner whether CPU-PMU bottleneck diagnostics derived from

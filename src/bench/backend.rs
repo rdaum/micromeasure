@@ -749,6 +749,56 @@ impl MeasurementBackend for WallClockBackend {
     }
 }
 
+/// Host-side companion backend for operation-reported device timestamps.
+///
+/// Pair this backend with a [`BenchSampleResult`] that calls
+/// [`BenchSampleResult::with_primary_duration`]. The runner replaces the
+/// provisional host duration with the operation's device duration, while this
+/// backend retains the synchronized host-visible boundary as a custom metric.
+#[derive(Default)]
+pub struct OperationReportedDeviceBackend;
+
+impl OperationReportedDeviceBackend {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl MeasurementBackend for OperationReportedDeviceBackend {
+    fn begin(&mut self) {}
+
+    fn end(&mut self) {}
+
+    fn collect(
+        &mut self,
+        host_elapsed: Duration,
+        ops: u64,
+        _chunk_index: usize,
+        results: &mut Results,
+        metrics: &mut Vec<MetricValue>,
+    ) {
+        results.duration = host_elapsed;
+        results.iterations = ops;
+        results.chunks_executed = 1;
+        metrics.push(
+            MetricValue::duration_ms("host_visible_ms", host_elapsed)
+                .with_display_name("Host-visible latency"),
+        );
+    }
+
+    fn measurement_label(&self) -> &'static str {
+        "operation-reported device timing"
+    }
+
+    fn pmu_counter_profile(&self) -> PmuCounterProfile {
+        PmuCounterProfile::None
+    }
+
+    fn emits_cpu_diagnostics(&self) -> bool {
+        false
+    }
+}
+
 // LinuxPerfBackend is implemented in `perf.rs` (behind `cfg(target_os =
 // "linux")`) and re-exported from `bench.rs`. It preserves the historic
 // `run_with_perf_group` / `run_with_individual_counters` fallback chain,
@@ -775,6 +825,24 @@ mod tests {
         assert!(metrics.is_empty());
         assert!(!results.has_cycles);
         assert_eq!(backend.measurement_label(), "timing only");
+        assert!(!backend.emits_cpu_diagnostics());
+    }
+
+    #[test]
+    fn operation_reported_backend_retains_host_visible_latency() {
+        let mut backend = OperationReportedDeviceBackend::new();
+        let mut results = Results::default();
+        let mut metrics = Vec::new();
+        backend.collect(Duration::from_millis(7), 3, 0, &mut results, &mut metrics);
+
+        assert_eq!(results.duration, Duration::from_millis(7));
+        assert_eq!(results.iterations, 3);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, "host_visible_ms");
+        assert_eq!(
+            backend.measurement_label(),
+            "operation-reported device timing"
+        );
         assert!(!backend.emits_cpu_diagnostics());
     }
 

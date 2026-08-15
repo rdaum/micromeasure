@@ -55,7 +55,8 @@ use std::{
 
 pub use backend::{
     DiagnosticError, DiagnosticResult, EnergyScope, MeasurementBackend, MeasurementDomain,
-    MemoryBandwidthScope, MetricFormat, MetricValue, PmuCounterProfile, PmuScope, WallClockBackend,
+    MemoryBandwidthScope, MetricFormat, MetricValue, OperationReportedDeviceBackend,
+    PmuCounterProfile, PmuScope, WallClockBackend,
 };
 #[cfg(feature = "cuda")]
 pub use cuda::{CudaError, CudaEvent, CudaEventBackend, CudaResult};

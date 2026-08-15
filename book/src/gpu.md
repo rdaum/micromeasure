@@ -113,6 +113,9 @@ then drives primary latency, throughput, calibration, stability statistics,
 and persisted raw samples. Report host-visible submit/completion latency as a
 separate custom metric when that boundary matters.
 
+`OperationReportedDeviceBackend` supplies the corresponding measurement label,
+suppresses CPU diagnostics, and records `host_visible_ms` automatically.
+
 ### Built-in GPU counter collector
 
 Available behind the `gpu-counters` feature. `GpuCounterCollector` wraps NVIDIA CUPTI/NVPerf range profiling for diagnostic replay passes:

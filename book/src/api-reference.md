@@ -109,7 +109,7 @@ Throughput::per_operation(amount, unit)    // arbitrary unit
 
 | Type | Purpose | Source |
 |---|---|---|
-| `BenchSampleResult` | `{ operations: u64, metrics: Vec<MetricValue> }`. `operations(n)`, `with_metric(...)`, `push_metric(...)`. `From<u64>`. | `src/bench/backend.rs` |
+| `BenchSampleResult` | `{ operations: u64, primary_duration: Option<Duration>, metrics: Vec<MetricValue> }`. `operations(n)`, `with_primary_duration(...)`, `with_metric(...)`, `push_metric(...)`. `From<u64>`. | `src/bench/backend.rs` |
 | `MetricValue` | `{ name, value, unit, section, display_name, format }`. Constructors: `new`, `duration_ms`, `bandwidth_gib_s`, `throughput_tflops`, `integer`. Builders: `with_display_name`, `with_section`, `with_format`. | `src/bench/backend.rs` |
 | `MetricFormat` | `Number` (default, adaptive) / `Integer` (no decimals/scientific). | `src/bench/backend.rs` |
 

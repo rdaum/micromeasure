@@ -103,6 +103,16 @@ On a CUDA error it records `cuda_error_code` as a metric instead of crashing the
 
 See [cuda_event_backend](./examples/cuda-event-backend.md) for a runnable example using real `cudaMemsetAsync` on the default stream.
 
+### Operation-reported device time
+
+Some device APIs cannot put timing events around an opaque closure. WebGPU
+timestamp writes, for example, must be encoded in the command encoder that
+contains the measured pass. Such a benchmark can return
+`BenchSampleResult::with_primary_duration(duration)`. The reported duration
+then drives primary latency, throughput, calibration, stability statistics,
+and persisted raw samples. Report host-visible submit/completion latency as a
+separate custom metric when that boundary matters.
+
 ### Built-in GPU counter collector
 
 Available behind the `gpu-counters` feature. `GpuCounterCollector` wraps NVIDIA CUPTI/NVPerf range profiling for diagnostic replay passes:
@@ -171,6 +181,7 @@ Leave `has_cycles`/`has_instructions`/... false to suppress CPU PMU rows in the 
 fn my_gpu_bench(ctx: &mut GpuContext, chunk_size: usize, chunk_num: usize) -> BenchSampleResult {
     let device_s = ctx.run_kernel(chunk_size);
     BenchSampleResult::operations(chunk_size as u64)
+        .with_primary_duration(Duration::from_secs_f64(device_s))
         .push_metric(
             MetricValue::duration_ms("cuda_event_ms", Duration::from_secs_f64(device_s))
                 .with_display_name("CUDA event time"),

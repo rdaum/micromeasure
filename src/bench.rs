@@ -952,7 +952,11 @@ fn diagnose_stats(stats: &crate::BenchmarkStats) -> Vec<String> {
     diagnostics
 }
 
-fn calibrate_engine<T: BenchContext, F: Fn(usize) -> T + ?Sized, G: Fn(&mut T, usize, usize)>(
+fn calibrate_engine<
+    T: BenchContext,
+    F: Fn(usize) -> T + ?Sized,
+    G: Fn(&mut T, usize, usize) -> Option<Duration>,
+>(
     f: G,
     factory: &F,
     throughput: &Throughput,
@@ -971,7 +975,8 @@ fn calibrate_engine<T: BenchContext, F: Fn(usize) -> T + ?Sized, G: Fn(&mut T, u
             let mut prepared = factory(preferred_chunk_size);
             backend.begin();
             let started = Instant::now();
-            black_box(|| f(&mut prepared, preferred_chunk_size, warm_up_count))();
+            let primary_duration =
+                black_box(|| f(&mut prepared, preferred_chunk_size, warm_up_count))();
             let host_elapsed = started.elapsed();
             backend.end();
 
@@ -985,6 +990,9 @@ fn calibrate_engine<T: BenchContext, F: Fn(usize) -> T + ?Sized, G: Fn(&mut T, u
                 &mut results,
                 &mut metrics,
             );
+            if let Some(duration) = primary_duration {
+                results.duration = duration;
+            }
             measured_warm_up_duration += if results.duration > Duration::ZERO {
                 results.duration
             } else {
@@ -1028,8 +1036,8 @@ fn calibrate_engine<T: BenchContext, F: Fn(usize) -> T + ?Sized, G: Fn(&mut T, u
     for i in 0..15 {
         let mut prepared = factory(chunk_size);
         let started = Instant::now();
-        black_box(|| f(&mut prepared, chunk_size, 0))();
-        let duration = started.elapsed();
+        let primary_duration = black_box(|| f(&mut prepared, chunk_size, 0))();
+        let duration = primary_duration.unwrap_or_else(|| started.elapsed());
         let duration_secs = duration.as_secs_f64();
 
         if duration_secs >= 0.0001 {
@@ -1352,6 +1360,9 @@ fn execute_standard_sample_with_metrics<T: BenchContext>(
         &mut results,
         &mut metrics,
     );
+    if let Some(duration) = sample_result.primary_duration {
+        results.duration = duration;
+    }
     (results, metrics)
 }
 
@@ -1839,7 +1850,17 @@ impl BenchmarkRunner {
         let _affinity_guard = BenchAffinityGuard::acquire();
         println!("\nBenchmark: {name}");
 
-        let config = calibrate_engine(f, factory, &throughput, &self.runtime, backend.as_mut());
+        let calibrate_fn = |ctx: &mut T, cs: usize, cn: usize| {
+            f(ctx, cs, cn);
+            None
+        };
+        let config = calibrate_engine(
+            calibrate_fn,
+            factory,
+            &throughput,
+            &self.runtime,
+            backend.as_mut(),
+        );
         println!(
             "  calibrated: chunk={} samples={} estimate={}",
             config.chunk_size,
@@ -1990,15 +2011,10 @@ impl BenchmarkRunner {
         let _affinity_guard = BenchAffinityGuard::acquire();
         println!("\nBenchmark: {name}");
 
-        // For calibration we wrap `f` so its `BenchSampleResult` return is
-        // discarded; calibration only needs to time the work, not collect
-        // metrics. Using a non-capturing closure here would require a
-        // function-pointer wrapper, which is awkward; the generalised
-        // `calibrate_engine` signature accepts `impl Fn(...)` so this
-        // closure works directly.
-        let calibrate_fn = |ctx: &mut T, cs: usize, cn: usize| {
-            let _ = f(ctx, cs, cn);
-        };
+        // The result's metrics are discarded during calibration, but an
+        // operation-reported primary duration still drives the estimated
+        // device throughput and sample count.
+        let calibrate_fn = |ctx: &mut T, cs: usize, cn: usize| f(ctx, cs, cn).primary_duration;
         let config = calibrate_engine(
             calibrate_fn,
             factory,
@@ -3707,7 +3723,10 @@ mod tests {
             max_samples: 10,
         };
         let config = calibrate_engine(
-            slow_operation,
+            |ctx, chunk_size, chunk_num| {
+                slow_operation(ctx, chunk_size, chunk_num);
+                None
+            },
             &|_chunk_size| SlowContext,
             &Throughput::ops(),
             &runtime,
@@ -3772,7 +3791,10 @@ mod tests {
             max_samples: 20,
         };
         let config = calibrate_engine(
-            fixed_operation,
+            |ctx, chunk_size, chunk_num| {
+                fixed_operation(ctx, chunk_size, chunk_num);
+                None
+            },
             &|_chunk_size| FixedContext,
             &Throughput::ops(),
             &runtime,
@@ -4035,6 +4057,41 @@ mod tests {
             "expected cuda_event_ms in {names:?}"
         );
         assert!(names.contains(&"tflops"), "expected tflops in {names:?}");
+    }
+
+    #[test]
+    fn bench_sample_operation_reported_duration_is_primary() {
+        use crate::bench::backend::BenchSampleResult;
+        use std::time::Duration;
+
+        struct DummyCtx;
+
+        impl crate::BenchContext for DummyCtx {
+            fn prepare(_chunk_size: usize) -> Self {
+                Self
+            }
+        }
+
+        fn sample_bench(
+            _ctx: &mut DummyCtx,
+            _chunk_size: usize,
+            _chunk_num: usize,
+        ) -> BenchSampleResult {
+            std::thread::sleep(Duration::from_millis(1));
+            BenchSampleResult::operations(4).with_primary_duration(Duration::from_micros(250))
+        }
+
+        let mut backend = crate::WallClockBackend::new();
+        let (results, _metrics) = super::execute_standard_sample_with_metrics(
+            &(sample_bench as fn(&mut DummyCtx, usize, usize) -> BenchSampleResult),
+            &mut DummyCtx,
+            1,
+            0,
+            &mut backend,
+        );
+
+        assert_eq!(results.duration, Duration::from_micros(250));
+        assert_eq!(results.iterations, 4);
     }
 
     #[test]

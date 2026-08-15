@@ -294,6 +294,16 @@ pub struct BenchSampleResult {
     /// numbers (a zero value will produce `n/a` throughput and `inf`
     /// ns/op, matching the existing fallback behaviour).
     pub operations: u64,
+    /// Optional operation-reported duration to use as the sample's primary
+    /// measurement instead of the host wall-clock/backend duration.
+    ///
+    /// This is intended for device APIs whose timestamps must be encoded by
+    /// the operation itself (for example WebGPU timestamp queries). CUDA can
+    /// place events around an opaque closure from a measurement backend, but
+    /// WebGPU cannot: the timestamp writes are part of the command encoder.
+    /// Supplying this value lets both kinds of device timing feed the same
+    /// latency, throughput, stability, and persisted-sample machinery.
+    pub primary_duration: Option<Duration>,
     /// Custom per-sample metrics. Names should be stable across samples of
     /// the same benchmark so the aggregation path can group them. The
     /// runner keys summaries by `(section, name, unit)` so metrics with
@@ -306,8 +316,20 @@ impl BenchSampleResult {
     pub fn operations(operations: u64) -> Self {
         Self {
             operations,
+            primary_duration: None,
             metrics: Vec::new(),
         }
+    }
+
+    /// Use an operation-reported duration as the primary timing sample.
+    ///
+    /// The duration must be non-zero. Callers should also return the device
+    /// duration and host-visible latency as named metrics when both are useful
+    /// to interpret the benchmark.
+    pub fn with_primary_duration(mut self, duration: Duration) -> Self {
+        assert!(duration > Duration::ZERO, "primary duration must be > 0");
+        self.primary_duration = Some(duration);
+        self
     }
 
     pub fn with_metric(mut self, name: &'static str, value: f64, unit: &'static str) -> Self {

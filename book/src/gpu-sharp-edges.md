@@ -124,6 +124,7 @@ You could log these to stderr, but you could not get them into the persisted rep
 ```rust,ignore
 pub struct BenchSampleResult {
     pub operations: u64,
+    pub primary_duration: Option<Duration>,
     pub metrics: Vec<MetricValue>,
 }
 ```
@@ -133,6 +134,10 @@ The runner:
 1. Reads `operations` and routes it through the existing throughput/latency aggregation (`Results.iterations`).
 2. Collects `metrics` per sample and aggregates them into `MetricSummary` (mean, median, p95, min, max, contributing sample count).
 3. Persists the aggregated summaries in `BenchmarkStats.metrics` (JSON via serde) and renders them in a `custom metrics:` table beneath the standard stats table.
+
+`primary_duration` is normally absent. Device APIs that must encode their own
+timestamp queries can set it with `with_primary_duration`; it replaces host or
+backend duration for the primary sample statistics.
 
 Bench-function metrics and backend-pushed metrics are **merged into one table**. The aggregation key is `(section, name, unit)`, so metrics with different sections or units are distinct. `MetricValue` has a `format` hint (`Number` for adaptive scientific/decimal, `Integer` for IDs/counts) and an optional `display_name` (cosmetic; the aggregation key remains `name`).
 

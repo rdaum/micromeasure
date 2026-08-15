@@ -24,6 +24,7 @@
   - [custom_metrics](./examples/custom-metrics.md)
   - [custom_backend](./examples/custom-backend.md)
   - [cuda_event_backend](./examples/cuda-event-backend.md)
+  - [wgpu_timestamp_backend](./examples/wgpu-timestamp-backend.md)
   - [gpu_counters](./examples/gpu-counters.md)
 - [GPU Benchmarking Sharp Edges](./gpu-sharp-edges.md)
 - [micromeasure vs Criterion](./vs-criterion.md)

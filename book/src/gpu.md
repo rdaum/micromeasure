@@ -116,6 +116,12 @@ separate custom metric when that boundary matters.
 `OperationReportedDeviceBackend` supplies the corresponding measurement label,
 suppresses CPU diagnostics, and records `host_visible_ms` automatically.
 
+For a complete runnable wgpu reference — feature negotiation, pass-boundary
+timestamp writes, resolve/readback buffers, checked tick conversion, and an
+opt-in hardware self-check — see
+[wgpu_timestamp_backend](./examples/wgpu-timestamp-backend.md). It introduces
+no new backend type; the example owns its device, queue, and submissions.
+
 ### Built-in GPU counter collector
 
 Available behind the `gpu-counters` feature. `GpuCounterCollector` wraps NVIDIA CUPTI/NVPerf range profiling for diagnostic replay passes:

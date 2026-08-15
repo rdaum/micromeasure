@@ -104,6 +104,67 @@ If a backend leaves `results.duration` at `Duration::ZERO`, the runner falls bac
 - It requires the two events to have both completed. `CudaEventBackend` synchronizes the stop event in `end()` before `collect()` reads the elapsed time.
 - It is only meaningful for events on the same stream. `CudaEventBackend` uses the default stream throughout. Multi-stream work would need a backend that records on the relevant streams and reads the correct event pairs.
 
+## wgpu timestamps are encoded by the operation, not the backend
+
+### The problem
+
+wgpu has no host-side event API. Device timestamp writes are commands:
+`ComputePassDescriptor::timestamp_writes` (or
+`CommandEncoder::write_timestamp`, a different, narrower feature) must be
+encoded inside the command encoder that contains the measured pass. A
+`MeasurementBackend` that wraps an opaque closure with `begin`/`end` cannot
+reach inside it, so a CUDA-style `WgpuTimestampBackend` is structurally
+impossible without the backend owning submission — which would break
+application ownership of fences, multi-buffer submits, and resource leases.
+
+### The mitigation
+
+The **operation-reported duration contract**
+(`BenchSampleResult::with_primary_duration` in `src/bench/backend.rs`) lets
+the bench closure report the device duration it measured itself. The runner
+replaces the provisional host duration with `primary_duration` for latency,
+throughput, calibration, stability statistics, and persisted samples.
+`OperationReportedDeviceBackend` supplies the measurement label, suppresses
+CPU diagnostics, and records `host_visible_ms`. See
+[wgpu_timestamp_backend](./examples/wgpu-timestamp-backend.md) for a
+complete reference integration in which the application owns device, queue,
+encoding, submission, and synchronization.
+
+### Rules the reference example follows
+
+- **Feature negotiation up front.** Request `TIMESTAMP_QUERY` only when
+  `adapter.features()` advertises it; verify `device.features()` before
+  creating the query set. Do not assume per-backend support (Vulkan, DX12,
+  Metal, GLES, and WebGPU all differ by adapter and driver).
+- **Pass-boundary timestamps only.** `timestamp_writes` uses
+  `TIMESTAMP_QUERY` alone. `CommandEncoder::write_timestamp` requires
+  `TIMESTAMP_QUERY_INSIDE_ENCODERS` and is a different, narrower-supported
+  mode.
+- **Separate resolve and readback buffers.** Portable WebGPU requires
+  resolving queries into a `QUERY_RESOLVE | COPY_SRC` buffer, then copying
+  into a distinct `COPY_DST | MAP_READ` buffer. Do not map the resolve
+  buffer.
+- **Availability is a preflight decision.** If timestamps are unavailable,
+  skip the device-timed benchmark with a clear reason before warm-up or
+  sampling. Never mix host-timed and device-timed samples in one
+  distribution, and never "repair" a device sample with a numeric error
+  metric or a host-duration fallback.
+- **Checked conversion.** Reject wrap-boundary deltas (`stop < start`),
+  zero ticks, non-finite/zero/negative periods, and non-finite or
+  overflowing durations before handing a duration to
+  `with_primary_duration` (which asserts `> 0`).
+- **Warm up untimed.** The runner's fixed-chunk warm-up phase executes the
+  real sample path (pipeline compilation, shader caching, GPU power states)
+  before any measured samples; those warm-up samples never enter the
+  statistics.
+- **Synchronous readback is a microbenchmark convenience.** Blocking per
+  sample is appropriate here but not an execution-model recommendation;
+  production runtimes should collect timestamps asynchronously or in
+  batches while keeping the same `BenchSampleResult` contract. The timing
+  helper never waits on the device: `map_async` is issued before the
+  application's own exact-submission wait, and `finish_read` is
+  nonblocking (at most one bounded `Poll` drain, then `MapNotReady`).
+
 ## No per-sample custom metrics (historically)
 
 ### The problem
@@ -239,6 +300,7 @@ For most metrics this is fine. For categorical or count-valued metrics (algorith
 | CPU PMU diagnostics misleading for GPU | `MeasurementDomain::{Gpu, Mixed}` + `emits_cpu_diagnostics()` | `src/bench.rs` `diagnose_stats` |
 | Calibration assumes CPU-like scaling | `BenchContext::chunk_size() -> Some(n)` | `src/bench.rs` `calibrate_engine` |
 | Host wall-clock != device time | `MeasurementBackend` duration contract; `CudaEventBackend` | `src/bench/backend.rs`, `src/bench/cuda.rs` |
+| wgpu timestamps must be encoded by the operation | `with_primary_duration` + `OperationReportedDeviceBackend` | `src/bench/backend.rs`, `examples/wgpu_timestamp_backend.rs` |
 | No per-sample custom metrics | `bench_sample` + `BenchSampleResult` + `MetricValue` | `src/bench/backend.rs` |
 | Invasive counters contaminate timing | `diagnostic_pass` + `diagnostic_samples` | `src/bench.rs` |
 | NVIDIA counter permissions vary | `GpuCounterError::into_diagnostic_result()` | `src/bench/gpu_counters.rs` |

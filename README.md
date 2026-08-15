@@ -137,7 +137,7 @@ Example output:
 
 ![micromeasure example output](screenshot.png)
 
-For more examples (concurrent, throughput units, GPU domain, custom metrics, custom backend, CUDA event backend, GPU counters), see [Examples](./book/src/examples.md).
+For more examples (concurrent, throughput units, GPU domain, custom metrics, custom backend, CUDA event backend, wgpu device timestamp queries, GPU counters), see [Examples](./book/src/examples.md).
 
 ## Linux-first, and why
 

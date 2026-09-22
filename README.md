@@ -29,6 +29,18 @@ That means:
 - persisted raw samples for immediate local comparison, explicit CI baselines, external sample-series ingestion, reusable structured comparison, advisory or gating renderers, and a separately packaged provider-neutral suite CLI
 - GPU benchmarking with pluggable measurement backends, per-sample custom metrics, measurement domain tagging, and optional NVIDIA GPU counter diagnostics
 
+## Odin implementation
+
+[`micromeasure-odin/`](./micromeasure-odin/README.md) contains the standalone Odin package.
+It provides CPU timing, optional Linux PMU counters, memory observations, and raw sample reports.
+Its JSON output uses the shared [sample-series format](./book/src/series-reports.md), which the Rust CLI validates and compares.
+
+```sh
+bash micromeasure-odin/check-standalone.sh
+# With the micromeasure CLI installed:
+bash micromeasure-odin/check-series.sh
+```
+
 ## Documentation
 
 The full documentation lives in **[the mdbook](./book/src/SUMMARY.md)**. Build it locally with:
@@ -181,7 +193,7 @@ That origin explains the design bias:
 
 ## License
 
-`micromeasure` is licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE).
+The Rust and Odin implementations use the Apache License, Version 2.0. See [LICENSE](./LICENSE).
 
 Unless explicitly stated otherwise, any contribution intentionally submitted for inclusion in this
 project is contributed under the same license.

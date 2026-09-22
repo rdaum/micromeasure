@@ -1,0 +1,78 @@
+{
+  "document_type": "micromeasure-series",
+  "schema_version": 1,
+  "timestamp": "2026-09-22T00:00:00Z",
+  "suite": "interchange-fixture",
+  "validity": {
+    "status": "valid"
+  },
+  "context": {
+    "runner_id": "fixture-runner",
+    "environment": {},
+    "provenance": {
+      "producer": "reference-fixture"
+    }
+  },
+  "results": [
+    {
+      "group": "fixture",
+      "name": "body",
+      "measurement": "latency",
+      "unit": "ns/op",
+      "direction": "lower",
+      "samples": [
+        100,
+        110,
+        120
+      ],
+      "validity": {
+        "status": "valid"
+      },
+      "dimensions": {
+        "sample_kind": "batch-average",
+        "scope": "benchmark-body",
+        "normalization": "harness-operation"
+      },
+      "provenance": {}
+    },
+    {
+      "group": "fixture",
+      "name": "body",
+      "measurement": "throughput",
+      "unit": "MiB/s",
+      "direction": "higher",
+      "samples": [
+        2500000,
+        2272727.272727273,
+        2083333.3333333333
+      ],
+      "validity": {
+        "status": "valid"
+      },
+      "dimensions": {
+        "sample_kind": "batch-average",
+        "scope": "benchmark-body",
+        "normalization": "harness-operation"
+      },
+      "provenance": {}
+    },
+    {
+      "group": "fixture",
+      "name": "body",
+      "measurement": "memory",
+      "unit": "bytes",
+      "direction": "informational",
+      "samples": [
+        -50
+      ],
+      "validity": {
+        "status": "valid"
+      },
+      "dimensions": {
+        "kind": "current-rss-delta",
+        "scope": "whole-benchmark-including-warmup-calibration-and-hooks"
+      },
+      "provenance": {}
+    }
+  ]
+}

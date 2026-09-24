@@ -3,6 +3,7 @@ package micromeasure
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
+import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -291,11 +292,15 @@ test_baseline_and_structured_report_round_trip :: proc(t: ^testing.T) {
 	bytes, err := os.read_entire_file(path, context.allocator)
 	testing.expect(t, err == nil)
 	defer delete(bytes)
-	storage: [32768]u8
-	arena: mem.Arena
-	mem.arena_init(&arena, storage[:])
+	// A growing arena, not a fixed buffer: unmarshal's peak depends on where
+	// the arena lands in memory (map storage is 64-byte aligned, and map
+	// seeds derive from addresses), which moved a 32 KiB stack buffer across
+	// its limit on some runs.
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
 	doc: Report_Document
-	parse_err := json.unmarshal(bytes, &doc, allocator = mem.arena_allocator(&arena))
+	parse_err := json.unmarshal(bytes, &doc, allocator = virtual.arena_allocator(&arena))
 	testing.expectf(t, parse_err == nil, "%v", parse_err)
 	if parse_err != nil {
 		return

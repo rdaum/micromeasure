@@ -20,6 +20,6 @@ test_failed_counter_io_does_not_report_a_zero_measurement :: proc(t: ^testing.T)
 		testing.expect_value(t, set.values[kind], f64(0))
 		testing.expect_value(t, set.coverage[kind], f64(0))
 	}
-	reading, ok := counter_read(-1)
+	_, ok := counter_read(-1)
 	testing.expect(t, !ok)
 }

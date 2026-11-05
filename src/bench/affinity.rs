@@ -15,9 +15,37 @@ pub(super) fn warn_affinity_once(message: impl Into<String>) {
     }
 }
 
+/// Puts the current thread's affinity back as it was when this was made, however the scope that
+/// changed it is left.
+#[cfg(target_os = "linux")]
+struct RestoreAffinityOnDrop(Option<libc::cpu_set_t>);
+
+#[cfg(target_os = "linux")]
+impl RestoreAffinityOnDrop {
+    fn capture() -> Self {
+        Self(capture_current_thread_affinity().ok())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RestoreAffinityOnDrop {
+    fn drop(&mut self) {
+        if let Some(mask) = self.0.as_ref()
+            && let Err(error) = restore_current_thread_affinity(mask)
+        {
+            warn_affinity_once(format!(
+                "Could not restore thread affinity after probing a core's PMU: {error}"
+            ));
+        }
+    }
+}
+
+/// Whether a core can count instructions. Probing it moves the current thread there for the
+/// duration; it is moved back whatever the outcome, so that threads it spawns later aren't
+/// confined to the last core probed.
 #[cfg(target_os = "linux")]
 fn core_has_usable_pmu(core_id: usize) -> bool {
-    let original_affinity = capture_current_thread_affinity().ok();
+    let _restore = RestoreAffinityOnDrop::capture();
     if pin_current_thread_to_core(core_id).is_err() {
         return false;
     }
@@ -37,16 +65,10 @@ fn core_has_usable_pmu(core_id: usize) -> bool {
     black_box(acc);
 
     let _ = counter.disable();
-    let usable = match counter.read_count_and_time() {
+    match counter.read_count_and_time() {
         Ok(cat) => cat.count > 0 || cat.time_running > 0,
         Err(_) => false,
-    };
-
-    if let Some(mask) = original_affinity.as_ref() {
-        let _ = restore_current_thread_affinity(mask);
     }
-
-    usable
 }
 
 #[cfg(target_os = "linux")]
@@ -280,7 +302,35 @@ impl Drop for BenchAffinityGuard {
     }
 }
 
+/// The cores to pin a concurrent benchmark's workers to, one each, or none when pinning is
+/// disabled.
 #[cfg(target_os = "linux")]
 pub(super) fn concurrent_worker_pin_cores(total_threads: usize) -> Vec<usize> {
+    if pinning_disabled() {
+        return Vec::new();
+    }
     choose_concurrent_pin_cores(&current_allowed_core_ids(), total_threads)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn allowed() -> Vec<usize> {
+        core_ids_from_mask(&capture_current_thread_affinity().expect("affinity"))
+    }
+
+    /// Probing cores for PMU support, which choosing workers' cores does, must leave the calling
+    /// thread where it was: workers spawned afterwards inherit its affinity, and a thread left on
+    /// the last core probed would confine every later benchmark's workers to one core.
+    #[test]
+    fn choosing_worker_cores_leaves_the_caller_where_it_was() {
+        let before = allowed();
+        for core_id in before.iter().take(4) {
+            black_box(core_has_usable_pmu(*core_id));
+            assert_eq!(allowed(), before, "after probing core {core_id}");
+        }
+        black_box(choose_concurrent_pin_cores(&before, before.len()));
+        assert_eq!(allowed(), before, "after choosing worker cores");
+    }
 }
